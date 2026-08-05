@@ -1,0 +1,15 @@
+schema_version: 1
+app:
+  id: pxy-backtest
+  kind: internal_compute_service
+  runtime: windows-winsw
+  service_name: pxy-backtest
+  host: app-win-01
+  bind: 127.0.0.1
+  internal_port: 3024
+  public_path: null
+  auth_mode: trusted_service_header
+  compute_location: workstation_only
+  health_path: /health
+  runtime_root: D:/x1/pxy-runtime/PXYBACKTEST
+  secrets_source: local_file_only

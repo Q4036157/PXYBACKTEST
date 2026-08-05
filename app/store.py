@@ -1,0 +1,381 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+
+TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+
+
+class TaskNotFoundError(LookupError):
+    pass
+
+
+class TaskStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._initialize()
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.path, timeout=5.0)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _initialize(self) -> None:
+        with self._connection() as connection:
+            connection.executescript(
+                """
+                PRAGMA journal_mode=WAL;
+                PRAGMA synchronous=NORMAL;
+                CREATE TABLE IF NOT EXISTS tasks (
+                    task_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    source_node TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    result_path TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_tasks_user_created
+                    ON tasks(user_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS ix_tasks_status_created
+                    ON tasks(status, created_at ASC);
+                CREATE TABLE IF NOT EXISTS task_events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY(task_id) REFERENCES tasks(task_id)
+                );
+                CREATE INDEX IF NOT EXISTS ix_task_events_task_seq
+                    ON task_events(task_id, seq);
+                """
+            )
+
+    def create_task(
+        self,
+        *,
+        user_id: str,
+        source_node: str,
+        request: dict[str, Any],
+    ) -> str:
+        task_id = str(uuid.uuid4())
+        now = time.time()
+        state = {
+            "task_id": task_id,
+            "status": "pending",
+            "progress": 0.0,
+            "processed_bars": 0,
+            "total_bars": 0,
+            "speed": request.get("speed", 50),
+            "replay": {},
+            "live_bars": [],
+            "live_trades": [],
+            "live_orders": [],
+            "live_positions": [],
+            "strategy_lines": [],
+            "recent_replay_events": [],
+            "event_seq": 0,
+        }
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    task_id, user_id, source_node, status, request_json,
+                    state_json, created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    user_id,
+                    source_node,
+                    json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                    now,
+                    now,
+                ),
+            )
+        return task_id
+
+    def count_queued_for_user(self, user_id: str) -> int:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND status = 'pending'",
+                (user_id,),
+            ).fetchone()
+        return int(row["count"] if row else 0)
+
+    def recover_interrupted_tasks(self) -> int:
+        now = time.time()
+        with self._lock, self._connection() as connection:
+            changed = connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'pending', error = '', updated_at = ?
+                WHERE status IN ('running', 'paused')
+                """,
+                (now,),
+            )
+        return int(changed.rowcount)
+
+    def pending_tasks(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT task_id, user_id, request_json FROM tasks WHERE status = 'pending' ORDER BY created_at ASC"
+            ).fetchall()
+        return [
+            {
+                "task_id": str(row["task_id"]),
+                "user_id": str(row["user_id"]),
+                "request": json.loads(row["request_json"]),
+            }
+            for row in rows
+        ]
+
+    def mark_running(self, task_id: str) -> bool:
+        now = time.time()
+        with self._lock, self._connection() as connection:
+            changed = connection.execute(
+                "UPDATE tasks SET status = 'running', updated_at = ? WHERE task_id = ? AND status = 'pending'",
+                (now, task_id),
+            )
+        return changed.rowcount == 1
+
+    def set_status(self, task_id: str, status: str, error: str = "") -> None:
+        now = time.time()
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT state_json FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise TaskNotFoundError(task_id)
+            state = json.loads(row["state_json"])
+            state["status"] = status
+            if error:
+                state["error"] = error
+            connection.execute(
+                """
+                UPDATE tasks SET status = ?, error = ?, state_json = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (
+                    status,
+                    error,
+                    json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                    now,
+                    task_id,
+                ),
+            )
+
+    def append_event(self, task_id: str, event_type: str, payload: dict[str, Any]) -> int:
+        now = time.time()
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT user_id, state_json FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise TaskNotFoundError(task_id)
+            user_id = str(row["user_id"])
+            cursor = connection.execute(
+                """
+                INSERT INTO task_events(task_id, user_id, event_type, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    user_id,
+                    event_type,
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    now,
+                ),
+            )
+            seq = int(cursor.lastrowid)
+            state = self._apply_event(json.loads(row["state_json"]), event_type, payload)
+            state["event_seq"] = seq
+            status = str(state.get("status") or "running")
+            result_path = str(payload.get("result_path") or "") if event_type == "completed" else ""
+            error = str(payload.get("error") or "") if event_type == "failed" else ""
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = ?, state_json = ?,
+                    result_path = CASE WHEN ? <> '' THEN ? ELSE result_path END,
+                    error = CASE WHEN ? <> '' THEN ? ELSE error END,
+                    updated_at = ?
+                WHERE task_id = ?
+                """,
+                (
+                    status,
+                    json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                    result_path,
+                    result_path,
+                    error,
+                    error,
+                    now,
+                    task_id,
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM task_events
+                WHERE task_id = ? AND seq NOT IN (
+                    SELECT seq FROM task_events WHERE task_id = ? ORDER BY seq DESC LIMIT 5000
+                )
+                """,
+                (task_id, task_id),
+            )
+        return seq
+
+    @staticmethod
+    def _apply_event(
+        state: dict[str, Any], event_type: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        if event_type == "state":
+            state.update(payload)
+            state["status"] = payload.get("status", state.get("status", "running"))
+        elif event_type == "bar":
+            bar = payload.get("bar")
+            if isinstance(bar, dict) and bar.get("datetime"):
+                bars = list(state.get("live_bars") or [])
+                if bars and bars[-1].get("datetime") == bar.get("datetime"):
+                    bars[-1] = bar
+                else:
+                    bars.append(bar)
+                state["live_bars"] = bars[-100:]
+                state["current_bar"] = bar
+        elif event_type.endswith("_snapshot"):
+            key = event_type.removesuffix("_snapshot")
+            mapping = {
+                "trades": "live_trades",
+                "orders": "live_orders",
+                "positions": "live_positions",
+                "strategy_lines": "strategy_lines",
+                "replay_events": "recent_replay_events",
+            }
+            if key in mapping:
+                state[mapping[key]] = payload.get("items", [])
+        elif event_type == "completed":
+            state["status"] = "completed"
+            state["progress"] = 100.0
+        elif event_type == "failed":
+            state["status"] = "failed"
+            state["error"] = str(payload.get("error") or "backtest worker failed")
+        elif event_type == "cancelled":
+            state["status"] = "cancelled"
+        return state
+
+    def get_task(self, user_id: str, task_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE task_id = ? AND user_id = ?",
+                (task_id, user_id),
+            ).fetchone()
+        if row is None:
+            raise TaskNotFoundError(task_id)
+        state = json.loads(row["state_json"])
+        state.update(
+            {
+                "task_id": task_id,
+                "status": str(row["status"]),
+                "created_at": float(row["created_at"]),
+                "updated_at": float(row["updated_at"]),
+            }
+        )
+        return state
+
+    def get_result_path(self, task_id: str) -> Path:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT result_path FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        if row is None:
+            raise TaskNotFoundError(task_id)
+        return Path(str(row["result_path"] or ""))
+
+    def get_request(self, task_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT request_json FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        if row is None:
+            raise TaskNotFoundError(task_id)
+        return json.loads(row["request_json"])
+
+    def list_tasks(self, user_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT task_id, status, request_json, state_json, created_at, updated_at
+                FROM tasks WHERE user_id = ? ORDER BY created_at DESC LIMIT ?
+                """,
+                (user_id, limit),
+            ).fetchall()
+        tasks: list[dict[str, Any]] = []
+        for row in rows:
+            request = json.loads(row["request_json"])
+            state = json.loads(row["state_json"])
+            tasks.append(
+                {
+                    "task_id": str(row["task_id"]),
+                    "strategy_class": request.get("strategy_class", ""),
+                    "vt_symbol": request.get("vt_symbol", ""),
+                    "interval": request.get("interval", ""),
+                    "start_time": request.get("start_time", ""),
+                    "end_time": request.get("end_time", ""),
+                    "status": str(row["status"]),
+                    "progress": float(state.get("progress") or 0),
+                    "created_at": float(row["created_at"]),
+                    "updated_at": float(row["updated_at"]),
+                }
+            )
+        return tasks
+
+    def events_after(
+        self, user_id: str, task_id: str, after_seq: int, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        self.get_task(user_id, task_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT seq, event_type, payload_json, created_at
+                FROM task_events
+                WHERE task_id = ? AND user_id = ? AND seq > ?
+                ORDER BY seq ASC LIMIT ?
+                """,
+                (task_id, user_id, after_seq, limit),
+            ).fetchall()
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            event_type = str(row["event_type"])
+            payload = json.loads(row["payload_json"])
+            if event_type == "completed":
+                payload.pop("result_path", None)
+            if event_type == "failed":
+                payload.pop("traceback", None)
+            events.append(
+                {
+                    "seq": int(row["seq"]),
+                    "type": event_type,
+                    "data": payload,
+                    "created_at": float(row["created_at"]),
+                }
+            )
+        return events

@@ -32,6 +32,10 @@ PXYLH 的独立工作站回测执行服务。109 和 204 只负责用户鉴权�
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
+安装脚本优先复用 `PXYBACKTEST_PYTHON` 指定的 Python，其次使用相邻 PXYLH
+仓库的 `venv312`。它只安装本服务依赖并验证 PXYLH 回测运行时导入，不重复安装
+整套 PXYLH 依赖。PXYLH 运行时必须先独立安装完成。
+
 服务令牌必须放在工作站本地密钥文件中，不提交到 Git。必要环境变量：
 
 - `PXYBACKTEST_SERVICE_TOKEN_FILE`

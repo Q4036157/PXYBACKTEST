@@ -1,31 +1,35 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$PxyLhRoot = $env:PXYBACKTEST_PXYLH_ROOT,
+    [string]$Python = $env:PXYBACKTEST_PYTHON
+)
 
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$pxylhRoot = if ($env:PXYBACKTEST_PXYLH_ROOT) {
-    $env:PXYBACKTEST_PXYLH_ROOT
+$pxylhRoot = if ($PxyLhRoot) {
+    $PxyLhRoot
 } else {
-    "D:\x1\x2\PXYLH"
+    Join-Path (Split-Path -Parent $repoRoot) "PXYLH"
 }
-$pxylhRequirements = Join-Path $pxylhRoot "backend\requirements.txt"
-$pythonCandidates = @(
+$backendRoot = Join-Path $pxylhRoot "backend"
+$pythonCandidates = @($Python,
+    (Join-Path $pxylhRoot "venv312\Scripts\python.exe"),
+    (Join-Path $repoRoot ".venv\Scripts\python.exe"),
     "C:\Users\Work\AppData\Local\Programs\Python\Python312\python.exe",
     "C:\Python312\python.exe"
-)
+ ) | Where-Object { $_ }
 $python = $pythonCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
 if (!$python) { throw "No supported Python 3.12 executable was found." }
-if (!(Test-Path -LiteralPath $pxylhRequirements -PathType Leaf)) {
-    throw "PXYLH requirements were not found: $pxylhRequirements"
+if (!(Test-Path -LiteralPath $backendRoot -PathType Container)) {
+    throw "PXYLH backend was not found: $backendRoot"
 }
 
-$venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
-if (!(Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-    & $python -m venv (Join-Path $repoRoot ".venv")
+$env:PYTHONPATH = "$repoRoot;$pxylhRoot;$backendRoot"
+& $python -c "import fastapi, pydantic, uvicorn; from app.main import create_app; from services.backtest_service.engine_runner import run_backtest_sync" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    & $python -m pip install -r (Join-Path $repoRoot "requirements.txt")
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-& $venvPython -m pip install --upgrade pip
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-& $venvPython -m pip install -r (Join-Path $repoRoot "requirements.txt") -r $pxylhRequirements
+& $python -c "from app.main import create_app; from services.backtest_service.engine_runner import run_backtest_sync; print('PXYBACKTEST runtime imports OK')"
 exit $LASTEXITCODE

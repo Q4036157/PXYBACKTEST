@@ -11,6 +11,8 @@ from typing import Any, Iterator
 
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+EVENT_RETENTION = 5000
+EVENT_PRUNE_INTERVAL = 500
 
 
 class TaskNotFoundError(LookupError):
@@ -22,6 +24,7 @@ class TaskStore:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._last_pruned_seq: dict[str, int] = {}
         self._initialize()
 
     @contextmanager
@@ -153,9 +156,24 @@ class TaskStore:
     def mark_running(self, task_id: str) -> bool:
         now = time.time()
         with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT state_json FROM tasks WHERE task_id = ? AND status = 'pending'",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            state = json.loads(row["state_json"])
+            state["status"] = "running"
             changed = connection.execute(
-                "UPDATE tasks SET status = 'running', updated_at = ? WHERE task_id = ? AND status = 'pending'",
-                (now, task_id),
+                """
+                UPDATE tasks SET status = 'running', state_json = ?, updated_at = ?
+                WHERE task_id = ? AND status = 'pending'
+                """,
+                (
+                    json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                    now,
+                    task_id,
+                ),
             )
         return changed.rowcount == 1
 
@@ -186,7 +204,16 @@ class TaskStore:
             )
 
     def append_event(self, task_id: str, event_type: str, payload: dict[str, Any]) -> int:
-        now = time.time()
+        return self.append_events(task_id, [(event_type, payload)])[0]
+
+    def append_events(
+        self,
+        task_id: str,
+        events: list[tuple[str, dict[str, Any]]],
+    ) -> list[int]:
+        if not events:
+            return []
+
         with self._lock, self._connection() as connection:
             row = connection.execute(
                 "SELECT user_id, state_json FROM tasks WHERE task_id = ?", (task_id,)
@@ -194,25 +221,36 @@ class TaskStore:
             if row is None:
                 raise TaskNotFoundError(task_id)
             user_id = str(row["user_id"])
-            cursor = connection.execute(
-                """
-                INSERT INTO task_events(task_id, user_id, event_type, payload_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    user_id,
-                    event_type,
-                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                    now,
-                ),
-            )
-            seq = int(cursor.lastrowid)
-            state = self._apply_event(json.loads(row["state_json"]), event_type, payload)
-            state["event_seq"] = seq
+            state = json.loads(row["state_json"])
+            result_path = ""
+            error = ""
+            sequences: list[int] = []
+
+            for event_type, payload in events:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO task_events(task_id, user_id, event_type, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        user_id,
+                        event_type,
+                        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                        time.time(),
+                    ),
+                )
+                seq = int(cursor.lastrowid)
+                sequences.append(seq)
+                state = self._apply_event(state, event_type, payload)
+                state["event_seq"] = seq
+                if event_type == "completed":
+                    result_path = str(payload.get("result_path") or "")
+                elif event_type == "failed":
+                    error = str(payload.get("error") or "")
+
             status = str(state.get("status") or "running")
-            result_path = str(payload.get("result_path") or "") if event_type == "completed" else ""
-            error = str(payload.get("error") or "") if event_type == "failed" else ""
+            now = time.time()
             connection.execute(
                 """
                 UPDATE tasks
@@ -233,16 +271,51 @@ class TaskStore:
                     task_id,
                 ),
             )
-            connection.execute(
-                """
-                DELETE FROM task_events
-                WHERE task_id = ? AND seq NOT IN (
-                    SELECT seq FROM task_events WHERE task_id = ? ORDER BY seq DESC LIMIT 5000
-                )
-                """,
-                (task_id, task_id),
-            )
-        return seq
+            last_seq = sequences[-1]
+            last_pruned_seq = self._last_pruned_seq.get(task_id, 0)
+            if last_seq - last_pruned_seq >= EVENT_PRUNE_INTERVAL:
+                cutoff = connection.execute(
+                    """
+                    SELECT seq FROM task_events
+                    WHERE task_id = ?
+                    ORDER BY seq DESC LIMIT 1 OFFSET ?
+                    """,
+                    (task_id, EVENT_RETENTION - 1),
+                ).fetchone()
+                if cutoff is not None:
+                    connection.execute(
+                        "DELETE FROM task_events WHERE task_id = ? AND seq < ?",
+                        (task_id, int(cutoff["seq"])),
+                    )
+                self._last_pruned_seq[task_id] = last_seq
+        return sequences
+
+    @staticmethod
+    def _trade_key(trade: dict[str, Any]) -> str:
+        trade_id = str(trade.get("trade_id") or "").strip()
+        if trade_id:
+            return trade_id
+        return "|".join(
+            str(trade.get(key) or "")
+            for key in ("datetime", "direction", "offset", "price", "volume")
+        )
+
+    @classmethod
+    def _merge_trades(
+        cls, existing: list[dict[str, Any]], incoming: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        merged = list(existing)
+        indexes = {cls._trade_key(item): index for index, item in enumerate(merged)}
+        for trade in incoming:
+            if not isinstance(trade, dict):
+                continue
+            key = cls._trade_key(trade)
+            if key in indexes:
+                merged[indexes[key]] = trade
+            else:
+                indexes[key] = len(merged)
+                merged.append(trade)
+        return merged[-5000:]
 
     @staticmethod
     def _apply_event(
@@ -261,6 +334,12 @@ class TaskStore:
                     bars.append(bar)
                 state["live_bars"] = bars[-100:]
                 state["current_bar"] = bar
+        elif event_type == "trade":
+            trade = payload.get("trade")
+            if isinstance(trade, dict):
+                state["live_trades"] = TaskStore._merge_trades(
+                    list(state.get("live_trades") or []), [trade]
+                )
         elif event_type.endswith("_snapshot"):
             key = event_type.removesuffix("_snapshot")
             mapping = {
@@ -271,7 +350,14 @@ class TaskStore:
                 "replay_events": "recent_replay_events",
             }
             if key in mapping:
-                state[mapping[key]] = payload.get("items", [])
+                items = payload.get("items", [])
+                if key == "trades":
+                    state["live_trades"] = TaskStore._merge_trades(
+                        list(state.get("live_trades") or []),
+                        list(items) if isinstance(items, list) else [],
+                    )
+                else:
+                    state[mapping[key]] = items
         elif event_type == "completed":
             state["status"] = "completed"
             state["progress"] = 100.0
@@ -300,6 +386,16 @@ class TaskStore:
             }
         )
         return state
+
+    def get_task_status(self, user_id: str, task_id: str) -> dict[str, str]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT status, error FROM tasks WHERE task_id = ? AND user_id = ?",
+                (task_id, user_id),
+            ).fetchone()
+        if row is None:
+            raise TaskNotFoundError(task_id)
+        return {"status": str(row["status"]), "error": str(row["error"] or "")}
 
     def get_result_path(self, task_id: str) -> Path:
         with self._connection() as connection:
@@ -348,11 +444,64 @@ class TaskStore:
             )
         return tasks
 
+    def queue_context(self, user_id: str, task_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            task = connection.execute(
+                "SELECT status, created_at FROM tasks WHERE task_id = ? AND user_id = ?",
+                (task_id, user_id),
+            ).fetchone()
+            if task is None:
+                raise TaskNotFoundError(task_id)
+
+            if str(task["status"]) != "pending":
+                return {"queue_ahead": 0, "queue_position": 0, "active_task": None}
+
+            queue_ahead_row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM tasks
+                WHERE status IN ('running', 'paused')
+                   OR (status = 'pending' AND created_at < ?)
+                """,
+                (float(task["created_at"]),),
+            ).fetchone()
+            active = connection.execute(
+                """
+                SELECT user_id, status, state_json
+                FROM tasks
+                WHERE status IN ('running', 'paused')
+                ORDER BY created_at ASC LIMIT 1
+                """
+            ).fetchone()
+
+        active_task = None
+        if active is not None:
+            state = json.loads(active["state_json"])
+            active_task = {
+                "status": str(active["status"]),
+                "progress": float(state.get("progress") or 0),
+                "processed_bars": int(state.get("processed_bars") or 0),
+                "total_bars": int(state.get("total_bars") or 0),
+                "owned_by_current_user": str(active["user_id"]) == user_id,
+            }
+
+        queue_ahead = int(queue_ahead_row["count"] if queue_ahead_row else 0)
+        return {
+            "queue_ahead": queue_ahead,
+            "queue_position": queue_ahead + 1,
+            "active_task": active_task,
+        }
+
     def events_after(
         self, user_id: str, task_id: str, after_seq: int, limit: int = 200
     ) -> list[dict[str, Any]]:
-        self.get_task(user_id, task_id)
         with self._connection() as connection:
+            owned = connection.execute(
+                "SELECT 1 FROM tasks WHERE task_id = ? AND user_id = ?",
+                (task_id, user_id),
+            ).fetchone()
+            if owned is None:
+                raise TaskNotFoundError(task_id)
             rows = connection.execute(
                 """
                 SELECT seq, event_type, payload_json, created_at

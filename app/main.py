@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 
@@ -66,7 +67,7 @@ def create_app(
     async def list_tasks(
         identity: TrustedIdentity = Depends(identity_dependency),
     ) -> dict:
-        tasks = task_manager.store.list_tasks(identity.user_id)
+        tasks = await asyncio.to_thread(task_manager.store.list_tasks, identity.user_id)
         return {"success": True, "tasks": tasks, "total": len(tasks)}
 
     @app.get("/api/v1/tasks/{task_id}")
@@ -75,7 +76,7 @@ def create_app(
         identity: TrustedIdentity = Depends(identity_dependency),
     ) -> dict:
         try:
-            return task_manager.result(identity.user_id, task_id)
+            return await asyncio.to_thread(task_manager.result, identity.user_id, task_id)
         except TaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail="回测任务不存在") from exc
 
@@ -86,11 +87,16 @@ def create_app(
         after_seq: int = Query(default=0, ge=0),
         limit: int = Query(default=200, ge=1, le=500),
     ) -> dict:
-        try:
-            task = task_manager.store.get_task(identity.user_id, task_id)
-            events = task_manager.store.events_after(
+        def load_event_page() -> tuple[dict, list[dict], dict]:
+            task_status = task_manager.store.get_task_status(identity.user_id, task_id)
+            page_events = task_manager.store.events_after(
                 identity.user_id, task_id, after_seq, limit
             )
+            context = task_manager.store.queue_context(identity.user_id, task_id)
+            return task_status, page_events, context
+
+        try:
+            task, events, queue_context = await asyncio.to_thread(load_event_page)
         except TaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail="回测任务不存在") from exc
         next_seq = events[-1]["seq"] if events else after_seq
@@ -101,6 +107,7 @@ def create_app(
             "error": task.get("error", ""),
             "events": events,
             "next_seq": next_seq,
+            **queue_context,
         }
 
     @app.post("/api/v1/tasks/{task_id}/pause")

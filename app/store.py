@@ -29,9 +29,10 @@ class TaskStore:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path, timeout=5.0)
+        connection = sqlite3.connect(self.path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         try:
+            connection.execute("PRAGMA busy_timeout = 30000")
             yield connection
             connection.commit()
         finally:
@@ -119,7 +120,7 @@ class TaskStore:
         return task_id
 
     def count_queued_for_user(self, user_id: str) -> int:
-        with self._connection() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 "SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND status = 'pending'",
                 (user_id,),
@@ -140,7 +141,7 @@ class TaskStore:
         return int(changed.rowcount)
 
     def pending_tasks(self) -> list[dict[str, Any]]:
-        with self._connection() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 "SELECT task_id, user_id, request_json FROM tasks WHERE status = 'pending' ORDER BY created_at ASC"
             ).fetchall()
@@ -369,7 +370,7 @@ class TaskStore:
         return state
 
     def get_task(self, user_id: str, task_id: str) -> dict[str, Any]:
-        with self._connection() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM tasks WHERE task_id = ? AND user_id = ?",
                 (task_id, user_id),
@@ -388,7 +389,7 @@ class TaskStore:
         return state
 
     def get_task_status(self, user_id: str, task_id: str) -> dict[str, str]:
-        with self._connection() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 "SELECT status, error FROM tasks WHERE task_id = ? AND user_id = ?",
                 (task_id, user_id),
@@ -398,7 +399,7 @@ class TaskStore:
         return {"status": str(row["status"]), "error": str(row["error"] or "")}
 
     def get_result_path(self, task_id: str) -> Path:
-        with self._connection() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 "SELECT result_path FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
@@ -407,7 +408,7 @@ class TaskStore:
         return Path(str(row["result_path"] or ""))
 
     def get_request(self, task_id: str) -> dict[str, Any]:
-        with self._connection() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 "SELECT request_json FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
@@ -416,7 +417,7 @@ class TaskStore:
         return json.loads(row["request_json"])
 
     def list_tasks(self, user_id: str, limit: int = 100) -> list[dict[str, Any]]:
-        with self._connection() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT task_id, status, request_json, state_json, created_at, updated_at
@@ -445,7 +446,7 @@ class TaskStore:
         return tasks
 
     def queue_context(self, user_id: str, task_id: str) -> dict[str, Any]:
-        with self._connection() as connection:
+        with self._lock, self._connection() as connection:
             task = connection.execute(
                 "SELECT status, created_at FROM tasks WHERE task_id = ? AND user_id = ?",
                 (task_id, user_id),
@@ -495,7 +496,7 @@ class TaskStore:
     def events_after(
         self, user_id: str, task_id: str, after_seq: int, limit: int = 200
     ) -> list[dict[str, Any]]:
-        with self._connection() as connection:
+        with self._lock, self._connection() as connection:
             owned = connection.execute(
                 "SELECT 1 FROM tasks WHERE task_id = ? AND user_id = ?",
                 (task_id, user_id),

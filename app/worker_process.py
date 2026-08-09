@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import queue
 import sys
 import threading
@@ -10,6 +11,23 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any
+
+
+def _configure_backtest_worker_logging() -> None:
+    """让工作进程输出回测数据链路的 INFO 日志。"""
+    logger = logging.getLogger("backtest_service")
+    if not any(
+        getattr(handler, "name", "") == "pxybacktest-worker"
+        for handler in logger.handlers
+    ):
+        handler = logging.StreamHandler()
+        handler.name = "pxybacktest-worker"
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 
 def _stable_hash(value: Any) -> str:
@@ -57,6 +75,7 @@ def run_preloaded_worker(
     job_queue,
     ready_queue,
 ) -> None:
+    _configure_backtest_worker_logging()
     try:
         preload_pxylh_runtime(pxylh_root)
         ready_queue.put({"ready": True})
@@ -132,7 +151,10 @@ def run_backtest_worker(
             extract_live_trades,
         )
         from services.backtest_service.strategy_line_utils import extract_strategy_lines
-        from services.backtest_service.time_utils import parse_to_beijing_naive
+        from services.backtest_service.time_utils import (
+            parse_backtest_end_to_beijing_naive,
+            parse_to_beijing_naive,
+        )
     except Exception as exc:
         _emit(
             event_queue,
@@ -149,7 +171,7 @@ def run_backtest_worker(
         vt_symbol=str(request["vt_symbol"]),
         interval=str(request.get("interval") or "1h"),
         start_time=parse_to_beijing_naive(str(request["start_time"])),
-        end_time=parse_to_beijing_naive(str(request["end_time"])),
+        end_time=parse_backtest_end_to_beijing_naive(str(request["end_time"])),
         parameters=dict(request.get("parameters") or {}),
         capital=float(request.get("capital") or 1_000_000),
         rate=float(request.get("rate") or 0.0004),
@@ -183,7 +205,13 @@ def run_backtest_worker(
                     ),
                 },
             )
-            holder["result"] = run_backtest_sync(task, None)
+            holder["result"] = run_backtest_sync(
+                task,
+                None,
+                event_sink=lambda event_type, payload: _emit(
+                    event_queue, event_type, payload, reliable=True
+                ),
+            )
         except BaseException as exc:
             holder["error"] = f"{type(exc).__name__}: {exc}"
             holder["traceback"] = traceback.format_exc()
@@ -193,7 +221,6 @@ def run_backtest_worker(
 
     _emit(event_queue, "state", {"status": "running", "progress": 0.0})
     last_replay_seq = -1
-    last_bar_signature = ""
     snapshot_hashes: dict[str, str] = {}
     emitted_trade_count = 0
     applied_speed: float | None = None
@@ -258,16 +285,6 @@ def run_backtest_worker(
                     "replay": replay,
                 },
             )
-            bar = dict(task.current_bar or {})
-            signature = _stable_hash(bar) if bar else ""
-            if bar and signature != last_bar_signature:
-                last_bar_signature = signature
-                _emit(
-                    event_queue,
-                    "bar",
-                    {"bar": bar, "replay_seq": replay_seq},
-                    reliable=True,
-                )
 
         visual_trades = getattr(engine, "_visual_trades", None) if engine else None
         current_trades = (

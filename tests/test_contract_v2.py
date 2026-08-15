@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from app.config import Settings
 from app.daa_client import DaaCapabilitiesError, _validate_capabilities
-from app.main import create_app
+from app.main import _bind_factor_set_to_manifest, create_app
 from app.models import (
     DataSnapshotRefV2,
     DataSnapshotSelectionV2,
@@ -627,6 +627,69 @@ def test_snapshot_client_canonicalizes_verified_full_manifest(
     assert resolved.quality_accepted is True
     assert resolved.quality_report_id == "quality-provider"
     assert "files" not in resolved.datasets[0].model_dump()
+
+
+def test_snapshot_client_loads_registered_factor_set_and_binds_derivation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factor_set = {
+        "factor_set_id": "daily_value",
+        "version": 3,
+        "factor_set_hash": "a" * 64,
+        "feature_code_hash": "b" * 64,
+        "status": "active",
+    }
+
+    def fake_request(_self, method: str, path: str, payload: dict | None) -> dict:
+        assert (method, path, payload) == (
+            "GET",
+            "/api/v1/backtest/factor-sets/daily_value?version=3",
+            None,
+        )
+        return factor_set
+
+    monkeypatch.setattr(PxyDataSnapshotClient, "_request", fake_request)
+    client = PxyDataSnapshotClient(base_url="http://pxydata", api_key="test")
+    loaded = asyncio.run(client.get_factor_set("daily_value", 3))
+    updates = _bind_factor_set_to_manifest(
+        _factor_payload(),
+        {
+            "derivation": {
+                "factor_set_id": "daily_value",
+                "factor_set_hash": "a" * 64,
+                "feature_code_hash": "b" * 64,
+            }
+        },
+        loaded,
+    )
+
+    assert updates == {
+        "factor_set_id": "daily_value",
+        "factor_set_version": 3,
+        "factor_set_hash": "a" * 64,
+        "feature_code_hash": "b" * 64,
+    }
+
+
+def test_factor_set_binding_rejects_execution_snapshot_hash_mismatch() -> None:
+    with pytest.raises(SnapshotProviderError, match="factor_set_hash"):
+        _bind_factor_set_to_manifest(
+            _factor_payload(),
+            {
+                "derivation": {
+                    "factor_set_id": "daily_value",
+                    "factor_set_hash": "c" * 64,
+                    "feature_code_hash": "b" * 64,
+                }
+            },
+            {
+                "factor_set_id": "daily_value",
+                "version": 3,
+                "factor_set_hash": "a" * 64,
+                "feature_code_hash": "b" * 64,
+                "status": "active",
+            },
+        )
 
 
 def test_v2_preserves_snapshot_provider_unavailable_status(tmp_path: Path) -> None:

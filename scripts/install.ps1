@@ -17,7 +17,7 @@ $pythonCandidates = @($Python,
     (Join-Path $repoRoot ".venv\Scripts\python.exe"),
     "C:\Users\Work\AppData\Local\Programs\Python\Python312\python.exe",
     "C:\Python312\python.exe"
- ) | Where-Object { $_ }
+) | Where-Object { $_ }
 $python = $pythonCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
 if (!$python) { throw "No supported Python 3.12 executable was found." }
 if (!(Test-Path -LiteralPath $backendRoot -PathType Container)) {
@@ -30,6 +30,11 @@ if ($LASTEXITCODE -ne 0) {
     & $python -m pip install -r (Join-Path $repoRoot "requirements.txt")
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
+$hasOptuna = (& $python -c "import importlib.util; print(int(importlib.util.find_spec('optuna') is not None))").Trim()
+if ($hasOptuna -ne "1") {
+    & $python -m pip install --disable-pip-version-check "optuna>=4.0,<5"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 
-& $python -c "from app.main import create_app; from services.backtest_service.engine_runner import run_backtest_sync; print('PXYBACKTEST runtime imports OK')"
+& $python -c "import optuna; from app.main import create_app; from services.backtest_service.engine_runner import run_backtest_sync; print('PXYBACKTEST runtime imports OK')"
 exit $LASTEXITCODE

@@ -5,12 +5,16 @@ import hashlib
 import json
 import logging
 import queue
+import subprocess
 import sys
 import threading
 import time
 import traceback
 from pathlib import Path
 from typing import Any
+
+A_SHARE_ADAPTER_CONTRACT = "pxybacktest.engine-adapter.a-share.v1"
+DAA_ENGINE_TYPES = {"a_share_portfolio", "factor_matrix", "event_sentiment"}
 
 
 def _configure_backtest_worker_logging() -> None:
@@ -45,30 +49,211 @@ def _atomic_json_write(path: Path, payload: Any) -> None:
 
 
 def build_replay_event_snapshot(events: list[Any], limit: int = 20) -> list[Any]:
-    return list(events[-max(1, limit):])
+    return list(events[-max(1, limit) :])
 
 
 def preload_pxylh_runtime(pxylh_root: str) -> None:
     backend_root = Path(pxylh_root).resolve() / "backend"
     if not backend_root.is_dir():
-        raise FileNotFoundError(f"PXYLH backend directory does not exist: {backend_root}")
+        raise FileNotFoundError(
+            f"PXYLH backend directory does not exist: {backend_root}"
+        )
     backend_path = str(backend_root)
     if backend_path not in sys.path:
         sys.path.insert(0, backend_path)
     from services.backtest_service.engine_runner import run_backtest_sync  # noqa: F401
-    from services.backtest_service.kline_loader import ensure_backtest_kline_data  # noqa: F401
-    from services.backtest_service.models import BacktestTask, convert_numpy_types  # noqa: F401
+    from services.backtest_service.kline_loader import (
+        ensure_backtest_kline_data,  # noqa: F401
+    )
+    from services.backtest_service.models import (  # noqa: F401
+        BacktestTask,
+        convert_numpy_types,
+    )
     from services.backtest_service.replay_runtime_utils import (  # noqa: F401
         build_replay_state,
         extract_live_orders,
         extract_live_positions,
         extract_live_trades,
     )
-    from services.backtest_service.strategy_line_utils import extract_strategy_lines  # noqa: F401
+    from services.backtest_service.strategy_line_utils import (
+        extract_strategy_lines,  # noqa: F401
+    )
+
+
+def _daa_python(daa_root: Path) -> Path:
+    windows_python = daa_root / "backend" / ".venv" / "Scripts" / "python.exe"
+    if windows_python.is_file():
+        return windows_python
+    return daa_root / "backend" / ".venv" / "bin" / "python"
+
+
+def _safe_adapter_error(error: Any, *private_roots: Path) -> str:
+    message = " ".join(str(error or "DAA worker failed").split())[:500]
+    for root in private_roots:
+        text = str(root)
+        if text:
+            message = message.replace(text, "<internal>")
+    return message
+
+
+def _stop_subprocess(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=0.25)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=1.0)
+
+
+def run_a_share_worker(
+    task_id: str,
+    request: dict[str, Any],
+    daa_root: str,
+    pxydata_root: str,
+    result_path: str,
+    job_dir: str,
+    event_queue,
+    command_queue,
+) -> None:
+    """通过 DAA 自有 Python 进程执行 manifest-bound A 股回测。"""
+    daa_path = Path(daa_root).resolve()
+    backend_root = daa_path / "backend"
+    data_root = Path(pxydata_root).resolve()
+    python = _daa_python(daa_path)
+    work_dir = Path(job_dir)
+    final_path = Path(result_path)
+    cancelled = False
+
+    try:
+        if (
+            not python.is_file()
+            or not (backend_root / "app" / "backtest" / "pxy_adapter.py").is_file()
+        ):
+            raise RuntimeError("DAA A 股适配器未安装")
+        if not data_root.is_dir():
+            raise RuntimeError("PXYDATA 数据根目录不可用")
+        task_contract = request.get("_task_contract")
+        manifest = request.get("_snapshot_manifest")
+        if not isinstance(task_contract, dict) or not isinstance(manifest, dict):
+            raise ValueError("A 股 worker 请求缺少任务契约或完整快照清单")
+
+        _emit(
+            event_queue,
+            "state",
+            {"status": "running", "phase": "verifying_snapshot", "progress": 2.0},
+        )
+        _emit(
+            event_queue,
+            "state",
+            {"status": "running", "phase": "running_engine", "progress": 10.0},
+        )
+
+        def cancel_requested() -> bool:
+            nonlocal cancelled
+            try:
+                while True:
+                    command_message = command_queue.get_nowait()
+                    if str(command_message.get("action") or "") == "cancel":
+                        cancelled = True
+            except queue.Empty:
+                pass
+            return cancelled
+
+        from app.optimization import run_task_optimization
+        from app.result_contract import build_a_share_result_v2
+
+        evaluation_index = 0
+
+        def evaluate(candidate: dict[str, Any]) -> dict[str, Any]:
+            nonlocal evaluation_index
+            evaluation_index += 1
+            adapter_request_path = work_dir / f"a-share-request-{evaluation_index}.json"
+            adapter_result_path = work_dir / f"a-share-result-{evaluation_index}.json"
+            candidate_request = {**request, "_task_contract": candidate}
+            _atomic_json_write(
+                adapter_request_path,
+                {
+                    "contract_version": A_SHARE_ADAPTER_CONTRACT,
+                    "task_id": task_id,
+                    "task": candidate,
+                    "manifest": manifest,
+                },
+            )
+            command = [
+                str(python),
+                "-m",
+                "app.backtest.pxy_adapter",
+                "--request",
+                str(adapter_request_path),
+                "--result",
+                str(adapter_result_path),
+                "--pxydata-root",
+                str(data_root),
+            ]
+            process = subprocess.Popen(
+                command,
+                cwd=backend_root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            while process.poll() is None:
+                if cancel_requested():
+                    _stop_subprocess(process)
+                    raise InterruptedError("A 股回测任务已取消")
+                time.sleep(0.05)
+            if not adapter_result_path.is_file():
+                raise RuntimeError("DAA worker 未生成结果")
+            adapter_response = json.loads(
+                adapter_result_path.read_text(encoding="utf-8")
+            )
+            if not isinstance(adapter_response, dict):
+                raise RuntimeError("DAA worker 返回格式无效")
+            if not adapter_response.get("success"):
+                error = _safe_adapter_error(
+                    adapter_response.get("error"), daa_path, data_root, work_dir
+                )
+                raise RuntimeError(f"DAA A 股回测失败: {error}")
+            raw_result = adapter_response.get("result")
+            if not isinstance(raw_result, dict):
+                raise RuntimeError("DAA worker 结果缺少 result 对象")
+            return build_a_share_result_v2(
+                task_id=task_id,
+                request=candidate_request,
+                raw_result=raw_result,
+            )
+
+        result = run_task_optimization(
+            task_contract,
+            evaluate,
+            cancel_check=cancel_requested,
+        )
+        _atomic_json_write(final_path, result)
+        _emit(
+            event_queue,
+            "completed",
+            {"result_path": str(final_path), "progress": 100.0},
+            terminal=True,
+        )
+    except Exception as exc:
+        if cancelled:
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
+        error = _safe_adapter_error(exc, daa_path, data_root, work_dir)
+        _emit(
+            event_queue,
+            "failed",
+            {"error": f"DAA A 股回测失败: {error}"},
+            terminal=True,
+        )
 
 
 def run_preloaded_worker(
     pxylh_root: str,
+    daa_root: str,
+    pxydata_root: str,
     render_interval_ms: int,
     event_queue,
     command_queue,
@@ -78,15 +263,41 @@ def run_preloaded_worker(
     _configure_backtest_worker_logging()
     try:
         preload_pxylh_runtime(pxylh_root)
-        ready_queue.put({"ready": True})
     except BaseException as exc:
-        ready_queue.put({"ready": False, "error": f"{type(exc).__name__}: {exc}"})
-        return
+        pxylh_preload_error = f"{type(exc).__name__}: {exc}"
+    else:
+        pxylh_preload_error = ""
+    ready_queue.put({"ready": True, "pxylh_preload_error": pxylh_preload_error})
 
     job = job_queue.get()
     if job is None:
         return
-    task_id, request, result_path = job
+    task_id, request, result_path, job_dir = job
+    engine_type = str(
+        (request.get("_task_contract") or {}).get("engine_type") or "vnpy_cta"
+    )
+    if engine_type in DAA_ENGINE_TYPES:
+        run_a_share_worker(
+            task_id,
+            request,
+            daa_root,
+            pxydata_root,
+            result_path,
+            job_dir,
+            event_queue,
+            command_queue,
+        )
+        return
+    if engine_type == "microstructure":
+        run_microstructure_worker(
+            task_id,
+            request,
+            pxydata_root,
+            result_path,
+            event_queue,
+            command_queue,
+        )
+        return
     run_backtest_worker(
         task_id,
         request,
@@ -96,6 +307,75 @@ def run_preloaded_worker(
         event_queue,
         command_queue,
     )
+
+
+def run_microstructure_worker(
+    task_id: str,
+    request: dict[str, Any],
+    pxydata_root: str,
+    result_path: str,
+    event_queue,
+    command_queue,
+) -> None:
+    """在隔离 worker 中执行 manifest-bound 真实 Tick 回放。"""
+    cancelled = False
+    try:
+        def cancel_requested() -> bool:
+            nonlocal cancelled
+            try:
+                while True:
+                    command = command_queue.get_nowait()
+                    if str(command.get("action") or "") == "cancel":
+                        cancelled = True
+            except queue.Empty:
+                pass
+            return cancelled
+
+        if cancel_requested():
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
+        task = request.get("_task_contract")
+        manifest = request.get("_snapshot_manifest")
+        if not isinstance(task, dict) or not isinstance(manifest, dict):
+            raise ValueError("microstructure worker 缺少任务契约或完整快照清单")
+        _emit(
+            event_queue,
+            "state",
+            {"status": "running", "phase": "verifying_ticks", "progress": 5.0},
+        )
+        from app.microstructure import run_microstructure_backtest
+        from app.optimization import run_task_optimization
+
+        def evaluate(candidate: dict[str, Any]) -> dict[str, Any]:
+            return run_microstructure_backtest(
+                task_id=task_id,
+                task=candidate,
+                manifest=manifest,
+                data_root=pxydata_root,
+            )
+
+        result = run_task_optimization(
+            task,
+            evaluate,
+            cancel_check=cancel_requested,
+        )
+        _atomic_json_write(Path(result_path), result)
+        _emit(
+            event_queue,
+            "completed",
+            {"result_path": str(result_path), "progress": 100.0},
+            terminal=True,
+        )
+    except Exception as exc:
+        if cancelled:
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
+        _emit(
+            event_queue,
+            "failed",
+            {"error": f"microstructure 回测失败: {type(exc).__name__}: {exc}"},
+            terminal=True,
+        )
 
 
 def _emit(
@@ -159,7 +439,9 @@ def run_backtest_worker(
         _emit(
             event_queue,
             "failed",
-            {"error": f"unable to load PXYLH backtest runtime: {type(exc).__name__}: {exc}"},
+            {
+                "error": f"unable to load PXYLH backtest runtime: {type(exc).__name__}: {exc}"
+            },
             terminal=True,
         )
         return
@@ -216,7 +498,9 @@ def run_backtest_worker(
             holder["error"] = f"{type(exc).__name__}: {exc}"
             holder["traceback"] = traceback.format_exc()
 
-    thread = threading.Thread(target=execute, name=f"backtest-{task_id[:8]}", daemon=True)
+    thread = threading.Thread(
+        target=execute, name=f"backtest-{task_id[:8]}", daemon=True
+    )
     thread.start()
 
     _emit(event_queue, "state", {"status": "running", "progress": 0.0})
@@ -238,7 +522,9 @@ def run_backtest_worker(
                 elif action == "resume":
                     requested_paused = False
                 elif action == "speed":
-                    requested_speed = max(1.0, min(100.0, float(command.get("speed") or 1)))
+                    requested_speed = max(
+                        1.0, min(100.0, float(command.get("speed") or 1))
+                    )
                     task.speed = requested_speed
                     applied_speed = None
                 elif action == "cancel":
@@ -341,6 +627,10 @@ def run_backtest_worker(
         return
 
     result = convert_numpy_types(holder.get("result") or {})
+    if request.get("_task_contract"):
+        from app.result_contract import build_result_v2
+
+        result = build_result_v2(task_id=task_id, request=request, raw_result=result)
     final_path = Path(result_path)
     _atomic_json_write(final_path, result)
     _emit(

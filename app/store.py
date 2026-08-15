@@ -83,13 +83,18 @@ class TaskStore:
     ) -> str:
         task_id = str(uuid.uuid4())
         now = time.time()
+        task_contract = request.get("_task_contract") or {}
+        execution = task_contract.get("execution") or {}
         state = {
             "task_id": task_id,
+            "schema_version": int(task_contract.get("schema_version") or 1),
+            "engine_type": task_contract.get("engine_type", "vnpy_cta"),
+            "data_snapshot": task_contract.get("data", {}).get("snapshot"),
             "status": "pending",
             "progress": 0.0,
             "processed_bars": 0,
             "total_bars": 0,
-            "speed": request.get("speed", 50),
+            "speed": request.get("speed", execution.get("speed", 50)),
             "replay": {},
             "live_bars": [],
             "live_trades": [],
@@ -204,7 +209,9 @@ class TaskStore:
                 ),
             )
 
-    def append_event(self, task_id: str, event_type: str, payload: dict[str, Any]) -> int:
+    def append_event(
+        self, task_id: str, event_type: str, payload: dict[str, Any]
+    ) -> int:
         return self.append_events(task_id, [(event_type, payload)])[0]
 
     def append_events(
@@ -429,14 +436,23 @@ class TaskStore:
         for row in rows:
             request = json.loads(row["request_json"])
             state = json.loads(row["state_json"])
+            task_contract = request.get("_task_contract") or {}
+            strategy = task_contract.get("strategy") or {}
+            universe = task_contract.get("universe") or {}
+            period = task_contract.get("period") or {}
             tasks.append(
                 {
                     "task_id": str(row["task_id"]),
-                    "strategy_class": request.get("strategy_class", ""),
-                    "vt_symbol": request.get("vt_symbol", ""),
-                    "interval": request.get("interval", ""),
-                    "start_time": request.get("start_time", ""),
-                    "end_time": request.get("end_time", ""),
+                    "schema_version": int(task_contract.get("schema_version") or 1),
+                    "engine_type": task_contract.get("engine_type", "vnpy_cta"),
+                    "data_snapshot": task_contract.get("data", {}).get("snapshot"),
+                    "strategy_class": request.get("strategy_class")
+                    or strategy.get("entrypoint", ""),
+                    "vt_symbol": request.get("vt_symbol")
+                    or ",".join(universe.get("symbols") or []),
+                    "interval": request.get("interval") or period.get("interval", ""),
+                    "start_time": request.get("start_time") or period.get("start", ""),
+                    "end_time": request.get("end_time") or period.get("end", ""),
                     "status": str(row["status"]),
                     "progress": float(state.get("progress") or 0),
                     "created_at": float(row["created_at"]),

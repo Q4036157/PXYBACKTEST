@@ -6,11 +6,10 @@ import multiprocessing
 import queue
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from .config import Settings
-from .store import TERMINAL_STATUSES, TaskNotFoundError, TaskStore
+from .store import TERMINAL_STATUSES, TaskStore
 from .worker_process import run_preloaded_worker
 
 
@@ -85,7 +84,9 @@ class TaskManager:
     async def submit(
         self, *, user_id: str, source_node: str, request: dict[str, Any]
     ) -> str:
-        queued_count = await asyncio.to_thread(self.store.count_queued_for_user, user_id)
+        queued_count = await asyncio.to_thread(
+            self.store.count_queued_for_user, user_id
+        )
         if queued_count >= self.settings.max_queued_per_user:
             raise QueueLimitError("当前用户的回测排队任务已达到上限")
         return await asyncio.to_thread(
@@ -195,7 +196,9 @@ class TaskManager:
             if task["status"] in TERMINAL_STATUSES:
                 return False
             status_matches = status is None or task["status"] == status
-            speed_matches = speed is None or abs(float(task.get("speed") or 0) - speed) < 1e-9
+            speed_matches = (
+                speed is None or abs(float(task.get("speed") or 0) - speed) < 1e-9
+            )
             if status_matches and speed_matches:
                 return True
             await asyncio.sleep(0.025)
@@ -229,7 +232,9 @@ class TaskManager:
                 self.store.append_event(
                     task_id,
                     "failed",
-                    {"error": f"回测Worker异常退出，exit_code={handle.process.exitcode}"},
+                    {
+                        "error": f"回测Worker异常退出，exit_code={handle.process.exitcode}"
+                    },
                 )
             self._workers.pop(task_id, None)
             if self._warm_worker is None and not self._stopping:
@@ -298,6 +303,8 @@ class TaskManager:
             target=run_preloaded_worker,
             args=(
                 str(self.settings.pxylh_root),
+                str(self.settings.daa_root),
+                str(self.settings.pxydata_data_root),
                 self.settings.render_interval_ms,
                 event_queue,
                 command_queue,
@@ -321,8 +328,9 @@ class TaskManager:
     ) -> None:
         task_id = pending["task_id"]
         result_path = self.settings.results_dir / task_id / "result.json"
+        job_dir = self.settings.jobs_dir / task_id
         warm_worker.job_queue.put_nowait(
-            (task_id, pending["request"], str(result_path))
+            (task_id, pending["request"], str(result_path), str(job_dir))
         )
         self._workers[task_id] = WorkerHandle(
             user_id=pending["user_id"],

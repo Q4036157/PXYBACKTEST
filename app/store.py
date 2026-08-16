@@ -361,7 +361,8 @@ class TaskStore:
                     bars[-1] = bar
                 else:
                     bars.append(bar)
-                state["live_bars"] = bars[-500:]
+                # 执行快照是事件裁剪后的恢复权威，必须保留回测起点以来的完整 K 线。
+                state["live_bars"] = bars
                 state["current_bar"] = bar
                 state["last_bar_replay_seq"] = max(
                     int(state.get("last_bar_replay_seq") or 0),

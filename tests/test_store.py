@@ -51,6 +51,39 @@ def test_store_applies_incremental_bar_events(tmp_path: Path) -> None:
     assert [event["seq"] for event in events] == [second_seq]
 
 
+def test_store_keeps_all_replayed_bars_in_execution_snapshot(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path / "backtest.sqlite3")
+    task_id = store.create_task(
+        user_id="user-a", source_node="204", request=request_payload()
+    )
+    store.mark_running(task_id)
+
+    store.append_events(
+        task_id,
+        [
+            (
+                "bar",
+                {
+                    "bar": {
+                        "datetime": f"2026-08-{1 + index // 1440:02d} "
+                        f"{index % 1440 // 60:02d}:{index % 60:02d}:00",
+                        "open": index,
+                        "close": index + 1,
+                    },
+                    "replay_seq": index + 1,
+                },
+            )
+            for index in range(750)
+        ],
+    )
+
+    task = store.get_task("user-a", task_id)
+
+    assert len(task["live_bars"]) == 750
+    assert task["live_bars"][0]["datetime"] == "2026-08-01 00:00:00"
+    assert task["live_bars"][-1]["datetime"] == "2026-08-01 12:29:00"
+
+
 def test_mark_running_keeps_column_and_state_json_consistent(tmp_path: Path) -> None:
     store = TaskStore(tmp_path / "backtest.sqlite3")
     task_id = store.create_task(

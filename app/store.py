@@ -95,6 +95,10 @@ class TaskStore:
             "processed_bars": 0,
             "total_bars": 0,
             "speed": request.get("speed", execution.get("speed", 50)),
+            "execution_mode": request.get(
+                "execution_mode", execution.get("execution_mode", "visual")
+            ),
+            "result_available": False,
             "replay": {},
             "live_bars": [],
             "live_trades": [],
@@ -254,7 +258,7 @@ class TaskStore:
                 sequences.append(seq)
                 state = self._apply_event(state, event_type, payload)
                 state["event_seq"] = seq
-                if event_type == "completed":
+                if event_type in {"completed", "cancelled"}:
                     result_path = str(payload.get("result_path") or "")
                 elif event_type == "failed":
                     error = str(payload.get("error") or "")
@@ -390,11 +394,17 @@ class TaskStore:
         elif event_type == "completed":
             state["status"] = "completed"
             state["progress"] = 100.0
+            state["result_available"] = bool(payload.get("result_path"))
         elif event_type == "failed":
             state["status"] = "failed"
             state["error"] = str(payload.get("error") or "backtest worker failed")
         elif event_type == "cancelled":
             state["status"] = "cancelled"
+            state["result_available"] = bool(
+                payload.get("result_available") or payload.get("result_path")
+            )
+            if payload.get("progress") is not None:
+                state["progress"] = float(payload["progress"])
         return state
 
     def get_task(self, user_id: str, task_id: str) -> dict[str, Any]:
@@ -476,6 +486,8 @@ class TaskStore:
                     "end_time": request.get("end_time") or period.get("end", ""),
                     "status": str(row["status"]),
                     "progress": float(state.get("progress") or 0),
+                    "result_available": bool(state.get("result_available")),
+                    "execution_mode": str(state.get("execution_mode") or "visual"),
                     "created_at": float(row["created_at"]),
                     "updated_at": float(row["updated_at"]),
                 }
@@ -536,7 +548,7 @@ class TaskStore:
         for row in rows:
             event_type = str(row["event_type"])
             payload = json.loads(row["payload_json"])
-            if event_type == "completed":
+            if event_type in {"completed", "cancelled"}:
                 payload.pop("result_path", None)
             if event_type == "failed":
                 payload.pop("traceback", None)

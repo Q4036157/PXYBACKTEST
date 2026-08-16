@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 from app.config import Settings
-from app.manager import TaskManager, WorkerHandle
+from app.manager import MAX_WORKER_EVENTS_PER_CYCLE, TaskManager, WorkerHandle
 from app.store import TaskStore
 
 from test_store import request_payload
@@ -157,7 +157,7 @@ def test_worker_event_persistence_does_not_block_asyncio_loop(tmp_path: Path) ->
     )
     store.mark_running(task_id)
     event_queue: queue.Queue = queue.Queue()
-    for index in range(150):
+    for index in range(MAX_WORKER_EVENTS_PER_CYCLE + 50):
         event_queue.put({"type": "state", "data": {"progress": index}})
     manager = TaskManager(configured, store)
     manager._workers[task_id] = WorkerHandle(

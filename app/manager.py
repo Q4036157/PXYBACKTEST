@@ -17,6 +17,38 @@ class QueueLimitError(ValueError):
     pass
 
 
+MAX_WORKER_EVENTS_PER_CYCLE = 500
+
+
+def compact_worker_event_batch(
+    events: list[tuple[str, dict[str, Any]]],
+) -> list[tuple[str, dict[str, Any]]]:
+    """同一轮排空中每根 K 线只保留最新 Tick，持久事件全部保留。"""
+    last_bar_indexes: dict[str, int] = {}
+    bar_event_counts: dict[str, int] = {}
+    for index, (event_type, payload) in enumerate(events):
+        if event_type != "bar":
+            continue
+        bar = payload.get("bar")
+        datetime = str(bar.get("datetime") or "") if isinstance(bar, dict) else ""
+        if datetime:
+            last_bar_indexes[datetime] = index
+            bar_event_counts[datetime] = bar_event_counts.get(datetime, 0) + 1
+
+    compacted: list[tuple[str, dict[str, Any]]] = []
+    for index, event in enumerate(events):
+        event_type, payload = event
+        if event_type == "bar":
+            bar = payload.get("bar")
+            datetime = str(bar.get("datetime") or "") if isinstance(bar, dict) else ""
+            if datetime and last_bar_indexes.get(datetime) != index:
+                continue
+            if datetime and bar_event_counts.get(datetime, 0) > 1:
+                event = (event_type, {**payload, "coalesced": True})
+        compacted.append(event)
+    return compacted
+
+
 @dataclass
 class WorkerHandle:
     user_id: str
@@ -167,10 +199,13 @@ class TaskManager:
 
     def result(self, user_id: str, task_id: str) -> dict[str, Any]:
         task = self.store.get_task(user_id, task_id)
-        if task["status"] != "completed":
+        if task["status"] not in {"completed", "cancelled"}:
             return task
         result_path = self.store.get_result_path(task_id)
         if not result_path.is_file():
+            if task["status"] == "cancelled":
+                task["result_available"] = False
+                return task
             self.store.append_event(
                 task_id,
                 "failed",
@@ -178,6 +213,7 @@ class TaskManager:
             )
             return self.store.get_task(user_id, task_id)
         task["result"] = json.loads(result_path.read_text(encoding="utf-8"))
+        task["result_available"] = True
         return task
 
     async def _loop(self) -> None:
@@ -213,7 +249,7 @@ class TaskManager:
     async def _drain_worker_events(self) -> None:
         for task_id, handle in list(self._workers.items()):
             batch: list[tuple[str, dict[str, Any]]] = []
-            for _ in range(100):
+            for _ in range(MAX_WORKER_EVENTS_PER_CYCLE):
                 try:
                     event = handle.event_queue.get_nowait()
                 except queue.Empty:
@@ -226,7 +262,8 @@ class TaskManager:
                 if event_type in {"completed", "failed", "cancelled"}:
                     handle.terminal_event_received = True
             if batch:
-                await asyncio.to_thread(self.store.append_events, task_id, batch)
+                compacted = compact_worker_event_batch(batch)
+                await asyncio.to_thread(self.store.append_events, task_id, compacted)
 
     def _reap_workers(self) -> None:
         for task_id, handle in list(self._workers.items()):

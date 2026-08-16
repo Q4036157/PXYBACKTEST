@@ -38,6 +38,7 @@ class SubmitBacktestRequest(BaseModel):
     slippage: float = Field(default=0, ge=0)
     speed: float = Field(default=50, ge=1, le=100)
     mode: Literal["BAR", "TICK"] = "BAR"
+    execution_mode: Literal["visual", "fast"] = "visual"
 
     @field_validator(
         "strategy_class", "vt_symbol", "interval", "start_time", "end_time"
@@ -235,6 +236,7 @@ class ExecutionModelV2(BaseModel):
     slippage: float = Field(default=0, ge=0)
     speed: float = Field(default=50, ge=1, le=100)
     mode: Literal["BAR", "TICK"] = "BAR"
+    execution_mode: Literal["visual", "fast"] = "visual"
     leverage: float | None = Field(default=None, gt=0)
     commission: float | None = Field(default=None, ge=0)
     stamp_tax: float | None = Field(default=None, ge=0)
@@ -512,6 +514,7 @@ class SubmitBacktestRequestV2(BaseModel):
                 "slippage": self.execution.slippage,
                 "speed": self.execution.speed,
                 "mode": self.execution.mode,
+                "execution_mode": self.execution.execution_mode,
             }
         ).model_dump()
         legacy["_task_contract"] = self.model_dump(mode="json")

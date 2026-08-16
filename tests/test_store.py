@@ -290,3 +290,57 @@ def test_missing_result_file_changes_completed_task_to_failed(tmp_path: Path) ->
 
     assert task["status"] == "failed"
     assert task["error"] == "回测结果文件不存在"
+
+
+def test_cancelled_task_keeps_and_returns_partial_result(tmp_path: Path) -> None:
+    settings = Settings(
+        runtime_root=tmp_path / "runtime",
+        pxylh_root=tmp_path / "PXYLH",
+        service_token="test-token",
+    )
+    store = TaskStore(settings.database_path)
+    task_id = store.create_task(
+        user_id="user-a", source_node="109", request=request_payload()
+    )
+    result_path = settings.results_dir / task_id / "result.json"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_text(
+        '{"complete":false,"termination_reason":"cancelled","trades":[]}',
+        encoding="utf-8",
+    )
+    store.append_event(
+        task_id,
+        "cancelled",
+        {
+            "result_path": str(result_path),
+            "result_available": True,
+            "progress": 3.91,
+        },
+    )
+
+    listed = store.list_tasks("user-a")[0]
+    task = TaskManager(settings, store).result("user-a", task_id)
+
+    assert listed["result_available"] is True
+    assert listed["progress"] == 3.91
+    assert task["status"] == "cancelled"
+    assert task["result_available"] is True
+    assert task["result"]["complete"] is False
+
+
+def test_cancelled_task_without_result_stays_cancelled(tmp_path: Path) -> None:
+    settings = Settings(
+        runtime_root=tmp_path / "runtime",
+        pxylh_root=tmp_path / "PXYLH",
+        service_token="test-token",
+    )
+    store = TaskStore(settings.database_path)
+    task_id = store.create_task(
+        user_id="user-a", source_node="109", request=request_payload()
+    )
+    store.append_event(task_id, "cancelled", {})
+
+    task = TaskManager(settings, store).result("user-a", task_id)
+
+    assert task["status"] == "cancelled"
+    assert task["result_available"] is False

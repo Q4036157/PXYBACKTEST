@@ -460,6 +460,7 @@ def run_backtest_worker(
         slippage=float(request.get("slippage") or 0),
         speed=float(request.get("speed") or 50),
         mode=str(request.get("mode") or "BAR").upper(),
+        execution_mode=str(request.get("execution_mode") or "visual").lower(),
     )
 
     holder: dict[str, Any] = {}
@@ -538,6 +539,12 @@ def run_backtest_worker(
 
         engine = task.engine
         if engine:
+            if (
+                cancelled
+                and not bool(getattr(engine, "is_cancelled", False))
+                and hasattr(engine, "cancel")
+            ):
+                engine.cancel()
             if applied_speed != requested_speed and hasattr(engine, "set_speed"):
                 engine.set_speed(requested_speed)
                 applied_speed = requested_speed
@@ -614,9 +621,6 @@ def run_backtest_worker(
         time.sleep(render_interval)
 
     thread.join(timeout=1.0)
-    if cancelled:
-        _emit(event_queue, "cancelled", {}, terminal=True)
-        return
     if "error" in holder:
         _emit(
             event_queue,
@@ -627,12 +631,34 @@ def run_backtest_worker(
         return
 
     result = convert_numpy_types(holder.get("result") or {})
+    result.update(
+        {
+            "complete": not cancelled,
+            "termination_reason": "cancelled" if cancelled else "completed",
+            "progress": float(task.progress or 0.0),
+            "processed_bars": int(task.processed_bars or 0),
+            "total_bars": int(task.total_bars or 0),
+            "current_datetime": str(task.current_datetime or ""),
+        }
+    )
     if request.get("_task_contract"):
         from app.result_contract import build_result_v2
 
         result = build_result_v2(task_id=task_id, request=request, raw_result=result)
     final_path = Path(result_path)
     _atomic_json_write(final_path, result)
+    if cancelled:
+        _emit(
+            event_queue,
+            "cancelled",
+            {
+                "result_path": str(final_path),
+                "result_available": True,
+                "progress": float(task.progress or 0.0),
+            },
+            terminal=True,
+        )
+        return
     _emit(
         event_queue,
         "completed",

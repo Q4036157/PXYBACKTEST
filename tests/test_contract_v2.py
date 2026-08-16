@@ -793,6 +793,32 @@ def test_result_v2_maps_legacy_vnpy_result_without_inventing_orders() -> None:
     assert result["run"]["random_seed"] == 7
 
 
+def test_result_v2_marks_cancelled_execution_as_partial() -> None:
+    task = _payload()
+    task["data"] = {"snapshot": _snapshot().model_dump(mode="json")}
+
+    result = build_result_v2(
+        task_id="task-partial",
+        request={"_task_contract": task},
+        raw_result={
+            "complete": False,
+            "termination_reason": "cancelled",
+            "progress": 3.91,
+            "processed_bars": 226,
+            "total_bars": 5760,
+            "current_datetime": "2026-08-01 03:45:00",
+            "trades": [{"trade_id": "trade-1", "pnl": 12.5}],
+            "data_count": 226,
+        },
+    )
+
+    assert result["complete"] is False
+    assert result["termination_reason"] == "cancelled"
+    assert result["diagnostics"]["progress"] == 3.91
+    assert result["diagnostics"]["processed_bars"] == 226
+    assert result["diagnostics"]["total_bars"] == 5760
+
+
 def test_result_v2_maps_daa_result_and_discloses_price_degradation() -> None:
     task = _a_share_payload()
     task["data"] = {"snapshot": _a_share_snapshot().model_dump(mode="json")}

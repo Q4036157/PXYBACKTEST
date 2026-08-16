@@ -153,6 +153,55 @@ def test_store_prunes_events_by_interval_instead_of_every_batch(
     assert len(events) == 5
 
 
+def test_event_page_returns_execution_snapshot_after_history_is_pruned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module, "EVENT_RETENTION", 5)
+    monkeypatch.setattr(store_module, "EVENT_PRUNE_INTERVAL", 1)
+    store = TaskStore(tmp_path / "backtest.sqlite3")
+    task_id = store.create_task(
+        user_id="user-a", source_node="204", request=request_payload()
+    )
+
+    sequences = []
+    for minute in range(7):
+        sequences.append(
+            store.append_event(
+                task_id,
+                "bar",
+                {
+                    "bar": {
+                        "datetime": f"2026-08-01 00:0{minute}:00",
+                        "open": minute,
+                        "close": minute + 1,
+                    },
+                    "replay_seq": minute + 1,
+                },
+            )
+        )
+
+    page = store.event_page(
+        "user-a", task_id, after_seq=sequences[0], limit=2
+    )
+
+    assert page["history_truncated"] is True
+    assert page["earliest_seq"] == sequences[2]
+    assert page["latest_seq"] == sequences[-1]
+    assert page["next_seq"] == sequences[3]
+    assert [event["seq"] for event in page["events"]] == sequences[2:4]
+    assert page["resync"]["event_seq"] == sequences[-1]
+    assert [bar["datetime"] for bar in page["resync"]["live_bars"]] == [
+        f"2026-08-01 00:0{minute}:00" for minute in range(7)
+    ]
+    assert page["resync"]["last_bar_replay_seq"] == 7
+
+    current_page = store.event_page(
+        "user-a", task_id, after_seq=sequences[-1], limit=2
+    )
+    assert current_page["history_truncated"] is False
+    assert current_page["resync"] is None
+
+
 def test_store_reports_global_queue_position_without_leaking_other_user(tmp_path: Path) -> None:
     store = TaskStore(tmp_path / "backtest.sqlite3")
     running_id = store.create_task(

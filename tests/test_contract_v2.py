@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,11 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.daa_client import DaaCapabilitiesError, _validate_capabilities
+from app.daa_client import (
+    DaaAdapterClient,
+    DaaCapabilitiesError,
+    _validate_capabilities,
+)
 from app.main import _bind_factor_set_to_manifest, create_app
 from app.models import (
     DataSnapshotRefV2,
@@ -550,6 +555,57 @@ def test_daa_capabilities_preserves_supported_factor_engine_types() -> None:
     )
 
     assert factor["engine_types"] == ["factor_matrix"]
+
+
+def test_daa_capabilities_timeout_is_a_controlled_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    settings.daa_python.parent.mkdir(parents=True)
+    settings.daa_python.touch()
+    adapter_path = settings.daa_backend_root / "app" / "backtest" / "pxy_adapter.py"
+    adapter_path.parent.mkdir(parents=True)
+    adapter_path.touch()
+    settings.pxydata_data_root.mkdir(parents=True)
+    client = DaaAdapterClient(settings, timeout_seconds=12.0)
+
+    def raise_timeout(*args, **kwargs):
+        assert kwargs["timeout"] == 12.0
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", raise_timeout)
+
+    with pytest.raises(DaaCapabilitiesError, match="读取超时"):
+        client._load_capabilities()
+
+
+def test_v2_capabilities_degrades_without_failing_when_daa_times_out(
+    tmp_path: Path,
+) -> None:
+    class TimedOutDaaClient:
+        @property
+        def configured(self) -> bool:
+            return True
+
+        async def get_capabilities(self) -> dict:
+            raise DaaCapabilitiesError("DAA 策略目录读取超时")
+
+    settings = _settings(tmp_path)
+    manager = StoreOnlyManager(TaskStore(settings.database_path))
+    app = create_app(
+        settings,
+        manager,
+        FakeSnapshotClient(_a_share_snapshot()),
+        TimedOutDaaClient(),  # type: ignore[arg-type]
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/v2/capabilities", headers=_headers())
+
+    assert response.status_code == 200
+    engines = {item["id"]: item for item in response.json()["engines"]}
+    assert engines["vnpy_cta"]["available"] is True
+    assert engines["a_share_portfolio"]["available"] is False
 
 
 def test_v2_model_rejects_invalid_data_choice_and_compares_actual_instants() -> None:

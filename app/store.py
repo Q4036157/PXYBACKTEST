@@ -103,6 +103,8 @@ class TaskStore:
             "strategy_lines": [],
             "recent_replay_events": [],
             "event_seq": 0,
+            "last_bar_replay_seq": 0,
+            "events_pruned_through": 0,
         }
         with self._lock, self._connection() as connection:
             connection.execute(
@@ -257,6 +259,38 @@ class TaskStore:
                 elif event_type == "failed":
                     error = str(payload.get("error") or "")
 
+            last_seq = sequences[-1]
+            last_pruned_seq = self._last_pruned_seq.get(task_id, 0)
+            if last_seq - last_pruned_seq >= EVENT_PRUNE_INTERVAL:
+                cutoff = connection.execute(
+                    """
+                    SELECT seq FROM task_events
+                    WHERE task_id = ?
+                    ORDER BY seq DESC LIMIT 1 OFFSET ?
+                    """,
+                    (task_id, EVENT_RETENTION - 1),
+                ).fetchone()
+                if cutoff is not None:
+                    cutoff_seq = int(cutoff["seq"])
+                    deleted = connection.execute(
+                        """
+                        SELECT MAX(seq) AS seq FROM task_events
+                        WHERE task_id = ? AND seq < ?
+                        """,
+                        (task_id, cutoff_seq),
+                    ).fetchone()
+                    deleted_through = int(deleted["seq"] or 0) if deleted else 0
+                    if deleted_through:
+                        connection.execute(
+                            "DELETE FROM task_events WHERE task_id = ? AND seq < ?",
+                            (task_id, cutoff_seq),
+                        )
+                        state["events_pruned_through"] = max(
+                            int(state.get("events_pruned_through") or 0),
+                            deleted_through,
+                        )
+                self._last_pruned_seq[task_id] = last_seq
+
             status = str(state.get("status") or "running")
             now = time.time()
             connection.execute(
@@ -279,23 +313,6 @@ class TaskStore:
                     task_id,
                 ),
             )
-            last_seq = sequences[-1]
-            last_pruned_seq = self._last_pruned_seq.get(task_id, 0)
-            if last_seq - last_pruned_seq >= EVENT_PRUNE_INTERVAL:
-                cutoff = connection.execute(
-                    """
-                    SELECT seq FROM task_events
-                    WHERE task_id = ?
-                    ORDER BY seq DESC LIMIT 1 OFFSET ?
-                    """,
-                    (task_id, EVENT_RETENTION - 1),
-                ).fetchone()
-                if cutoff is not None:
-                    connection.execute(
-                        "DELETE FROM task_events WHERE task_id = ? AND seq < ?",
-                        (task_id, int(cutoff["seq"])),
-                    )
-                self._last_pruned_seq[task_id] = last_seq
         return sequences
 
     @staticmethod
@@ -340,8 +357,12 @@ class TaskStore:
                     bars[-1] = bar
                 else:
                     bars.append(bar)
-                state["live_bars"] = bars[-100:]
+                state["live_bars"] = bars[-500:]
                 state["current_bar"] = bar
+                state["last_bar_replay_seq"] = max(
+                    int(state.get("last_bar_replay_seq") or 0),
+                    int(payload.get("replay_seq") or 0),
+                )
         elif event_type == "trade":
             trade = payload.get("trade")
             if isinstance(trade, dict):
@@ -509,6 +530,99 @@ class TaskStore:
             "active_task": active_task,
         }
 
+    @staticmethod
+    def _serialize_event_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            event_type = str(row["event_type"])
+            payload = json.loads(row["payload_json"])
+            if event_type == "completed":
+                payload.pop("result_path", None)
+            if event_type == "failed":
+                payload.pop("traceback", None)
+            events.append(
+                {
+                    "seq": int(row["seq"]),
+                    "type": event_type,
+                    "data": payload,
+                    "created_at": float(row["created_at"]),
+                }
+            )
+        return events
+
+    @staticmethod
+    def _replay_resync_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+        keys = (
+            "event_seq",
+            "last_bar_replay_seq",
+            "status",
+            "progress",
+            "current_datetime",
+            "processed_bars",
+            "total_bars",
+            "speed",
+            "replay",
+            "live_bars",
+            "live_trades",
+            "live_orders",
+            "live_positions",
+            "strategy_lines",
+            "recent_replay_events",
+            "current_bar",
+        )
+        return {key: state.get(key) for key in keys}
+
+    def event_page(
+        self, user_id: str, task_id: str, after_seq: int, limit: int = 200
+    ) -> dict[str, Any]:
+        """原子读取事件窗口；历史已裁剪时返回当前执行快照。"""
+        with self._lock, self._connection() as connection:
+            owned = connection.execute(
+                """
+                SELECT status, error, state_json FROM tasks
+                WHERE task_id = ? AND user_id = ?
+                """,
+                (task_id, user_id),
+            ).fetchone()
+            if owned is None:
+                raise TaskNotFoundError(task_id)
+            state = json.loads(owned["state_json"])
+            bounds = connection.execute(
+                """
+                SELECT MIN(seq) AS earliest_seq, MAX(seq) AS latest_seq
+                FROM task_events WHERE task_id = ? AND user_id = ?
+                """,
+                (task_id, user_id),
+            ).fetchone()
+            earliest_seq = int(bounds["earliest_seq"] or 0) if bounds else 0
+            latest_seq = int(bounds["latest_seq"] or 0) if bounds else 0
+            pruned_through = int(state.get("events_pruned_through") or 0)
+            history_truncated = pruned_through > after_seq
+            rows = connection.execute(
+                """
+                SELECT seq, event_type, payload_json, created_at
+                FROM task_events
+                WHERE task_id = ? AND user_id = ? AND seq > ?
+                ORDER BY seq ASC LIMIT ?
+                """,
+                (task_id, user_id, after_seq, limit),
+            ).fetchall()
+
+        events = self._serialize_event_rows(rows)
+        next_seq = int(events[-1]["seq"]) if events else after_seq
+        return {
+            "status": str(owned["status"]),
+            "error": str(owned["error"] or ""),
+            "events": events,
+            "next_seq": next_seq,
+            "earliest_seq": earliest_seq,
+            "latest_seq": latest_seq,
+            "history_truncated": history_truncated,
+            "resync": self._replay_resync_snapshot(state)
+            if history_truncated
+            else None,
+        }
+
     def events_after(
         self, user_id: str, task_id: str, after_seq: int, limit: int = 200
     ) -> list[dict[str, Any]]:
@@ -528,20 +642,4 @@ class TaskStore:
                 """,
                 (task_id, user_id, after_seq, limit),
             ).fetchall()
-        events: list[dict[str, Any]] = []
-        for row in rows:
-            event_type = str(row["event_type"])
-            payload = json.loads(row["payload_json"])
-            if event_type == "completed":
-                payload.pop("result_path", None)
-            if event_type == "failed":
-                payload.pop("traceback", None)
-            events.append(
-                {
-                    "seq": int(row["seq"]),
-                    "type": event_type,
-                    "data": payload,
-                    "created_at": float(row["created_at"]),
-                }
-            )
-        return events
+        return self._serialize_event_rows(rows)

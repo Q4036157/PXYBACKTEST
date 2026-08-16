@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
+from app.manager import PlaybackControlResult
 from app.models import SubmitBacktestRequest
 from app.store import TaskStore
 from pydantic import ValidationError
@@ -28,13 +29,13 @@ class StoreOnlyManager:
     def result(self, user_id: str, task_id: str) -> dict:
         return self.store.get_task(user_id, task_id)
 
-    async def pause(self, user_id: str, task_id: str) -> bool:
-        self.store.get_task(user_id, task_id)
-        return False
+    async def pause(self, user_id: str, task_id: str) -> PlaybackControlResult:
+        task = self.store.get_task(user_id, task_id)
+        return PlaybackControlResult(False, False, str(task["status"]))
 
-    async def resume(self, user_id: str, task_id: str) -> bool:
-        self.store.get_task(user_id, task_id)
-        return False
+    async def resume(self, user_id: str, task_id: str) -> PlaybackControlResult:
+        task = self.store.get_task(user_id, task_id)
+        return PlaybackControlResult(False, False, str(task["status"]))
 
     async def set_speed(self, user_id: str, task_id: str, speed: float) -> bool:
         self.store.get_task(user_id, task_id)
@@ -128,6 +129,42 @@ def test_task_routes_enforce_user_ownership(tmp_path: Path) -> None:
     assert response.status_code == 404
 
 
+def test_pause_response_reports_acceptance_confirmation_and_status(
+    tmp_path: Path,
+) -> None:
+    configured = settings(tmp_path)
+    manager = StoreOnlyManager(TaskStore(configured.database_path))
+    task_id = manager.store.create_task(
+        user_id="user-a",
+        source_node="204",
+        request={
+            "strategy_class": "ExampleStrategy",
+            "vt_symbol": "BTCUSDT_SWAP_OKX.GLOBAL",
+            "interval": "1m",
+            "start_time": "2026-08-01 00:00:00",
+            "end_time": "2026-08-02 00:00:00",
+        },
+    )
+    app = create_app(configured, manager)  # type: ignore[arg-type]
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/tasks/{task_id}/pause",
+            headers={
+                "X-PXY-Service-Token": "test-service-token",
+                "X-PXY-User-Id": "user-a",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": False,
+        "confirmed": False,
+        "status": "pending",
+        "message": "任务当前状态为 pending，无法暂停",
+    }
+
+
 def test_events_report_queue_position_and_active_progress(tmp_path: Path) -> None:
     configured = settings(tmp_path)
     manager = StoreOnlyManager(TaskStore(configured.database_path))
@@ -169,6 +206,54 @@ def test_events_report_queue_position_and_active_progress(tmp_path: Path) -> Non
     assert response.status_code == 200
     assert response.json()["queue_ahead"] == 1
     assert response.json()["active_task"]["progress"] == 40
+
+
+def test_events_contract_reports_window_without_false_truncation(
+    tmp_path: Path,
+) -> None:
+    configured = settings(tmp_path)
+    manager = StoreOnlyManager(TaskStore(configured.database_path))
+    task_id = manager.store.create_task(
+        user_id="user-a",
+        source_node="204",
+        request={
+            "strategy_class": "ExampleStrategy",
+            "vt_symbol": "BTCUSDT_SWAP_OKX.GLOBAL",
+            "interval": "1m",
+            "start_time": "2026-08-01 00:00:00",
+            "end_time": "2026-08-02 00:00:00",
+        },
+    )
+    seq = manager.store.append_event(
+        task_id,
+        "bar",
+        {
+            "bar": {
+                "datetime": "2026-08-01 00:00:00",
+                "open": 1,
+                "close": 2,
+            },
+            "replay_seq": 1,
+        },
+    )
+    app = create_app(configured, manager)  # type: ignore[arg-type]
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/tasks/{task_id}/events",
+            headers={
+                "X-PXY-Service-Token": "test-service-token",
+                "X-PXY-User-Id": "user-a",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["earliest_seq"] == seq
+    assert payload["latest_seq"] == seq
+    assert payload["next_seq"] == seq
+    assert payload["history_truncated"] is False
+    assert payload["resync"] is None
 
 
 @pytest.mark.parametrize(

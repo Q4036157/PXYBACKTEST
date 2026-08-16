@@ -418,26 +418,21 @@ def create_app(
         after_seq: int = Query(default=0, ge=0),
         limit: int = Query(default=200, ge=1, le=500),
     ) -> dict:
-        def load_event_page() -> tuple[dict, list[dict], dict]:
-            task_status = task_manager.store.get_task_status(identity.user_id, task_id)
-            page_events = task_manager.store.events_after(
+        def load_event_page() -> tuple[dict, dict]:
+            page = task_manager.store.event_page(
                 identity.user_id, task_id, after_seq, limit
             )
             context = task_manager.store.queue_context(identity.user_id, task_id)
-            return task_status, page_events, context
+            return page, context
 
         try:
-            task, events, queue_context = await asyncio.to_thread(load_event_page)
+            page, queue_context = await asyncio.to_thread(load_event_page)
         except TaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail="回测任务不存在") from exc
-        next_seq = events[-1]["seq"] if events else after_seq
         return {
             "success": True,
             "task_id": task_id,
-            "status": task["status"],
-            "error": task.get("error", ""),
-            "events": events,
-            "next_seq": next_seq,
+            **page,
             **queue_context,
         }
 
@@ -447,12 +442,23 @@ def create_app(
         identity: TrustedIdentity = Depends(identity_dependency),
     ) -> dict:
         try:
-            success = await task_manager.pause(identity.user_id, task_id)
+            result = await task_manager.pause(identity.user_id, task_id)
         except TaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail="回测任务不存在") from exc
+        message = (
+            "回测已暂停"
+            if result.confirmed
+            else (
+                "暂停指令已提交，正在等待工作站确认"
+                if result.accepted
+                else f"任务当前状态为 {result.status}，无法暂停"
+            )
+        )
         return {
-            "success": success,
-            "message": "回测已暂停" if success else "只能暂停运行中的任务",
+            "success": result.accepted,
+            "confirmed": result.confirmed,
+            "status": result.status,
+            "message": message,
         }
 
     @app.post("/api/v1/tasks/{task_id}/resume")
@@ -461,12 +467,23 @@ def create_app(
         identity: TrustedIdentity = Depends(identity_dependency),
     ) -> dict:
         try:
-            success = await task_manager.resume(identity.user_id, task_id)
+            result = await task_manager.resume(identity.user_id, task_id)
         except TaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail="回测任务不存在") from exc
+        message = (
+            "回测继续"
+            if result.confirmed
+            else (
+                "继续指令已提交，正在等待工作站确认"
+                if result.accepted
+                else f"任务当前状态为 {result.status}，无法继续"
+            )
+        )
         return {
-            "success": success,
-            "message": "回测继续" if success else "只能继续暂停的任务",
+            "success": result.accepted,
+            "confirmed": result.confirmed,
+            "status": result.status,
+            "message": message,
         }
 
     @app.post("/api/v1/tasks/{task_id}/speed")

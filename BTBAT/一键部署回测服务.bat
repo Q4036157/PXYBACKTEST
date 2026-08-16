@@ -29,9 +29,18 @@ if errorlevel 1 (
 :admin_ready
 set "SERVICE_NAME=pxy-backtest"
 set "SERVICE_PORT=3024"
-set "BACKTEST_PYTHON=D:\x1\x2\PXYBACKTEST\.venv\Scripts\python.exe"
+set "BACKTEST_PYTHON=D:\x1\x2\PXYLH\venv312\Scripts\python.exe"
+set "DAA_PYTHON=D:\x1\x2\DAA\backend\.venv\Scripts\python.exe"
 set "INSTALLER=D:\x1\x2\PXYOPS\deploy\windows\app-win-01\Install-PxyBacktestService.ps1"
 set "DEPLOYED_XML=C:\ProgramData\PXY\services\pxy-backtest\pxy-backtest.xml"
+set "SERVICE_TOKEN_FILE=C:\ProgramData\PXY\secrets\pxy-backtest-service-token"
+set "PXYDATA_KEY_FILE=C:\ProgramData\PXY\secrets\pxydata-api-key"
+set "PYTHONPATH=D:\x1\x2\PXYBACKTEST;D:\x1\x2\PXYLH;D:\x1\x2\PXYLH\backend"
+set "PXYBACKTEST_PXYLH_ROOT=D:\x1\x2\PXYLH"
+set "PXYBACKTEST_RUNTIME_ROOT=D:\x1\pxy-runtime\PXYBACKTEST"
+set "PXYBACKTEST_SERVICE_TOKEN_FILE=%SERVICE_TOKEN_FILE%"
+set "PXYBACKTEST_PXYDATA_BASE_URL=http://127.0.0.1:3020"
+set "PXYBACKTEST_PXYDATA_API_KEY_FILE=%PXYDATA_KEY_FILE%"
 
 echo ============================================================
 echo   PXYBACKTEST one-click deploy
@@ -40,7 +49,7 @@ echo   port:    127.0.0.1:%SERVICE_PORT%
 echo ============================================================
 
 echo.
-echo [1/5] Checking deployment files and isolated environment...
+echo [1/5] Checking deployment files and target runtime...
 if not exist "%BACKTEST_PYTHON%" (
   echo [FAIL] Python not found: %BACKTEST_PYTHON%
   goto :failed
@@ -49,9 +58,23 @@ if not exist "%INSTALLER%" (
   echo [FAIL] Installer not found: %INSTALLER%
   goto :failed
 )
-"%BACKTEST_PYTHON%" -c "import fastapi, optuna, pyarrow, uvicorn; print('Environment OK: optuna=' + optuna.__version__ + ', pyarrow=' + pyarrow.__version__)"
+if not exist "%DAA_PYTHON%" (
+  echo [FAIL] DAA Python not found: %DAA_PYTHON%
+  goto :failed
+)
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$token='%SERVICE_TOKEN_FILE%';$data='%PXYDATA_KEY_FILE%';if(-not(Test-Path -LiteralPath $token -PathType Leaf)){Write-Host ('[FAIL] Service token not found: '+$token) -ForegroundColor Red;exit 1};if((Get-Content -LiteralPath $token -Raw).Trim().Length -lt 32){Write-Host '[FAIL] Service token is too short.' -ForegroundColor Red;exit 1};if(-not(Test-Path -LiteralPath $data -PathType Leaf)){Write-Host ('[FAIL] PXYDATA API key not found: '+$data) -ForegroundColor Red;exit 1};if((Get-Content -LiteralPath $data -Raw).Trim().Length -lt 1){Write-Host '[FAIL] PXYDATA API key is empty.' -ForegroundColor Red;exit 1}"
 if errorlevel 1 (
-  echo [FAIL] The PXYBACKTEST environment is missing runtime dependencies.
+  echo [FAIL] Secret file preflight failed.
+  goto :failed
+)
+"%BACKTEST_PYTHON%" -c "import aiosqlite, fastapi, optuna, pyarrow, uvicorn, vnpy; from app.main import create_app; from services.backtest_service.engine_runner import run_backtest_sync; print('Runtime OK: optuna=' + optuna.__version__ + ', pyarrow=' + pyarrow.__version__ + ', aiosqlite=' + aiosqlite.__version__)"
+if errorlevel 1 (
+  echo [FAIL] The target Python cannot import the PXYLH backtest worker.
+  goto :failed
+)
+"%BACKTEST_PYTHON%" -c "import asyncio; from app.config import Settings; from app.daa_client import DaaAdapterClient; data=asyncio.run(DaaAdapterClient(Settings.from_env(), timeout_seconds=90).get_capabilities()); assert data.get('contract_version') == 'pxybacktest.engine-adapter.a-share.v1'; assert data.get('strategies'); print('DAA capabilities OK: strategies=' + str(len(data['strategies'])))"
+if errorlevel 1 (
+  echo [FAIL] DAA capabilities preflight failed.
   goto :failed
 )
 if /i "%~1"=="--check" (
@@ -88,7 +111,7 @@ if errorlevel 1 (
 
 echo.
 echo [4/5] Verifying the deployed Python path...
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$expected='D:\x1\x2\PXYBACKTEST\.venv\Scripts\python.exe';$xml=[xml](Get-Content -LiteralPath '%DEPLOYED_XML%' -Raw);if($xml.service.executable -ne $expected){Write-Host ('[FAIL] Deployed path mismatch: ' + $xml.service.executable) -ForegroundColor Red;exit 1};Write-Host ('Deployed Python: ' + $expected) -ForegroundColor Green"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$expected='D:\x1\x2\PXYLH\venv312\Scripts\python.exe';$xml=[xml](Get-Content -LiteralPath '%DEPLOYED_XML%' -Raw);if($xml.service.executable -ne $expected){Write-Host ('[FAIL] Deployed path mismatch: ' + $xml.service.executable) -ForegroundColor Red;exit 1};Write-Host ('Deployed Python: ' + $expected) -ForegroundColor Green"
 if errorlevel 1 goto :failed
 
 echo.
@@ -98,12 +121,8 @@ if errorlevel 1 (
   echo [FAIL] The service is not RUNNING.
   goto :failed
 )
-set "HTTP_CODE="
-for /f "delims=" %%c in ('curl.exe -s -o nul -w "%%{http_code}" --max-time 5 http://127.0.0.1:%SERVICE_PORT%/health 2^>nul') do set "HTTP_CODE=%%c"
-if not "!HTTP_CODE!"=="200" (
-  echo [FAIL] Health check returned HTTP !HTTP_CODE!.
-  goto :failed
-)
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$health=Invoke-RestMethod -Uri 'http://127.0.0.1:%SERVICE_PORT%/health' -TimeoutSec 8;if(-not $health.ok -or -not $health.serviceTokenConfigured -or -not $health.pxydataSnapshotConfigured){Write-Host '[FAIL] Health prerequisites are incomplete.' -ForegroundColor Red;exit 1};$token=(Get-Content -LiteralPath '%SERVICE_TOKEN_FILE%' -Raw).Trim();$headers=@{'X-PXY-Service-Token'=$token;'X-PXY-User-Id'='deployment-check';'X-PXY-Source-Node'='app-win-01'};$cap=Invoke-RestMethod -Uri 'http://127.0.0.1:%SERVICE_PORT%/api/v2/capabilities' -Headers $headers -TimeoutSec 20;$vnpy=$cap.engines|Where-Object id -eq 'vnpy_cta'|Select-Object -First 1;if($cap.task_contract -ne 'pxybacktest.task-result.v2' -or -not $vnpy.available){Write-Host '[FAIL] Capabilities contract check failed.' -ForegroundColor Red;exit 1};Write-Host '[OK] Health, PXYDATA and capabilities checks passed.' -ForegroundColor Green"
+if errorlevel 1 goto :failed
 
 echo.
 echo [OK] PXYBACKTEST deployment completed and health check passed.

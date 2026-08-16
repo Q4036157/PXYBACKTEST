@@ -31,6 +31,7 @@ class DaaCapabilitiesClient(Protocol):
 class DaaAdapterClient:
     settings: Settings
     cache_seconds: float = 60.0
+    timeout_seconds: float = 12.0
     _cached_at: float = field(default=0.0, init=False)
     _cached: dict[str, Any] | None = field(default=None, init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False)
@@ -49,21 +50,26 @@ class DaaAdapterClient:
             now = time.monotonic()
             if self._cached is not None and now - self._cached_at < self.cache_seconds:
                 return self._cached
-            process = subprocess.run(
-                [
-                    str(self.settings.daa_python),
-                    "-m",
-                    "app.backtest.pxy_adapter",
-                    "--capabilities",
-                ],
-                cwd=self.settings.daa_backend_root,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=15.0,
-                check=False,
-            )
+            try:
+                process = subprocess.run(
+                    [
+                        str(self.settings.daa_python),
+                        "-m",
+                        "app.backtest.pxy_adapter",
+                        "--capabilities",
+                    ],
+                    cwd=self.settings.daa_backend_root,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=self.timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise DaaCapabilitiesError("DAA 策略目录读取超时") from exc
+            except OSError as exc:
+                raise DaaCapabilitiesError("DAA 策略目录进程启动失败") from exc
             if process.returncode != 0:
                 raise DaaCapabilitiesError("DAA 策略目录读取失败")
             try:

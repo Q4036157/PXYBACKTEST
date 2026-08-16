@@ -36,6 +36,13 @@ class WarmWorkerHandle:
     ready: bool = False
 
 
+@dataclass(frozen=True)
+class PlaybackControlResult:
+    accepted: bool
+    confirmed: bool
+    status: str
+
+
 class TaskManager:
     def __init__(self, settings: Settings, store: TaskStore | None = None):
         self.settings = settings
@@ -96,43 +103,42 @@ class TaskManager:
             request=request,
         )
 
-    async def pause(self, user_id: str, task_id: str) -> bool:
-        task = await asyncio.to_thread(self.store.get_task, user_id, task_id)
-        if task["status"] != "running":
-            return False
-        handle = self._workers.get(task_id)
-        if handle is None:
-            return False
-        try:
-            handle.command_queue.put_nowait({"action": "pause"})
-        except queue.Full:
-            return False
-        if await self._wait_for_state(user_id, task_id, status="paused"):
-            return True
-        try:
-            handle.command_queue.put_nowait({"action": "resume"})
-        except queue.Full:
-            pass
-        return False
+    async def pause(self, user_id: str, task_id: str) -> PlaybackControlResult:
+        return await self._set_paused(user_id, task_id, paused=True)
 
-    async def resume(self, user_id: str, task_id: str) -> bool:
+    async def resume(self, user_id: str, task_id: str) -> PlaybackControlResult:
+        return await self._set_paused(user_id, task_id, paused=False)
+
+    async def _set_paused(
+        self, user_id: str, task_id: str, *, paused: bool
+    ) -> PlaybackControlResult:
         task = await asyncio.to_thread(self.store.get_task, user_id, task_id)
-        if task["status"] != "paused":
-            return False
+        target_status = "paused" if paused else "running"
+        current_status = str(task["status"])
+        if current_status == target_status:
+            return PlaybackControlResult(True, True, current_status)
+        if current_status not in {"running", "paused"}:
+            return PlaybackControlResult(False, False, current_status)
         handle = self._workers.get(task_id)
         if handle is None:
-            return False
+            return PlaybackControlResult(False, False, current_status)
         try:
-            handle.command_queue.put_nowait({"action": "resume"})
+            handle.command_queue.put_nowait(
+                {"action": "pause" if paused else "resume"}
+            )
         except queue.Full:
-            return False
-        if await self._wait_for_state(user_id, task_id, status="running"):
-            return True
-        try:
-            handle.command_queue.put_nowait({"action": "pause"})
-        except queue.Full:
-            pass
-        return False
+            return PlaybackControlResult(False, False, current_status)
+
+        confirmed = await self._wait_for_state(
+            user_id, task_id, status=target_status
+        )
+        latest = await asyncio.to_thread(self.store.get_task, user_id, task_id)
+        latest_status = str(latest["status"])
+        return PlaybackControlResult(
+            accepted=True,
+            confirmed=confirmed and latest_status == target_status,
+            status=latest_status,
+        )
 
     async def set_speed(self, user_id: str, task_id: str, speed: float) -> bool:
         task = await asyncio.to_thread(self.store.get_task, user_id, task_id)

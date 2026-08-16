@@ -2,6 +2,7 @@ import asyncio
 import queue
 import time
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from app.config import Settings
 from app.manager import TaskManager, WorkerHandle
@@ -37,6 +38,14 @@ class FullQueue:
         raise queue.Full
 
 
+class RecordingQueue:
+    def __init__(self) -> None:
+        self.commands: list[dict] = []
+
+    def put_nowait(self, command: dict) -> None:
+        self.commands.append(command)
+
+
 class SlowStore(TaskStore):
     def append_events(self, task_id: str, events: list[tuple[str, dict]]) -> list[int]:
         time.sleep(0.15)
@@ -66,9 +75,15 @@ def test_pause_resume_and_speed_wait_for_worker_ack(tmp_path: Path) -> None:
         command_queue=AcknowledgingQueue(store, task_id),
     )
 
-    assert asyncio.run(manager.pause("user-a", task_id)) is True
+    pause_result = asyncio.run(manager.pause("user-a", task_id))
+    assert pause_result.accepted is True
+    assert pause_result.confirmed is True
+    assert pause_result.status == "paused"
     assert store.get_task("user-a", task_id)["status"] == "paused"
-    assert asyncio.run(manager.resume("user-a", task_id)) is True
+    resume_result = asyncio.run(manager.resume("user-a", task_id))
+    assert resume_result.accepted is True
+    assert resume_result.confirmed is True
+    assert resume_result.status == "running"
     assert store.get_task("user-a", task_id)["status"] == "running"
     assert asyncio.run(manager.set_speed("user-a", task_id, 20)) is True
     assert store.get_task("user-a", task_id)["speed"] == 20
@@ -83,8 +98,51 @@ def test_pause_does_not_change_state_when_command_queue_is_full(tmp_path: Path) 
         command_queue=FullQueue(),
     )
 
-    assert asyncio.run(manager.pause("user-a", task_id)) is False
+    result = asyncio.run(manager.pause("user-a", task_id))
+    assert result.accepted is False
+    assert result.confirmed is False
+    assert result.status == "running"
     assert store.get_task("user-a", task_id)["status"] == "running"
+
+
+def test_pause_and_resume_are_idempotent(tmp_path: Path) -> None:
+    manager, store, task_id = build_manager(tmp_path)
+    command_queue = RecordingQueue()
+    manager._workers[task_id] = WorkerHandle(
+        user_id="user-a",
+        process=AliveProcess(),  # type: ignore[arg-type]
+        event_queue=None,
+        command_queue=command_queue,
+    )
+
+    store.append_event(task_id, "state", {"status": "paused"})
+    pause_result = asyncio.run(manager.pause("user-a", task_id))
+    assert pause_result.confirmed is True
+    assert command_queue.commands == []
+
+    store.append_event(task_id, "state", {"status": "running"})
+    resume_result = asyncio.run(manager.resume("user-a", task_id))
+    assert resume_result.confirmed is True
+    assert command_queue.commands == []
+
+
+def test_unconfirmed_pause_never_enqueues_reverse_compensation(tmp_path: Path) -> None:
+    manager, _store, task_id = build_manager(tmp_path)
+    command_queue = RecordingQueue()
+    manager._workers[task_id] = WorkerHandle(
+        user_id="user-a",
+        process=AliveProcess(),  # type: ignore[arg-type]
+        event_queue=None,
+        command_queue=command_queue,
+    )
+    manager._wait_for_state = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    result = asyncio.run(manager.pause("user-a", task_id))
+
+    assert result.accepted is True
+    assert result.confirmed is False
+    assert result.status == "running"
+    assert command_queue.commands == [{"action": "pause"}]
 
 
 def test_worker_event_persistence_does_not_block_asyncio_loop(tmp_path: Path) -> None:

@@ -16,11 +16,14 @@ WorkflowNodeType = Literal[
     "data_source",
     "feature_engineering",
     "model_training",
+    "model_ensemble",
+    "custom_data",
     "portfolio",
     "risk",
     "backtest",
     "report",
     "live_signal",
+    "llm_signal",
 ]
 
 
@@ -100,6 +103,21 @@ def validate_workflow(payload: dict[str, Any]) -> dict[str, Any]:
     for node_id in live_ids:
         if backtest_id not in _ancestors(node_id, nodes):
             raise ValueError("live_signal 必须依赖 backtest，且只产生信号")
+    llm_ids = [node_id for node_id, node in nodes.items() if node.get("type") == "llm_signal"]
+    if mode == "research" and llm_ids:
+        raise ValueError("llm_signal 只能用于 paper 或 live_signal 模式")
+    for node_id in llm_ids:
+        if backtest_id not in _ancestors(node_id, nodes):
+            raise ValueError("llm_signal 必须依赖 backtest，且只产生信号")
+    custom_ids = [node_id for node_id, node in nodes.items() if node.get("type") == "custom_data"]
+    for node_id in custom_ids:
+        if source_id not in _ancestors(node_id, nodes) and node_id != source_id:
+            raise ValueError("custom_data 必须位于 data_source 之后")
+    ensemble_ids = [node_id for node_id, node in nodes.items() if node.get("type") == "model_ensemble"]
+    for node_id in ensemble_ids:
+        ancestors = _ancestors(node_id, nodes)
+        if sum(nodes[item].get("type") == "model_training" for item in ancestors) < 2:
+            raise ValueError("model_ensemble 至少需要两个上游 model_training 节点")
     return {
         "valid": True,
         "topological_order": order,

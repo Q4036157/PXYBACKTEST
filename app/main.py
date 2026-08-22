@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import date, timedelta
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import HTMLResponse
 
 from .auth import TrustedIdentity, build_identity_dependency
 from .config import Settings
@@ -21,6 +22,13 @@ from .learning import (
     learning_runtime_available,
     learning_runtime_capabilities,
 )
+from .lighter_microstructure import (
+    LIGHTER_STRATEGY_HASH,
+    LIGHTER_STRATEGY_ID,
+    lighter_runtime_available,
+)
+from .llm_signal import LLMRealtimeSignalRequest, LLMSignalError, generate_realtime_signal
+from .custom_nodes import CustomDataNodeRunRequest, CustomDataNodeSpec, CustomNodeError, run_custom_data_node, validate_custom_data_node
 from .models import (
     DAA_ENGINE_TYPES,
     DataSnapshotRefV2,
@@ -37,7 +45,10 @@ from .pxydata_client import (
 from .store import TaskNotFoundError
 
 A_SHARE_WARMUP_CALENDAR_DAYS = 120
-MANIFEST_ENGINE_TYPES = {*DAA_ENGINE_TYPES, "microstructure", *ML_ENGINE_TYPES}
+LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
+MANIFEST_ENGINE_TYPES = {
+    *DAA_ENGINE_TYPES, "microstructure", *ML_ENGINE_TYPES, *LIGHTER_ENGINE_TYPES
+}
 
 
 async def _verify_factor_set_binding(
@@ -110,6 +121,33 @@ def _snapshot_date_range(body: SubmitBacktestRequestV2) -> tuple[str, str]:
     return start.isoformat(), end.isoformat()
 
 
+def _workflow_editor_html() -> str:
+    """轻量 BeeAgent 风格 JSON 工作流编辑器；完整画布仍由上层前端负责。"""
+    return """<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><title>PXYBACKTEST Workflow Editor</title>
+<style>body{font:14px system-ui;background:#171717;color:#eee;margin:24px}textarea{width:100%;height:420px;background:#222;color:#eee;border:1px solid #555;padding:12px;font-family:monospace}button{padding:9px 16px;margin:8px 8px 8px 0;background:#d6a83b;border:0;border-radius:4px;cursor:pointer}pre{white-space:pre-wrap;background:#222;padding:12px}</style>
+<h2>PXYBACKTEST 工作流编辑器</h2>
+<p>这是后端自带的轻量 JSON 编辑器，保存/运行仍由受控 API 完成。</p>
+<textarea id="graph">{
+  "schema_version": 1,
+  "workflow_id": "demo",
+  "name": "研究工作流",
+  "mode": "research",
+  "nodes": [
+    {"id":"source","type":"data_source","depends_on":[]},
+    {"id":"features","type":"feature_engineering","depends_on":["source"]},
+    {"id":"backtest","type":"backtest","depends_on":["features"]}
+  ]
+}</textarea>
+<button onclick="validateGraph()">验证工作流</button><button onclick="addNode('custom_data')">添加自定义节点</button><button onclick="addNode('llm_signal')">添加 LLM 信号节点</button>
+<pre id="result">尚未验证</pre>
+<script>
+function value(){return JSON.parse(document.getElementById('graph').value)}
+function addNode(type){const x=value();const id=type+'_'+Date.now();const last=x.nodes[x.nodes.length-1].id;x.nodes.push({id,type,depends_on:[last],config:{}});document.getElementById('graph').value=JSON.stringify(x,null,2)}
+async function validateGraph(){try{const r=await fetch('/api/v2/workflows/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(value())});document.getElementById('result').textContent=await r.text()}catch(e){document.getElementById('result').textContent=e}}
+</script></html>"""
+
+
 def create_app(
     settings: Settings | None = None,
     manager: TaskManager | None = None,
@@ -127,6 +165,9 @@ def create_app(
     )
     learning_available = (
         configured.pxydata_data_root.is_dir() and learning_runtime_available()
+    )
+    lighter_available = (
+        configured.pxydata_data_root.is_dir() and lighter_runtime_available()
     )
 
     @asynccontextmanager
@@ -177,11 +218,23 @@ def create_app(
                 "contract": "pxybacktest.workflow.v1",
                 "node_types": [
                     "data_source", "feature_engineering", "model_training",
-                    "portfolio", "risk", "backtest", "report", "live_signal",
+                    "model_ensemble", "custom_data", "portfolio", "risk", "backtest",
+                    "report", "live_signal", "llm_signal",
                 ],
                 "execution_boundary": "signal_only_no_order_submission",
             },
             "learning": learning_runtime_capabilities(),
+            "llm": {
+                "enabled": bool(configured.llm_base_url and configured.llm_api_key),
+                "modes": ["paper", "live_signal"],
+                "historical_backtest": False,
+                "execution_boundary": "signal_only_no_order_submission",
+            },
+            "custom_nodes": {
+                "enabled": configured.custom_nodes_root.is_dir(),
+                "contract": "pxybacktest.custom-data-node.v1",
+                "trusted_local_code_only": True,
+            },
             "engines": [
                 {
                     "id": "vnpy_cta",
@@ -290,9 +343,37 @@ def create_app(
                     "available": learning_available and learning_runtime_capabilities()["optional"]["torch"],
                     "intervals": ["1d"],
                     "snapshot_enforcement": "manifest_bound",
-                    "models": ["transformer"],
+                    "models": [item for item in learning_runtime_capabilities()["models"] if item in {"lstm", "transformer", "transformer_seq", "ensemble"}],
                     "research_adapters": ["qlib", "rd-agent"],
                     "execution_mode": "offline_train_then_signal_only",
+                },
+                {
+                    "id": "lighter_microstructure",
+                    "available": lighter_available,
+                    "intervals": ["tick", "1s", "100ms"],
+                    "snapshot_enforcement": "manifest_bound",
+                    "data_contracts": [
+                        "pxydata.lighter_microstructure_factors.v1",
+                        "pxydata.lighter_order_book_events.v1",
+                        "pxydata.lighter_funding_history.v1",
+                    ],
+                    "features": [
+                        "funding_rate", "active_buy_sell", "l2_depth", "ofi",
+                    ],
+                    "strategies": [{
+                        "id": LIGHTER_STRATEGY_ID,
+                        "name": "Lighter 主动成交+资金费+多档盘口",
+                        "version": "builtin-v1",
+                        "source_hash": LIGHTER_STRATEGY_HASH,
+                        "entrypoint": LIGHTER_STRATEGY_ID,
+                        "parameters": [
+                            {"id": "book_depth", "default": 10},
+                            {"id": "entry_threshold", "default": 0.2},
+                            {"id": "max_hold_ms", "default": 3600000},
+                            {"id": "fee_bps_per_side", "default": 1.0},
+                            {"id": "slippage_bps_per_side", "default": 1.0},
+                        ],
+                    }],
                 },
                 {"id": "mt5_native", "available": False},
             ],
@@ -304,6 +385,54 @@ def create_app(
         _: TrustedIdentity = Depends(identity_dependency),
     ) -> dict:
         return validate_workflow(body.model_dump(mode="python"))
+
+    @app.post("/api/v2/signals/llm")
+    async def llm_signal_route(
+        body: LLMRealtimeSignalRequest,
+        _: TrustedIdentity = Depends(identity_dependency),
+    ) -> dict:
+        if not configured.llm_base_url or not configured.llm_api_key:
+            raise HTTPException(status_code=501, detail="LLM provider 尚未配置")
+        try:
+            return await generate_realtime_signal(
+                body,
+                base_url=configured.llm_base_url,
+                api_key=configured.llm_api_key,
+            )
+        except LLMSignalError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/api/v2/custom-nodes/validate")
+    async def validate_custom_node_route(
+        body: CustomDataNodeSpec,
+        _: TrustedIdentity = Depends(identity_dependency),
+    ) -> dict:
+        try:
+            return validate_custom_data_node(body, root=configured.custom_nodes_root)
+        except CustomNodeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v2/custom-nodes/run")
+    async def run_custom_node_route(
+        body: CustomDataNodeRunRequest,
+        _: TrustedIdentity = Depends(identity_dependency),
+    ) -> dict:
+        try:
+            result = run_custom_data_node(
+                body.spec,
+                root=configured.custom_nodes_root,
+                datas=body.datas,
+                context=body.context,
+            )
+        except CustomNodeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"ok": True, "result": result, "execution_boundary": "trusted_local_code_only"}
+
+    @app.get("/api/v2/workflows/editor", response_class=HTMLResponse)
+    async def workflow_editor_route(
+        _: TrustedIdentity = Depends(identity_dependency),
+    ) -> str:
+        return _workflow_editor_html()
 
     @app.post("/api/v1/tasks", status_code=status.HTTP_202_ACCEPTED)
     async def submit_task(
@@ -347,6 +476,7 @@ def create_app(
             or bool(engine_strategies)
             or (body.engine_type == "microstructure" and microstructure_available)
             or (body.engine_type in ML_ENGINE_TYPES and learning_available)
+            or (body.engine_type in LIGHTER_ENGINE_TYPES and lighter_available)
         )
         if not supported_engine:
             raise HTTPException(
@@ -386,6 +516,12 @@ def create_app(
             or body.strategy.source_hash.lower() != ML_STRATEGY_HASH
         ):
             raise HTTPException(status_code=409, detail="学习策略版本不一致")
+        if body.engine_type in LIGHTER_ENGINE_TYPES and (
+            body.strategy.id != LIGHTER_STRATEGY_ID
+            or body.strategy.entrypoint != LIGHTER_STRATEGY_ID
+            or body.strategy.source_hash.lower() != LIGHTER_STRATEGY_HASH
+        ):
+            raise HTTPException(status_code=409, detail="Lighter 策略版本不一致")
 
         try:
             start_date, end_date = _snapshot_date_range(body)

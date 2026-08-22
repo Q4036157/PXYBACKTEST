@@ -7,7 +7,7 @@ PXYLH 的独立工作站回测执行服务。109 和 204 只负责用户鉴权�
 - 所有已登录 PXYLH 用户均可提交任务，任务按用户隔离。
 - 支持 Lighter、OKX、Binance、BitMart、MT4/MT5 标准 VNPY 品种格式。
 - 规则、A 股因子、盘口微观结构和时间序列 ML 回测均走统一任务契约；Optuna/Walk-forward 作为独立优化层。
-- 内置 `linear_regression` 学习基线无需额外 ML 包；LightGBM、Transformer、QLib 和 RD-Agent 均为可选研究依赖。
+- 内置 `linear_regression` 学习基线无需额外 ML 包；LightGBM、LSTM、带位置编码的多时间步 Transformer、集成模型、QLib 和 RD-Agent 均为可选研究依赖。
 - 初始状态与后续增量事件分离，浏览器视觉刷新受限，策略引擎不跳 Tick。
 - 默认全局并发 1、每用户最多排队 3 个任务。
 
@@ -60,8 +60,14 @@ Lighter 微观结构面板可直接使用 `ofi_normalized`、`trade_imbalance`�
 `cancel_pressure`、`oi_flow_confirmation` 和 `future_mid_return_bps`。
 资金费率、持仓量等上下文列如果已经被 PXYDATA 的面板保存，也可通过
 `feature_columns` 选入。`task_type` 支持 `binary`、`ranking`、`regression`；
-`seq_len` 目前记录在契约中，真正的跨时间窗口模型仍需后续 LSTM/序列
-Transformer 适配器完成。
+`model_type=lstm` 使用按品种分组的真实时间窗口；`model_type=transformer_seq` 使用
+带可学习位置编码的多时间步 TransformerEncoder；`model_type=ensemble` 将
+LightGBM、LSTM、Transformer 的 OOS 预测按 `ensemble_weights` 加权。没有安装对应
+可选依赖时，服务会在能力接口中标记不可用并拒绝任务，不会悄悄降级。
+
+Lighter 专用 `lighter_microstructure` 引擎会从同一份 manifest 回放主动买/卖、资金费
+和多档盘口事件；若只有 `lighter_funding_history`，也可执行资金费研究回放。盘口重建
+遇到 nonce 断档会丢弃断档后的状态，避免坏盘口进入结果。
 
 数据切分按事件时间进行，`available_at > decision_time` 的数据会直接失败；
 结果只生成研究信号，不提交真实订单。需要实盘时，应把 OOS 信号交给
@@ -75,7 +81,12 @@ python -m pip install -e ".[ml,research]"
 ```
 
 `/api/v2/workflows/validate` 可校验“数据 → 特征 → 模型 → 组合 → 风控 →
-回测 → 报告/信号”的 DAG；`live_signal` 节点明确是 signal-only 边界。
+回测 → 报告/信号”的 DAG；新增 `custom_data`、`model_ensemble` 和 `llm_signal`
+节点。`/api/v2/workflows/editor` 提供一个轻量 JSON 编辑器；它是后端编辑器骨架，
+不是 BeeQuant 的完整商业画布。`/api/v2/signals/llm` 只接受工作站配置的
+OpenAI-compatible provider，返回带 `audit_hash` 的实时信号，明确禁止历史回测和下单。
+`custom_data` 只加载工作站 `PXYBACKTEST_CUSTOM_NODES_ROOT` 下、SHA256 已登记的
+本地受信任 Python；它不是公网任意代码沙箱。
 
 开源体验应通过 PXYLH 登录后的代理入口访问。不要直接把工作站 `3024`、服务令牌、
 账户信息或私有数据暴露到公网。
@@ -95,6 +106,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
 - `PXYBACKTEST_SERVICE_TOKEN_FILE`
 - `PXYBACKTEST_PXYLH_ROOT`
 - `PXYBACKTEST_RUNTIME_ROOT`
+- `PXYBACKTEST_PXYDATA_DATA_ROOT`
+- `PXYBACKTEST_LLM_BASE_URL`、`PXYBACKTEST_LLM_API_KEY_FILE`（仅启用实时 LLM 信号时）
+- `PXYBACKTEST_CUSTOM_NODES_ROOT`（默认 `D:\x1\pxy-runtime\PXYBACKTEST\custom_nodes`）
 
 本机验证：
 

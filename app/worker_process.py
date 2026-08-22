@@ -16,6 +16,7 @@ from typing import Any
 A_SHARE_ADAPTER_CONTRACT = "pxybacktest.engine-adapter.a-share.v1"
 DAA_ENGINE_TYPES = {"a_share_portfolio", "factor_matrix", "event_sentiment"}
 ML_ENGINE_TYPES = {"ml_factor", "deep_learning"}
+LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
 
 
 def _configure_backtest_worker_logging() -> None:
@@ -309,6 +310,16 @@ def run_preloaded_worker(
             command_queue,
         )
         return
+    if engine_type in LIGHTER_ENGINE_TYPES:
+        run_lighter_worker(
+            task_id,
+            request,
+            pxydata_root,
+            result_path,
+            event_queue,
+            command_queue,
+        )
+        return
     run_backtest_worker(
         task_id,
         request,
@@ -451,6 +462,43 @@ def run_learning_worker(
             {"error": f"学习回测失败: {type(exc).__name__}: {exc}"},
             terminal=True,
         )
+
+
+def run_lighter_worker(
+    task_id: str,
+    request: dict[str, Any],
+    pxydata_root: str,
+    result_path: str,
+    event_queue,
+    command_queue,
+) -> None:
+    """执行 manifest-bound Lighter 资金费/盘口/主动成交回放。"""
+    cancelled = False
+    try:
+        task = request.get("_task_contract")
+        manifest = request.get("_snapshot_manifest")
+        if not isinstance(task, dict) or not isinstance(manifest, dict):
+            raise ValueError("Lighter worker 缺少任务契约或完整快照清单")
+        try:
+            while True:
+                command = command_queue.get_nowait()
+                if str(command.get("action") or "") == "cancel":
+                    cancelled = True
+        except queue.Empty:
+            pass
+        if cancelled:
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
+        _emit(event_queue, "state", {"status": "running", "phase": "rebuilding_lighter_book", "progress": 5.0})
+        from app.lighter_microstructure import run_lighter_backtest
+        result = run_lighter_backtest(task_id=task_id, task=task, manifest=manifest, data_root=pxydata_root)
+        _atomic_json_write(Path(result_path), result)
+        _emit(event_queue, "completed", {"result_path": str(result_path), "progress": 100.0}, terminal=True)
+    except Exception as exc:
+        if cancelled:
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
+        _emit(event_queue, "failed", {"error": f"Lighter 回测失败: {type(exc).__name__}: {exc}"}, terminal=True)
 
 
 def _emit(

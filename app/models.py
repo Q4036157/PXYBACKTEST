@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 SUPPORTED_PLATFORMS = {"LIGHTER", "OKX", "BINANCE", "BITMART", "MT4", "MT5"}
 DAA_ENGINE_TYPES = {"a_share_portfolio", "factor_matrix", "event_sentiment"}
 ML_ENGINE_TYPES = {"ml_factor", "deep_learning"}
+LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
 
 
 def _extract_platform(vt_symbol: str) -> str:
@@ -80,6 +81,7 @@ EngineType = Literal[
     "microstructure",
     "ml_factor",
     "deep_learning",
+    "lighter_microstructure",
     "mt5_native",
 ]
 
@@ -345,11 +347,14 @@ class SubmitBacktestRequestV2(BaseModel):
             self._validate_microstructure_contract()
         elif self.engine_type in ML_ENGINE_TYPES:
             self._validate_learning_contract()
+        elif self.engine_type in LIGHTER_ENGINE_TYPES:
+            self._validate_lighter_contract()
         if self.optimization is not None and self.engine_type not in {
             "a_share_portfolio",
             "factor_matrix",
             "event_sentiment",
             "microstructure",
+            "lighter_microstructure",
         }:
             raise ValueError(f"{self.engine_type} 尚不支持统一优化任务")
 
@@ -385,7 +390,10 @@ class SubmitBacktestRequestV2(BaseModel):
         if label_column.startswith("forward_return_") and "kline_daily" not in set(datasets):
             raise ValueError("forward_return 标签需要同一快照包含 kline_daily")
         model_type = str(parameters.get("model_type") or "linear_regression").lower()
-        allowed = {"linear_regression", "linear_logit", "lightgbm", "transformer"}
+        allowed = {
+            "linear_regression", "linear_logit", "lightgbm", "lstm",
+            "transformer", "transformer_seq", "ensemble",
+        }
         if model_type not in allowed:
             raise ValueError(f"学习模型不受支持: {model_type}")
         task_type = str(parameters.get("task_type") or "regression").lower()
@@ -394,8 +402,10 @@ class SubmitBacktestRequestV2(BaseModel):
         seq_len = int(parameters.get("seq_len") or 1)
         if seq_len < 1 or seq_len > 4096:
             raise ValueError("学习回测 parameters.seq_len 必须在 1 到 4096 之间")
-        if self.engine_type == "deep_learning" and model_type != "transformer":
-            raise ValueError("deep_learning 引擎必须使用 model_type=transformer")
+        if self.engine_type == "deep_learning" and model_type not in {
+            "lstm", "transformer", "transformer_seq", "ensemble",
+        }:
+            raise ValueError("deep_learning 引擎必须使用 lstm、transformer、transformer_seq 或 ensemble")
         for name in ("train_days", "test_days", "step_days", "purge_days", "embargo_days", "top_k"):
             value = parameters.get(name)
             if value is not None and int(value) < 0:
@@ -520,6 +530,33 @@ class SubmitBacktestRequestV2(BaseModel):
         if not 0 < threshold < 1 or not 0 <= exit_threshold < threshold:
             raise ValueError("microstructure 盘口不平衡阈值无效")
 
+    def _validate_lighter_contract(self) -> None:
+        if len(self.universe.symbols) != 1:
+            raise ValueError("lighter_microstructure 当前要求恰好一个品种")
+        if self.period.interval not in {"tick", "1s", "100ms"}:
+            raise ValueError("lighter_microstructure 只支持 tick、1s 或 100ms")
+        if self.execution.mode != "TICK":
+            raise ValueError("lighter_microstructure 必须使用 TICK 模式")
+        if self.strategy.id != self.strategy.entrypoint:
+            raise ValueError("Lighter 策略要求 strategy.id 与 entrypoint 一致")
+        if re.fullmatch(r"[0-9a-fA-F]{64}", self.strategy.source_hash) is None:
+            raise ValueError("Lighter 策略要求完整的 strategy.source_hash SHA256")
+        datasets = (
+            self.data.selection.datasets
+            if self.data.selection is not None
+            else [item.name for item in self.data.snapshot.datasets]  # type: ignore[union-attr]
+        )
+        if not ({"lighter_microstructure_factors", "lighter_order_book_events", "lighter_funding_history"} & set(datasets)):
+            raise ValueError("Lighter 回测必须包含微观结构因子、盘口事件或资金费历史")
+        for name in ("book_depth", "max_hold_ms"):
+            value = int(self.parameters.get(name) or (10 if name == "book_depth" else 3_600_000))
+            if value < 1:
+                raise ValueError(f"Lighter parameters.{name} 必须大于 0")
+        threshold = float(self.parameters.get("entry_threshold", 0.2))
+        exit_threshold = float(self.parameters.get("exit_threshold", 0.0))
+        if not 0 < threshold <= 1 or not 0 <= exit_threshold < threshold:
+            raise ValueError("Lighter 盘口信号阈值无效")
+
     def with_snapshot(
         self,
         snapshot: DataSnapshotRefV2,
@@ -554,6 +591,14 @@ class SubmitBacktestRequestV2(BaseModel):
         if self.engine_type in ML_ENGINE_TYPES:
             if snapshot_manifest is None:
                 raise ValueError(f"{self.engine_type} 缺少内部快照清单")
+            return {
+                "speed": self.execution.speed,
+                "_task_contract": self.model_dump(mode="json"),
+                "_snapshot_manifest": snapshot_manifest,
+            }
+        if self.engine_type in LIGHTER_ENGINE_TYPES:
+            if snapshot_manifest is None:
+                raise ValueError("lighter_microstructure 缺少内部快照清单")
             return {
                 "speed": self.execution.speed,
                 "_task_contract": self.model_dump(mode="json"),

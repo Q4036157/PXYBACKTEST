@@ -54,7 +54,9 @@ def learning_runtime_capabilities() -> dict[str, Any]:
     if result["optional"]["lightgbm"]:
         result["models"].append("lightgbm")
     if result["optional"]["torch"]:
-        result["models"].append("transformer")
+        result["models"].extend(["lstm", "transformer", "transformer_seq"])
+    if result["optional"]["lightgbm"] and result["optional"]["torch"]:
+        result["models"].append("ensemble")
     return result
 
 
@@ -191,13 +193,17 @@ def run_learning_backtest(
     task_type = str(parameters.get("task_type") or "regression").strip().lower()
     if task_type not in {"binary", "ranking", "regression"}:
         raise LearningBacktestError(f"不支持的 task_type: {task_type}")
-    if model_type not in {"linear_regression", "linear_logit", "lightgbm", "transformer"}:
+    if model_type not in {"linear_regression", "linear_logit", "lightgbm", "lstm", "transformer", "transformer_seq", "ensemble"}:
         raise LearningBacktestError(f"不支持的学习模型: {model_type}")
     capabilities = learning_runtime_capabilities()
     if model_type == "lightgbm" and not capabilities["optional"]["lightgbm"]:
         raise LearningBacktestError("lightgbm 未安装；请安装 PXYBACKTEST 的 ml extra")
-    if model_type == "transformer" and not capabilities["optional"]["torch"]:
+    if model_type in {"lstm", "transformer", "transformer_seq"} and not capabilities["optional"]["torch"]:
         raise LearningBacktestError("torch 未安装；请安装 PXYBACKTEST 的 ml extra")
+    if model_type == "ensemble" and not (
+        capabilities["optional"]["torch"] and capabilities["optional"]["lightgbm"]
+    ):
+        raise LearningBacktestError("ensemble 需要同时安装 torch 和 lightgbm")
 
     universe = dict(task.get("universe") or {})
     period = dict(task.get("period") or {})
@@ -227,7 +233,14 @@ def run_learning_backtest(
         if len(train) < 2 or not test:
             continue
         model = _fit_model(model_type, train, feature_columns, label_column, parameters)
-        predictions = [(row, model(_features(row, feature_columns))) for row in test]
+        sequence_model = model_type in {"lstm", "transformer", "transformer_seq", "ensemble"}
+        predictions = []
+        for row in test:
+            if sequence_model:
+                history = _history_for_row(rows, row, int(parameters.get("seq_len") or 1))
+                predictions.append((row, model([_features(item, feature_columns) for item in history])))
+            else:
+                predictions.append((row, model(_features(row, feature_columns))))
         by_day: dict[str, list[tuple[dict[str, Any], float]]] = {}
         for row, prediction in predictions:
             by_day.setdefault(_date(row["event_time"]).isoformat(), []).append((row, prediction))
@@ -273,7 +286,7 @@ def run_learning_backtest(
         "metrics": {"total_return": equity / capital - 1.0, "final_equity": equity, "net_profit": equity - capital, "max_drawdown": min(drawdowns, default=0.0), "sharpe": (statistics.fmean(returns) / volatility * math.sqrt(252) if volatility > 0 else 0.0), "hit_rate": sum(value > 0 for value in returns) / len(returns), "n_trades": sum(int(point.get("n_selected") or 0) for point in all_daily), "n_days": len(all_daily)},
         "curves": {"equity": equity_curve, "drawdown": [{"date": p["date"], "value": drawdowns[i]} for i, p in enumerate(all_daily)]},
         "deals": [],
-        "diagnostics": {"adapter": f"pxybacktest.{model_type}.v1", "data_source_policy": "pxydata_snapshot_only", "snapshot_enforcement": "manifest_bound", "strictly_reproducible": model_type in {"linear_regression", "linear_logit"}, "feature_columns": feature_columns, "label_column": label_column, "model_type": model_type, "task_type": task_type, "seq_len": int(parameters.get("seq_len") or 1), "purge_days": int(parameters.get("purge_days") or 0), "embargo_days": int(parameters.get("embargo_days") or 0), "folds": fold_meta, "warnings": ["学习回测只生成研究信号，不提交真实订单。", "当前 Transformer 将因子列作为 token；尚未使用跨时间序列窗口。"] if model_type == "transformer" else ["学习回测只生成研究信号，不提交真实订单。"]},
+        "diagnostics": {"adapter": f"pxybacktest.{model_type}.v1", "data_source_policy": "pxydata_snapshot_only", "snapshot_enforcement": "manifest_bound", "strictly_reproducible": model_type in {"linear_regression", "linear_logit"}, "feature_columns": feature_columns, "label_column": label_column, "model_type": model_type, "task_type": task_type, "seq_len": int(parameters.get("seq_len") or 1), "purge_days": int(parameters.get("purge_days") or 0), "embargo_days": int(parameters.get("embargo_days") or 0), "folds": fold_meta, "warnings": ["学习回测只生成研究信号，不提交真实订单。"]},
         "artifacts": [],
     }
 
@@ -287,22 +300,22 @@ def _fit_model(model_type: str, rows: list[dict[str, Any]], columns: list[str], 
         model = lgb.LGBMRegressor(random_state=int(parameters.get("seed") or 42), n_estimators=int(parameters.get("n_estimators") or 100), verbosity=-1)
         model.fit([_features(row, columns) for row in rows], [float(row[label]) for row in rows])
         return lambda values: float(model.predict([values])[0])
-    if model_type == "transformer":
-        return _fit_torch_transformer(rows, columns, label, parameters)
+    if model_type in {"lstm", "transformer", "transformer_seq"}:
+        return _fit_torch_sequence(rows, columns, label, parameters, architecture="lstm" if model_type == "lstm" else "transformer")
+    if model_type == "ensemble":
+        return _fit_ensemble(rows, columns, label, parameters)
     return _fit_linear_regression(rows, columns, label, parameters)
 
 
-def _fit_torch_transformer(
+def _fit_torch_sequence(
     rows: list[dict[str, Any]],
     columns: list[str],
     label: str,
     parameters: dict[str, Any],
+    *,
+    architecture: str = "transformer",
 ):
-    """一个小型、CPU 友好的 Transformer 回归器。
-
-    每个因子作为一个长度为 1 的 token；这样仍然是严格的横截面模型，
-    不把测试期序列拼进训练窗口。生产环境可由 QLib 导出更长序列替换此适配器。
-    """
+    """训练真正使用时间窗口的 LSTM 或 Transformer。"""
     try:
         import torch
         from torch import nn
@@ -310,38 +323,98 @@ def _fit_torch_transformer(
         raise LearningBacktestError("torch 未安装；请安装 PXYBACKTEST 的 ml extra") from exc
     seed = int(parameters.get("seed") or 42)
     torch.manual_seed(seed)
-    values = torch.tensor([_features(row, columns) for row in rows], dtype=torch.float32)
-    targets = torch.tensor([float(row[label]) for row in rows], dtype=torch.float32).reshape(-1, 1)
-    d_model = int(parameters.get("d_model") or 16)
-    heads = int(parameters.get("nhead") or 2)
-    if d_model < 4 or d_model % heads:
-        raise LearningBacktestError("Transformer 的 d_model 必须 >=4 且能被 nhead 整除")
-    encoder_layer = nn.TransformerEncoderLayer(
-        d_model=d_model,
-        nhead=heads,
-        dim_feedforward=max(d_model * 2, 16),
-        dropout=float(parameters.get("dropout") or 0.0),
-        batch_first=True,
-    )
-    encoder = nn.TransformerEncoder(encoder_layer, num_layers=int(parameters.get("num_layers") or 1))
-    model = nn.Sequential(nn.Linear(1, d_model), encoder, nn.Flatten(start_dim=1), nn.Linear(len(columns) * d_model, 1))
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(parameters.get("learning_rate") or 0.005))
+    seq_len = max(1, int(parameters.get("seq_len") or 1))
+    sequences, target_values = _training_sequences(rows, columns, label, seq_len)
+    if not sequences:
+        raise LearningBacktestError("序列模型训练窗内没有足够的 seq_len 样本")
+    values = torch.tensor(sequences, dtype=torch.float32)
+    targets = torch.tensor(target_values, dtype=torch.float32).reshape(-1, 1)
+    if architecture == "lstm":
+        hidden = int(parameters.get("hidden_size") or 32)
+        recurrent = nn.LSTM(len(columns), hidden, num_layers=int(parameters.get("num_layers") or 1), batch_first=True, dropout=float(parameters.get("dropout") or 0.0))
+        head = nn.Linear(hidden, 1)
+        def forward(batch):
+            output, _ = recurrent(batch)
+            return head(output[:, -1, :])
+        trainable = [*recurrent.parameters(), *head.parameters()]
+    else:
+        d_model = int(parameters.get("d_model") or 16)
+        heads = int(parameters.get("nhead") or 2)
+        if d_model < 4 or d_model % heads:
+            raise LearningBacktestError("Transformer 的 d_model 必须 >=4 且能被 nhead 整除")
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=heads, dim_feedforward=max(d_model * 2, 16), dropout=float(parameters.get("dropout") or 0.0), batch_first=True)
+        encoder = nn.TransformerEncoder(encoder_layer, num_layers=int(parameters.get("num_layers") or 1))
+        projection = nn.Linear(len(columns), d_model)
+        position = nn.Parameter(torch.zeros(1, seq_len, d_model))
+        head = nn.Linear(d_model, 1)
+        def forward(batch):
+            encoded = encoder(projection(batch) + position[:, :batch.shape[1], :])
+            return head(encoded[:, -1, :])
+        trainable = [*encoder.parameters(), *projection.parameters(), position, *head.parameters()]
+    optimizer = torch.optim.Adam(trainable, lr=float(parameters.get("learning_rate") or 0.005))
     loss_fn = nn.MSELoss()
-    model.train()
+    for parameter in trainable:
+        parameter.requires_grad_(True)
     for _ in range(max(1, min(int(parameters.get("epochs") or 80), 1000))):
         optimizer.zero_grad()
-        prediction = model(values.unsqueeze(-1))
+        prediction = forward(values)
         loss = loss_fn(prediction, targets)
         loss.backward()
         optimizer.step()
-    model.eval()
+    for parameter in trainable:
+        parameter.requires_grad_(False)
 
     def predict(feature_values: list[float]) -> float:
         with torch.no_grad():
             tensor = torch.tensor([feature_values], dtype=torch.float32)
-            return float(model(tensor.unsqueeze(-1))[0, 0].item())
+            return float(forward(tensor)[0, 0].item())
 
     return predict
+
+
+def _fit_ensemble(rows, columns, label, parameters):
+    lgb_predict = _fit_model("lightgbm", rows, columns, label, parameters)
+    lstm_predict = _fit_torch_sequence(rows, columns, label, parameters, architecture="lstm")
+    transformer_predict = _fit_torch_sequence(rows, columns, label, parameters, architecture="transformer")
+    weights = parameters.get("ensemble_weights") or [1.0, 1.0, 1.0]
+    try:
+        numeric_weights = [float(item) for item in weights]
+    except (TypeError, ValueError):
+        numeric_weights = []
+    if not isinstance(weights, list) or len(numeric_weights) != 3 or any(item <= 0 for item in numeric_weights):
+        raise LearningBacktestError("ensemble_weights 必须包含 3 个正权重")
+    total = sum(numeric_weights)
+    w_lgb, w_lstm, w_transformer = [item / total for item in numeric_weights]
+    def predict(sequence):
+        flat = sequence[-1]
+        return w_lgb * lgb_predict(flat) + w_lstm * lstm_predict(sequence) + w_transformer * transformer_predict(sequence)
+    return predict
+
+
+def _training_sequences(rows, columns, label, seq_len):
+    grouped = {}
+    for row in sorted(rows, key=lambda item: (str(item.get("symbol") or ""), item["event_time"])):
+        grouped.setdefault(str(row.get("symbol") or ""), []).append(row)
+    sequences, labels = [], []
+    for group in grouped.values():
+        for index, row in enumerate(group):
+            start = max(0, index - seq_len + 1)
+            window = group[start : index + 1]
+            if len(window) < seq_len:
+                window = [group[0]] * (seq_len - len(window)) + window
+            sequences.append([_features(item, columns) for item in window])
+            labels.append(float(row[label]))
+    return sequences, labels
+
+
+def _history_for_row(rows, row, seq_len):
+    symbol = str(row.get("symbol") or "")
+    prior = [item for item in rows if str(item.get("symbol") or "") == symbol and item["event_time"] <= row["event_time"]]
+    prior.sort(key=lambda item: item["event_time"])
+    window = prior[-max(1, seq_len):]
+    if len(window) < seq_len:
+        window = ([window[0]] if window else [row]) * (seq_len - len(window)) + window
+    return window
 
 
 def _fit_linear_regression(rows: list[dict[str, Any]], columns: list[str], label: str, parameters: dict[str, Any]):

@@ -66,6 +66,40 @@ def test_learning_contract_requires_features_and_point_in_time_dataset() -> None
     assert validated.engine_type == "ml_factor"
 
 
+def test_lighter_microstructure_factor_contract_supports_ranking_and_sequence_metadata() -> None:
+    payload = {
+        "schema_version": 2,
+        "engine_type": "ml_factor",
+        "strategy": {
+            "id": "temporal_ml_rank_v1",
+            "version": "builtin-v1",
+            "source_hash": "a" * 64,
+            "entrypoint": "temporal_ml_rank_v1",
+        },
+        "universe": {"symbols": ["LITUSDT_SWAP_LIGHTER"]},
+        "period": {
+            "start": "2026-01-01T00:00:00+00:00",
+            "end": "2026-01-03T00:00:00+00:00",
+            "interval": "1d",
+        },
+        "data": {
+            "selection": {
+                "datasets": ["lighter_microstructure_factors"],
+                "decision_time": "2026-01-03T00:00:00+00:00",
+            }
+        },
+        "parameters": {
+            "feature_columns": ["ofi_normalized", "trade_imbalance"],
+            "label_column": "future_mid_return_bps",
+            "task_type": "ranking",
+            "seq_len": 24,
+        },
+    }
+    validated = SubmitBacktestRequestV2.model_validate(payload)
+    assert validated.parameters["task_type"] == "ranking"
+    assert validated.parameters["seq_len"] == 24
+
+
 def test_learning_errors_when_no_fold_can_be_built() -> None:
     rows = [{"event_time": "2026-01-01T00:00:00+00:00"}]
     with pytest.raises(LearningBacktestError, match="不足"):

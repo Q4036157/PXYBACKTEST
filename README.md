@@ -27,8 +27,8 @@ PXYLH 的独立工作站回测执行服务。109 和 204 只负责用户鉴权�
 ## 学习回测与工作流
 
 `/api/v2/capabilities` 会声明 `ml_factor`、`deep_learning` 和节点工作流能力。
-学习任务必须绑定 PXYDATA 的不可变 `ml_features_daily` 或
-`factor_matrix_daily` 快照，并在 `parameters` 中指定 `feature_columns`、
+学习任务必须绑定 PXYDATA 的不可变 `ml_features_daily`、`factor_matrix_daily`
+或 `lighter_microstructure_factors` 快照，并在 `parameters` 中指定 `feature_columns`、
 `label_column` 和训练/测试窗口。例如：
 
 ```json
@@ -44,6 +44,8 @@ PXYLH 的独立工作站回测执行服务。109 和 204 只负责用户鉴权�
     "model_type": "linear_regression",
     "feature_columns": ["value_score", "quality_score", "sentiment_5d"],
     "label_column": "forward_return_5d",
+    "task_type": "ranking",
+    "seq_len": 1,
     "train_days": 252,
     "test_days": 63,
     "purge_days": 5,
@@ -52,6 +54,14 @@ PXYLH 的独立工作站回测执行服务。109 和 204 只负责用户鉴权�
   }
 }
 ```
+
+Lighter 微观结构面板可直接使用 `ofi_normalized`、`trade_imbalance`、
+`depth_imbalance_5`、`microprice_gap_bps`、`absorption_score`、
+`cancel_pressure`、`oi_flow_confirmation` 和 `future_mid_return_bps`。
+资金费率、持仓量等上下文列如果已经被 PXYDATA 的面板保存，也可通过
+`feature_columns` 选入。`task_type` 支持 `binary`、`ranking`、`regression`；
+`seq_len` 目前记录在契约中，真正的跨时间窗口模型仍需后续 LSTM/序列
+Transformer 适配器完成。
 
 数据切分按事件时间进行，`available_at > decision_time` 的数据会直接失败；
 结果只生成研究信号，不提交真实订单。需要实盘时，应把 OOS 信号交给

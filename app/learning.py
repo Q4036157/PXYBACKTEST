@@ -18,7 +18,11 @@ from pathlib import Path
 from typing import Any
 
 
-LEARNING_DATASET_NAMES = {"ml_features_daily", "factor_matrix_daily"}
+LEARNING_DATASET_NAMES = {
+    "ml_features_daily",
+    "factor_matrix_daily",
+    "lighter_microstructure_factors",
+}
 ML_ENGINE_TYPES = {"ml_factor", "deep_learning"}
 ML_STRATEGY_ID = "temporal_ml_rank_v1"
 ML_STRATEGY_HASH = hashlib.sha256(b"pxybacktest.temporal-ml-rank.v1").hexdigest()
@@ -85,7 +89,9 @@ def load_manifest_feature_rows(
         None,
     )
     if not isinstance(dataset, dict):
-        raise LearningBacktestError("执行快照缺少 ml_features_daily 或 factor_matrix_daily")
+        raise LearningBacktestError(
+            "执行快照缺少 ml_features_daily、factor_matrix_daily 或 lighter_microstructure_factors"
+        )
     files = dataset.get("files")
     if not isinstance(files, list) or not files:
         raise LearningBacktestError("学习特征清单没有文件")
@@ -182,6 +188,9 @@ def run_learning_backtest(
         raise LearningBacktestError("学习回测必须指定 parameters.feature_columns")
     label_column = str(parameters.get("label_column") or "label").strip()
     model_type = str(parameters.get("model_type") or "linear_regression").strip().lower()
+    task_type = str(parameters.get("task_type") or "regression").strip().lower()
+    if task_type not in {"binary", "ranking", "regression"}:
+        raise LearningBacktestError(f"不支持的 task_type: {task_type}")
     if model_type not in {"linear_regression", "linear_logit", "lightgbm", "transformer"}:
         raise LearningBacktestError(f"不支持的学习模型: {model_type}")
     capabilities = learning_runtime_capabilities()
@@ -223,8 +232,11 @@ def run_learning_backtest(
         for row, prediction in predictions:
             by_day.setdefault(_date(row["event_time"]).isoformat(), []).append((row, prediction))
         for day, values in sorted(by_day.items()):
-            selected = [item for item in values if item[1] > threshold]
-            selected.sort(key=lambda item: item[1], reverse=True)
+            values.sort(key=lambda item: item[1], reverse=True)
+            if task_type == "ranking":
+                selected = values
+            else:
+                selected = [item for item in values if item[1] > threshold]
             if top_k:
                 selected = selected[:top_k]
             if not selected:
@@ -261,7 +273,7 @@ def run_learning_backtest(
         "metrics": {"total_return": equity / capital - 1.0, "final_equity": equity, "net_profit": equity - capital, "max_drawdown": min(drawdowns, default=0.0), "sharpe": (statistics.fmean(returns) / volatility * math.sqrt(252) if volatility > 0 else 0.0), "hit_rate": sum(value > 0 for value in returns) / len(returns), "n_trades": sum(int(point.get("n_selected") or 0) for point in all_daily), "n_days": len(all_daily)},
         "curves": {"equity": equity_curve, "drawdown": [{"date": p["date"], "value": drawdowns[i]} for i, p in enumerate(all_daily)]},
         "deals": [],
-        "diagnostics": {"adapter": f"pxybacktest.{model_type}.v1", "data_source_policy": "pxydata_snapshot_only", "snapshot_enforcement": "manifest_bound", "strictly_reproducible": model_type == "linear_logit", "feature_columns": feature_columns, "label_column": label_column, "model_type": model_type, "purge_days": int(parameters.get("purge_days") or 0), "embargo_days": int(parameters.get("embargo_days") or 0), "folds": fold_meta, "warnings": ["学习回测只生成研究信号，不提交真实订单。"]},
+        "diagnostics": {"adapter": f"pxybacktest.{model_type}.v1", "data_source_policy": "pxydata_snapshot_only", "snapshot_enforcement": "manifest_bound", "strictly_reproducible": model_type in {"linear_regression", "linear_logit"}, "feature_columns": feature_columns, "label_column": label_column, "model_type": model_type, "task_type": task_type, "seq_len": int(parameters.get("seq_len") or 1), "purge_days": int(parameters.get("purge_days") or 0), "embargo_days": int(parameters.get("embargo_days") or 0), "folds": fold_meta, "warnings": ["学习回测只生成研究信号，不提交真实订单。", "当前 Transformer 将因子列作为 token；尚未使用跨时间序列窗口。"] if model_type == "transformer" else ["学习回测只生成研究信号，不提交真实订单。"]},
         "artifacts": [],
     }
 

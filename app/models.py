@@ -369,9 +369,9 @@ class SubmitBacktestRequestV2(BaseModel):
             if self.data.selection is not None
             else [item.name for item in self.data.snapshot.datasets]  # type: ignore[union-attr]
         )
-        if not ({"ml_features_daily", "factor_matrix_daily"} & set(datasets)):
+        if not ({"ml_features_daily", "factor_matrix_daily", "lighter_microstructure_factors"} & set(datasets)):
             raise ValueError(
-                "学习回测数据快照必须包含 ml_features_daily 或 factor_matrix_daily"
+                "学习回测数据快照必须包含 ml_features_daily、factor_matrix_daily 或 lighter_microstructure_factors"
             )
         parameters = self.parameters
         feature_columns = parameters.get("feature_columns")
@@ -388,6 +388,12 @@ class SubmitBacktestRequestV2(BaseModel):
         allowed = {"linear_regression", "linear_logit", "lightgbm", "transformer"}
         if model_type not in allowed:
             raise ValueError(f"学习模型不受支持: {model_type}")
+        task_type = str(parameters.get("task_type") or "regression").lower()
+        if task_type not in {"binary", "ranking", "regression"}:
+            raise ValueError(f"学习 task_type 不受支持: {task_type}")
+        seq_len = int(parameters.get("seq_len") or 1)
+        if seq_len < 1 or seq_len > 4096:
+            raise ValueError("学习回测 parameters.seq_len 必须在 1 到 4096 之间")
         if self.engine_type == "deep_learning" and model_type != "transformer":
             raise ValueError("deep_learning 引擎必须使用 model_type=transformer")
         for name in ("train_days", "test_days", "step_days", "purge_days", "embargo_days", "top_k"):

@@ -261,6 +261,7 @@ def create_app(
                     "feature_contracts": [
                         "pxydata.ml_features_daily.v1",
                         "pxydata.factor_matrix_daily.v1",
+                        "pxydata.lighter_microstructure_factors.v1",
                     ],
                     "models": learning_runtime_capabilities()["models"],
                     "research_adapters": ["qlib", "rd-agent"],
@@ -274,6 +275,8 @@ def create_app(
                             "parameters": [
                                 {"id": "feature_columns", "required": True},
                                 {"id": "label_column", "default": "label"},
+                                {"id": "task_type", "choices": ["binary", "ranking", "regression"]},
+                                {"id": "seq_len", "default": 1},
                                 {"id": "train_days", "default": 252},
                                 {"id": "test_days", "default": 63},
                                 {"id": "purge_days", "default": 5},

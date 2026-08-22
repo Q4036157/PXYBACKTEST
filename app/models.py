@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 SUPPORTED_PLATFORMS = {"LIGHTER", "OKX", "BINANCE", "BITMART", "MT4", "MT5"}
 DAA_ENGINE_TYPES = {"a_share_portfolio", "factor_matrix", "event_sentiment"}
+ML_ENGINE_TYPES = {"ml_factor", "deep_learning"}
 
 
 def _extract_platform(vt_symbol: str) -> str:
@@ -77,6 +78,8 @@ EngineType = Literal[
     "factor_matrix",
     "event_sentiment",
     "microstructure",
+    "ml_factor",
+    "deep_learning",
     "mt5_native",
 ]
 
@@ -340,6 +343,8 @@ class SubmitBacktestRequestV2(BaseModel):
             self._validate_factor_contract()
         elif self.engine_type == "microstructure":
             self._validate_microstructure_contract()
+        elif self.engine_type in ML_ENGINE_TYPES:
+            self._validate_learning_contract()
         if self.optimization is not None and self.engine_type not in {
             "a_share_portfolio",
             "factor_matrix",
@@ -347,6 +352,48 @@ class SubmitBacktestRequestV2(BaseModel):
             "microstructure",
         }:
             raise ValueError(f"{self.engine_type} 尚不支持统一优化任务")
+
+    def _validate_learning_contract(self) -> None:
+        if self.period.interval != "1d":
+            raise ValueError("学习回测首期只支持 1d")
+        if self.execution.mode != "BAR":
+            raise ValueError("学习回测首期只支持 BAR 模式")
+        if self.execution.leverage not in (None, 1.0):
+            raise ValueError("学习回测不支持杠杆")
+        if self.strategy.id != self.strategy.entrypoint:
+            raise ValueError("学习策略要求 strategy.id 与 entrypoint 一致")
+        if re.fullmatch(r"[0-9a-fA-F]{64}", self.strategy.source_hash) is None:
+            raise ValueError("学习策略要求完整的 strategy.source_hash SHA256")
+        datasets = (
+            self.data.selection.datasets
+            if self.data.selection is not None
+            else [item.name for item in self.data.snapshot.datasets]  # type: ignore[union-attr]
+        )
+        if not ({"ml_features_daily", "factor_matrix_daily"} & set(datasets)):
+            raise ValueError(
+                "学习回测数据快照必须包含 ml_features_daily 或 factor_matrix_daily"
+            )
+        parameters = self.parameters
+        feature_columns = parameters.get("feature_columns")
+        if not isinstance(feature_columns, list) or not feature_columns:
+            raise ValueError("学习回测必须指定 parameters.feature_columns")
+        if len(feature_columns) > 128 or any(not str(item).strip() for item in feature_columns):
+            raise ValueError("parameters.feature_columns 必须包含 1 到 128 个非空字段")
+        label_column = str(parameters.get("label_column") or "label").strip()
+        if not label_column:
+            raise ValueError("parameters.label_column 不能为空")
+        if label_column.startswith("forward_return_") and "kline_daily" not in set(datasets):
+            raise ValueError("forward_return 标签需要同一快照包含 kline_daily")
+        model_type = str(parameters.get("model_type") or "linear_regression").lower()
+        allowed = {"linear_regression", "linear_logit", "lightgbm", "transformer"}
+        if model_type not in allowed:
+            raise ValueError(f"学习模型不受支持: {model_type}")
+        if self.engine_type == "deep_learning" and model_type != "transformer":
+            raise ValueError("deep_learning 引擎必须使用 model_type=transformer")
+        for name in ("train_days", "test_days", "step_days", "purge_days", "embargo_days", "top_k"):
+            value = parameters.get(name)
+            if value is not None and int(value) < 0:
+                raise ValueError(f"学习回测 parameters.{name} 不能为负数")
 
     def _validate_a_share_contract(self) -> None:
         if self.period.interval != "1d":
@@ -493,6 +540,14 @@ class SubmitBacktestRequestV2(BaseModel):
         if self.engine_type == "microstructure":
             if snapshot_manifest is None:
                 raise ValueError("microstructure 缺少内部快照清单")
+            return {
+                "speed": self.execution.speed,
+                "_task_contract": self.model_dump(mode="json"),
+                "_snapshot_manifest": snapshot_manifest,
+            }
+        if self.engine_type in ML_ENGINE_TYPES:
+            if snapshot_manifest is None:
+                raise ValueError(f"{self.engine_type} 缺少内部快照清单")
             return {
                 "speed": self.execution.speed,
                 "_task_contract": self.model_dump(mode="json"),

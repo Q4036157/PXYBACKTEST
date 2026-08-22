@@ -15,6 +15,7 @@ from typing import Any
 
 A_SHARE_ADAPTER_CONTRACT = "pxybacktest.engine-adapter.a-share.v1"
 DAA_ENGINE_TYPES = {"a_share_portfolio", "factor_matrix", "event_sentiment"}
+ML_ENGINE_TYPES = {"ml_factor", "deep_learning"}
 
 
 def _configure_backtest_worker_logging() -> None:
@@ -298,6 +299,16 @@ def run_preloaded_worker(
             command_queue,
         )
         return
+    if engine_type in ML_ENGINE_TYPES:
+        run_learning_worker(
+            task_id,
+            request,
+            pxydata_root,
+            result_path,
+            event_queue,
+            command_queue,
+        )
+        return
     run_backtest_worker(
         task_id,
         request,
@@ -374,6 +385,70 @@ def run_microstructure_worker(
             event_queue,
             "failed",
             {"error": f"microstructure 回测失败: {type(exc).__name__}: {exc}"},
+            terminal=True,
+        )
+
+
+def run_learning_worker(
+    task_id: str,
+    request: dict[str, Any],
+    pxydata_root: str,
+    result_path: str,
+    event_queue,
+    command_queue,
+) -> None:
+    """在隔离进程中执行快照绑定的 ML/深度学习研究回测。"""
+    cancelled = False
+    try:
+        def cancel_requested() -> bool:
+            nonlocal cancelled
+            try:
+                while True:
+                    command = command_queue.get_nowait()
+                    if str(command.get("action") or "") == "cancel":
+                        cancelled = True
+            except queue.Empty:
+                pass
+            return cancelled
+
+        if cancel_requested():
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
+        task = request.get("_task_contract")
+        manifest = request.get("_snapshot_manifest")
+        if not isinstance(task, dict) or not isinstance(manifest, dict):
+            raise ValueError("学习 worker 缺少任务契约或完整快照清单")
+        _emit(
+            event_queue,
+            "state",
+            {"status": "running", "phase": "training_model", "progress": 5.0},
+        )
+        from app.learning import run_learning_backtest
+
+        if cancel_requested():
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
+        result = run_learning_backtest(
+            task_id=task_id,
+            task=task,
+            manifest=manifest,
+            data_root=pxydata_root,
+        )
+        _atomic_json_write(Path(result_path), result)
+        _emit(
+            event_queue,
+            "completed",
+            {"result_path": str(result_path), "progress": 100.0},
+            terminal=True,
+        )
+    except Exception as exc:
+        if cancelled:
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
+        _emit(
+            event_queue,
+            "failed",
+            {"error": f"学习回测失败: {type(exc).__name__}: {exc}"},
             terminal=True,
         )
 

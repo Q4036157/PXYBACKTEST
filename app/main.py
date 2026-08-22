@@ -15,6 +15,12 @@ from .microstructure import (
     MICROSTRUCTURE_STRATEGY_ID,
     microstructure_runtime_available,
 )
+from .learning import (
+    ML_ENGINE_TYPES,
+    ML_STRATEGY_HASH,
+    learning_runtime_available,
+    learning_runtime_capabilities,
+)
 from .models import (
     DAA_ENGINE_TYPES,
     DataSnapshotRefV2,
@@ -22,6 +28,7 @@ from .models import (
     SubmitBacktestRequest,
     SubmitBacktestRequestV2,
 )
+from .workflow import WorkflowSpec, validate_workflow
 from .pxydata_client import (
     PxyDataSnapshotClient,
     SnapshotClient,
@@ -30,7 +37,7 @@ from .pxydata_client import (
 from .store import TaskNotFoundError
 
 A_SHARE_WARMUP_CALENDAR_DAYS = 120
-MANIFEST_ENGINE_TYPES = {*DAA_ENGINE_TYPES, "microstructure"}
+MANIFEST_ENGINE_TYPES = {*DAA_ENGINE_TYPES, "microstructure", *ML_ENGINE_TYPES}
 
 
 async def _verify_factor_set_binding(
@@ -118,6 +125,9 @@ def create_app(
     microstructure_available = (
         configured.pxydata_data_root.is_dir() and microstructure_runtime_available()
     )
+    learning_available = (
+        configured.pxydata_data_root.is_dir() and learning_runtime_available()
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -163,6 +173,15 @@ def create_app(
                 "max_objectives": 3,
                 "snapshot_bound": True,
             },
+            "workflow": {
+                "contract": "pxybacktest.workflow.v1",
+                "node_types": [
+                    "data_source", "feature_engineering", "model_training",
+                    "portfolio", "risk", "backtest", "report", "live_signal",
+                ],
+                "execution_boundary": "signal_only_no_order_submission",
+            },
+            "learning": learning_runtime_capabilities(),
             "engines": [
                 {
                     "id": "vnpy_cta",
@@ -234,9 +253,54 @@ def create_app(
                         }
                     ],
                 },
+                {
+                    "id": "ml_factor",
+                    "available": learning_available,
+                    "intervals": ["1d"],
+                    "snapshot_enforcement": "manifest_bound",
+                    "feature_contracts": [
+                        "pxydata.ml_features_daily.v1",
+                        "pxydata.factor_matrix_daily.v1",
+                    ],
+                    "models": learning_runtime_capabilities()["models"],
+                    "research_adapters": ["qlib", "rd-agent"],
+                    "strategies": [
+                        {
+                            "id": "temporal_ml_rank_v1",
+                            "name": "时间序列 ML 横截面排序",
+                            "version": "builtin-v1",
+                            "source_hash": ML_STRATEGY_HASH,
+                            "entrypoint": "temporal_ml_rank_v1",
+                            "parameters": [
+                                {"id": "feature_columns", "required": True},
+                                {"id": "label_column", "default": "label"},
+                                {"id": "train_days", "default": 252},
+                                {"id": "test_days", "default": 63},
+                                {"id": "purge_days", "default": 5},
+                                {"id": "embargo_days", "default": 1},
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "id": "deep_learning",
+                    "available": learning_available and learning_runtime_capabilities()["optional"]["torch"],
+                    "intervals": ["1d"],
+                    "snapshot_enforcement": "manifest_bound",
+                    "models": ["transformer"],
+                    "research_adapters": ["qlib", "rd-agent"],
+                    "execution_mode": "offline_train_then_signal_only",
+                },
                 {"id": "mt5_native", "available": False},
             ],
         }
+
+    @app.post("/api/v2/workflows/validate")
+    async def validate_workflow_route(
+        body: WorkflowSpec,
+        _: TrustedIdentity = Depends(identity_dependency),
+    ) -> dict:
+        return validate_workflow(body.model_dump(mode="python"))
 
     @app.post("/api/v1/tasks", status_code=status.HTTP_202_ACCEPTED)
     async def submit_task(
@@ -279,6 +343,7 @@ def create_app(
             body.engine_type == "vnpy_cta"
             or bool(engine_strategies)
             or (body.engine_type == "microstructure" and microstructure_available)
+            or (body.engine_type in ML_ENGINE_TYPES and learning_available)
         )
         if not supported_engine:
             raise HTTPException(
@@ -312,6 +377,12 @@ def create_app(
             or body.strategy.source_hash.lower() != MICROSTRUCTURE_STRATEGY_HASH
         ):
             raise HTTPException(status_code=409, detail="microstructure 策略版本不一致")
+        if body.engine_type in ML_ENGINE_TYPES and (
+            body.strategy.id != "temporal_ml_rank_v1"
+            or body.strategy.entrypoint != "temporal_ml_rank_v1"
+            or body.strategy.source_hash.lower() != ML_STRATEGY_HASH
+        ):
+            raise HTTPException(status_code=409, detail="学习策略版本不一致")
 
         try:
             start_date, end_date = _snapshot_date_range(body)

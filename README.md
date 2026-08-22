@@ -6,7 +6,8 @@ PXYLH 的独立工作站回测执行服务。109 和 204 只负责用户鉴权�
 
 - 所有已登录 PXYLH 用户均可提交任务，任务按用户隔离。
 - 支持 Lighter、OKX、Binance、BitMart、MT4/MT5 标准 VNPY 品种格式。
-- 单次 MT5 式可视化回测；参数优化不在当前阶段。
+- 规则、A 股因子、盘口微观结构和时间序列 ML 回测均走统一任务契约；Optuna/Walk-forward 作为独立优化层。
+- 内置 `linear_regression` 学习基线无需额外 ML 包；LightGBM、Transformer、QLib 和 RD-Agent 均为可选研究依赖。
 - 初始状态与后续增量事件分离，浏览器视觉刷新受限，策略引擎不跳 Tick。
 - 默认全局并发 1、每用户最多排队 3 个任务。
 
@@ -22,6 +23,49 @@ PXYLH 的独立工作站回测执行服务。109 和 204 只负责用户鉴权�
 - A 股多因子：独立的数据源、交易日历、复权、因子快照和组合构建器；禁止把因子未来值注入当前 bar。
 - 时空融合：将时间序列特征与空间关系图作为版本化输入快照，记录数据截止时间和特征版本，保证可复现。
 - 参数优化：在单次可视化回测稳定后增加独立优化队列、资源配额和结果元数据，不与单次任务共用无限制并发。
+
+## 学习回测与工作流
+
+`/api/v2/capabilities` 会声明 `ml_factor`、`deep_learning` 和节点工作流能力。
+学习任务必须绑定 PXYDATA 的不可变 `ml_features_daily` 或
+`factor_matrix_daily` 快照，并在 `parameters` 中指定 `feature_columns`、
+`label_column` 和训练/测试窗口。例如：
+
+```json
+{
+  "engine_type": "ml_factor",
+  "strategy": {
+    "id": "temporal_ml_rank_v1",
+    "version": "builtin-v1",
+    "source_hash": "<内置策略 SHA256>",
+    "entrypoint": "temporal_ml_rank_v1"
+  },
+  "parameters": {
+    "model_type": "linear_regression",
+    "feature_columns": ["value_score", "quality_score", "sentiment_5d"],
+    "label_column": "forward_return_5d",
+    "train_days": 252,
+    "test_days": 63,
+    "purge_days": 5,
+    "embargo_days": 1,
+    "top_k": 10
+  }
+}
+```
+
+数据切分按事件时间进行，`available_at > decision_time` 的数据会直接失败；
+结果只生成研究信号，不提交真实订单。需要实盘时，应把 OOS 信号交给
+PXYLH 的预览、风控和人工确认链路。QLib 负责离线数据集/模型研究，RD-Agent
+负责提出因子和实验候选，二者都不能绕过 PXYDATA 快照和 PXYBACKTEST 回测。
+
+可选依赖安装：
+
+```powershell
+python -m pip install -e ".[ml,research]"
+```
+
+`/api/v2/workflows/validate` 可校验“数据 → 特征 → 模型 → 组合 → 风控 →
+回测 → 报告/信号”的 DAG；`live_signal` 节点明确是 signal-only 边界。
 
 开源体验应通过 PXYLH 登录后的代理入口访问。不要直接把工作站 `3024`、服务令牌、
 账户信息或私有数据暴露到公网。

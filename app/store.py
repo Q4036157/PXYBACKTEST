@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .kernel import stable_hash
+
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 EVENT_RETENTION = 5000

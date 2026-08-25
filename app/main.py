@@ -579,11 +579,14 @@ def create_app(
             parameter_updates = {**(parameter_updates or {}), **factor_updates}
         resolved = body.with_snapshot(snapshot, parameter_updates=parameter_updates)
         try:
+            worker_request = resolved.to_worker_request(snapshot_manifest=snapshot_manifest)
             task_id = await task_manager.submit(
                 user_id=identity.user_id,
                 source_node=identity.source_node,
-                request=resolved.to_worker_request(snapshot_manifest=snapshot_manifest),
+                request=worker_request,
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except QueueLimitError as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         return {

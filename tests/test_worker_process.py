@@ -11,6 +11,7 @@ from app.worker_process import (
     _emit,
     build_replay_event_snapshot,
     run_a_share_worker,
+    run_lighter_worker,
     run_microstructure_worker,
 )
 
@@ -375,3 +376,34 @@ def test_microstructure_worker_honors_cancel_before_optimization(tmp_path: Path)
 
     assert list(events.queue)[-1]["type"] == "cancelled"
     assert not (tmp_path / "result.json").exists()
+
+
+def test_lighter_worker_runs_the_common_optimizer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    task = {
+        "engine_type": "lighter_microstructure",
+        "data": {"snapshot": {"snapshot_id": "snap-lighter"}},
+        "optimization": {"method": "optuna"},
+    }
+    request = {"_task_contract": task, "_snapshot_manifest": {"datasets": []}}
+    calls: list[dict] = []
+
+    def fake_backtest(*, task_id: str, task: dict, manifest: dict, data_root: str) -> dict:
+        calls.append({"task_id": task_id, "task": task, "manifest": manifest, "data_root": data_root})
+        return {"metrics": {"n_trades": 1, "total_return": 0.01}}
+
+    def fake_optimizer(task: dict, evaluator, *, cancel_check=None) -> dict:
+        assert task["optimization"]["method"] == "optuna"
+        assert cancel_check is not None
+        return {**evaluator(task), "optimization": {"method": "optuna"}}
+
+    monkeypatch.setattr("app.lighter_microstructure.run_lighter_backtest", fake_backtest)
+    monkeypatch.setattr("app.optimization.run_task_optimization", fake_optimizer)
+    events: queue.Queue = queue.Queue()
+    commands: queue.Queue = queue.Queue()
+    result_path = tmp_path / "result.json"
+
+    run_lighter_worker("task-lighter", request, str(tmp_path), str(result_path), events, commands)
+
+    assert json.loads(result_path.read_text(encoding="utf-8"))["optimization"]["method"] == "optuna"
+    assert len(calls) == 1
+    assert list(events.queue)[-1]["type"] == "completed"

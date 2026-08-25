@@ -18,6 +18,7 @@ DAA_ENGINE_TYPES = {"a_share_portfolio", "factor_matrix", "event_sentiment"}
 ML_ENGINE_TYPES = {"ml_factor", "deep_learning"}
 LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
 RELIABLE_EVENT_TIMEOUT_SECONDS = 5.0
+logger = logging.getLogger("backtest_service")
 
 
 def _configure_backtest_worker_logging() -> None:
@@ -480,20 +481,63 @@ def run_lighter_worker(
         manifest = request.get("_snapshot_manifest")
         if not isinstance(task, dict) or not isinstance(manifest, dict):
             raise ValueError("Lighter worker 缺少任务契约或完整快照清单")
-        try:
-            while True:
-                command = command_queue.get_nowait()
-                if str(command.get("action") or "") == "cancel":
-                    cancelled = True
-        except queue.Empty:
-            pass
+        def cancel_requested() -> bool:
+            nonlocal cancelled
+            try:
+                while True:
+                    command = command_queue.get_nowait()
+                    if str(command.get("action") or "") == "cancel":
+                        cancelled = True
+            except queue.Empty:
+                pass
+            return cancelled
+
+        cancel_requested()
         if cancelled:
             _emit(event_queue, "cancelled", {}, terminal=True)
             return
         _emit(event_queue, "state", {"status": "running", "phase": "rebuilding_lighter_book", "progress": 5.0})
         from app.lighter_microstructure import run_lighter_backtest
-        result = run_lighter_backtest(task_id=task_id, task=task, manifest=manifest, data_root=pxydata_root)
+        from app.optimization import run_task_optimization
+
+        def evaluate(candidate: dict[str, Any]) -> dict[str, Any]:
+            if cancel_requested():
+                raise InterruptedError("Lighter 回测任务已取消")
+            return run_lighter_backtest(
+                task_id=task_id,
+                task=candidate,
+                manifest=manifest,
+                data_root=pxydata_root,
+            )
+
+        logger.info(
+            "Lighter 回测开始: task_id=%s snapshot=%s datasets=%s optimization=%s",
+            task_id,
+            (task.get("data") or {}).get("snapshot_id")
+            or ((task.get("data") or {}).get("snapshot") or {}).get("snapshot_id"),
+            [
+                item.get("name")
+                for item in manifest.get("datasets", [])
+                if isinstance(item, dict)
+            ],
+            bool(task.get("optimization")),
+        )
+        result = run_task_optimization(
+            task,
+            evaluate,
+            cancel_check=cancel_requested,
+        )
+        if cancel_requested():
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
         _atomic_json_write(Path(result_path), result)
+        logger.info(
+            "Lighter 回测完成: task_id=%s n_trades=%s total_return=%s optimized=%s",
+            task_id,
+            (result.get("metrics") or {}).get("n_trades"),
+            (result.get("metrics") or {}).get("total_return"),
+            bool(result.get("optimization")),
+        )
         _emit(event_queue, "completed", {"result_path": str(result_path), "progress": 100.0}, terminal=True)
     except Exception as exc:
         if cancelled:

@@ -19,6 +19,10 @@ class TaskNotFoundError(LookupError):
     pass
 
 
+class QueueLimitReachedError(ValueError):
+    """用户的待执行任务达到上限。"""
+
+
 class TaskStore:
     def __init__(self, path: Path):
         self.path = path
@@ -83,6 +87,62 @@ class TaskStore:
     ) -> str:
         task_id = str(uuid.uuid4())
         now = time.time()
+        with self._lock, self._connection() as connection:
+            self._insert_task(
+                connection,
+                task_id=task_id,
+                user_id=user_id,
+                source_node=source_node,
+                request=request,
+                now=now,
+            )
+        return task_id
+
+    def create_task_if_queue_available(
+        self,
+        *,
+        user_id: str,
+        source_node: str,
+        request: dict[str, Any],
+        max_queued: int,
+    ) -> str:
+        """在同一 SQLite 事务中检查队列并创建任务。
+
+        先 ``COUNT`` 再 ``INSERT`` 会让并发提交绕过每用户队列上限。
+        ``BEGIN IMMEDIATE`` 让检查和插入对其他提交者保持原子性。
+        """
+        if max_queued < 1:
+            raise ValueError("max_queued 必须大于 0")
+        task_id = str(uuid.uuid4())
+        now = time.time()
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND status = 'pending'",
+                (user_id,),
+            ).fetchone()
+            if int(row["count"] if row else 0) >= max_queued:
+                raise QueueLimitReachedError("当前用户的回测排队任务已达到上限")
+            self._insert_task(
+                connection,
+                task_id=task_id,
+                user_id=user_id,
+                source_node=source_node,
+                request=request,
+                now=now,
+            )
+        return task_id
+
+    @staticmethod
+    def _insert_task(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        user_id: str,
+        source_node: str,
+        request: dict[str, Any],
+        now: float,
+    ) -> None:
         task_contract = request.get("_task_contract") or {}
         execution = task_contract.get("execution") or {}
         state = {
@@ -110,25 +170,23 @@ class TaskStore:
             "last_bar_replay_seq": 0,
             "events_pruned_through": 0,
         }
-        with self._lock, self._connection() as connection:
-            connection.execute(
-                """
-                INSERT INTO tasks(
-                    task_id, user_id, source_node, status, request_json,
-                    state_json, created_at, updated_at
-                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    user_id,
-                    source_node,
-                    json.dumps(request, ensure_ascii=False, separators=(",", ":")),
-                    json.dumps(state, ensure_ascii=False, separators=(",", ":")),
-                    now,
-                    now,
-                ),
-            )
-        return task_id
+        connection.execute(
+            """
+            INSERT INTO tasks(
+                task_id, user_id, source_node, status, request_json,
+                state_json, created_at, updated_at
+            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                user_id,
+                source_node,
+                json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                now,
+                now,
+            ),
+        )
 
     def count_queued_for_user(self, user_id: str) -> int:
         with self._lock, self._connection() as connection:

@@ -8,10 +8,29 @@ import pytest
 from app import worker_process
 from app.worker_process import (
     _configure_backtest_worker_logging,
+    _emit,
     build_replay_event_snapshot,
     run_a_share_worker,
     run_microstructure_worker,
 )
+
+
+def test_emit_reliable_event_fails_closed_when_queue_is_full() -> None:
+    events: queue.Queue = queue.Queue(maxsize=1)
+    events.put({"type": "existing", "data": {}})
+
+    with pytest.raises(RuntimeError, match="可靠回测事件投递失败"):
+        _emit(events, "trade", {"trade": {"id": "t1"}}, reliable=True)
+
+
+def test_emit_lossy_event_records_queue_drop(caplog: pytest.LogCaptureFixture) -> None:
+    events: queue.Queue = queue.Queue(maxsize=1)
+    events.put({"type": "existing", "data": {}})
+
+    with caplog.at_level(logging.WARNING, logger="backtest_service"):
+        assert _emit(events, "state", {"progress": 1.0}) is False
+
+    assert "非可靠回测事件因队列已满被降采样" in caplog.text
 
 
 def test_replay_event_snapshot_is_bounded_to_twenty_items() -> None:

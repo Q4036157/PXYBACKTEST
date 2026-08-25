@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import Settings
-from .store import TERMINAL_STATUSES, TaskStore
+from .store import (
+    TERMINAL_STATUSES,
+    QueueLimitReachedError,
+    TaskStore,
+)
 from .worker_process import run_preloaded_worker
 
 
@@ -123,17 +127,16 @@ class TaskManager:
     async def submit(
         self, *, user_id: str, source_node: str, request: dict[str, Any]
     ) -> str:
-        queued_count = await asyncio.to_thread(
-            self.store.count_queued_for_user, user_id
-        )
-        if queued_count >= self.settings.max_queued_per_user:
-            raise QueueLimitError("当前用户的回测排队任务已达到上限")
-        return await asyncio.to_thread(
-            self.store.create_task,
-            user_id=user_id,
-            source_node=source_node,
-            request=request,
-        )
+        try:
+            return await asyncio.to_thread(
+                self.store.create_task_if_queue_available,
+                user_id=user_id,
+                source_node=source_node,
+                request=request,
+                max_queued=self.settings.max_queued_per_user,
+            )
+        except QueueLimitReachedError as exc:
+            raise QueueLimitError(str(exc)) from exc
 
     async def pause(self, user_id: str, task_id: str) -> PlaybackControlResult:
         return await self._set_paused(user_id, task_id, paused=True)

@@ -17,6 +17,7 @@ A_SHARE_ADAPTER_CONTRACT = "pxybacktest.engine-adapter.a-share.v1"
 DAA_ENGINE_TYPES = {"a_share_portfolio", "factor_matrix", "event_sentiment"}
 ML_ENGINE_TYPES = {"ml_factor", "deep_learning"}
 LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
+RELIABLE_EVENT_TIMEOUT_SECONDS = 5.0
 
 
 def _configure_backtest_worker_logging() -> None:
@@ -508,16 +509,31 @@ def _emit(
     *,
     terminal: bool = False,
     reliable: bool = False,
-) -> None:
+) -> bool:
+    """向管理器发送事件。
+
+    可靠事件不能在队列满时静默丢失：在有限时间内无法投递时直接让
+    worker 失败，由任务层记录失败，而不是继续生成不可审计的结果。
+    普通 UI/回放事件仍允许降采样，但会留下明确的日志证据。
+    """
     event = {"type": event_type, "data": data}
     try:
         if terminal or reliable:
-            event_queue.put(event)
+            event_queue.put(event, timeout=RELIABLE_EVENT_TIMEOUT_SECONDS)
         else:
             event_queue.put_nowait(event)
+        return True
     except queue.Full:
-        if terminal:
-            event_queue.put(event, timeout=5.0)
+        logger = logging.getLogger("backtest_service")
+        if terminal or reliable:
+            raise RuntimeError(
+                f"可靠回测事件投递失败：事件队列已满，event_type={event_type}"
+            )
+        logger.warning(
+            "非可靠回测事件因队列已满被降采样：event_type=%s",
+            event_type,
+        )
+        return False
 
 
 def run_backtest_worker(

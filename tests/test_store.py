@@ -1,8 +1,10 @@
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
-from app.store import TaskNotFoundError, TaskStore
+from app.store import QueueLimitReachedError, TaskNotFoundError, TaskStore
 from app import store as store_module
 from app.config import Settings
 from app.manager import TaskManager
@@ -22,6 +24,54 @@ def request_payload() -> dict:
         "speed": 50,
         "mode": "TICK",
     }
+
+
+def test_create_task_if_queue_available_checks_and_inserts_atomically(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(tmp_path / "backtest.sqlite3")
+    store.create_task_if_queue_available(
+        user_id="user-a",
+        source_node="204",
+        request=request_payload(),
+        max_queued=1,
+    )
+
+    with pytest.raises(QueueLimitReachedError):
+        store.create_task_if_queue_available(
+            user_id="user-a",
+            source_node="204",
+            request=request_payload(),
+            max_queued=1,
+        )
+
+    assert store.count_queued_for_user("user-a") == 1
+
+
+def test_create_task_if_queue_available_is_atomic_across_store_instances(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "backtest.sqlite3"
+    stores = [TaskStore(database), TaskStore(database)]
+    barrier = Barrier(2)
+
+    def submit(store: TaskStore) -> bool:
+        barrier.wait()
+        try:
+            store.create_task_if_queue_available(
+                user_id="user-a",
+                source_node="204",
+                request=request_payload(),
+                max_queued=1,
+            )
+        except QueueLimitReachedError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(submit, stores))
+
+    assert sorted(results) == [False, True]
 
 
 def test_store_applies_incremental_bar_events(tmp_path: Path) -> None:

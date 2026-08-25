@@ -2,7 +2,26 @@ from __future__ import annotations
 
 from typing import Any
 
+from .kernel import stable_hash
+
 RESULT_CONTRACT_VERSION = "pxybacktest.task-result.v2"
+
+
+def _attach_reproducibility(
+    result: dict[str, Any], *, request: dict[str, Any], raw_result: dict[str, Any]
+) -> dict[str, Any]:
+    """给结果写入稳定的输入、事件和最终结果哈希。"""
+    task = dict(request.get("_task_contract") or {})
+    snapshot = dict((task.get("data") or {}).get("snapshot") or {})
+    events = list(raw_result.get("events") or raw_result.get("replay_events") or [])
+    result["reproducibility"] = {
+        "input_contract_sha256": stable_hash(task),
+        "manifest_sha256": snapshot.get("manifest_sha256"),
+        "event_log_sha256": stable_hash(events),
+        "engine_version": str(raw_result.get("engine_version") or "unknown"),
+    }
+    result["reproducibility"]["result_sha256"] = stable_hash(result)
+    return result
 
 
 def build_result_v2(
@@ -21,7 +40,7 @@ def build_result_v2(
         ]
     )
     trades = list(raw_result.get("trades") or [])
-    return {
+    result = {
         "schema_version": 2,
         "contract_version": RESULT_CONTRACT_VERSION,
         "task_id": task_id,
@@ -62,6 +81,7 @@ def build_result_v2(
         },
         "artifacts": [],
     }
+    return _attach_reproducibility(result, request=request, raw_result=raw_result)
 
 
 def build_a_share_result_v2(
@@ -98,7 +118,7 @@ def build_a_share_result_v2(
             "role": "factor_materialization_input",
         }
 
-    return {
+    result = {
         "schema_version": 2,
         "contract_version": RESULT_CONTRACT_VERSION,
         "task_id": task_id,
@@ -165,3 +185,4 @@ def build_a_share_result_v2(
         },
         "artifacts": [],
     }
+    return _attach_reproducibility(result, request=request, raw_result=raw_result)

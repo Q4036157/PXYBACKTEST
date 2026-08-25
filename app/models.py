@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .snapshot_verifier import validate_snapshot_manifest
+
 SUPPORTED_PLATFORMS = {"LIGHTER", "OKX", "BINANCE", "BITMART", "MT4", "MT5"}
 DAA_ENGINE_TYPES = {"a_share_portfolio", "factor_matrix", "event_sentiment"}
 ML_ENGINE_TYPES = {"ml_factor", "deep_learning"}
@@ -234,6 +236,12 @@ class TaskDataV2(BaseModel):
 
 
 class ExecutionModelV2(BaseModel):
+    """影响回测结果的唯一显式执行口径。
+
+    rate/slippage 保留给 v1/vn.py 兼容层；v2 结果同时记录标准化的 bps
+    费用与撮合语义，任何变化都会进入任务 fingerprint。
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     capital: float = Field(default=1_000_000, gt=0)
@@ -245,6 +253,80 @@ class ExecutionModelV2(BaseModel):
     leverage: float | None = Field(default=None, gt=0)
     commission: float | None = Field(default=None, ge=0)
     stamp_tax: float | None = Field(default=None, ge=0)
+    signal_time: Literal["bar_close", "tick"] = "bar_close"
+    entry_fill: Literal["same_bar_close", "next_bar_open", "next_tick"] = (
+        "next_bar_open"
+    )
+    exit_fill: Literal["same_bar_close", "next_bar_open", "next_tick"] = (
+        "next_bar_open"
+    )
+    matching_policy: Literal[
+        "bar_ohlc_conservative", "tick_price_time", "external_adapter"
+    ] = "bar_ohlc_conservative"
+    price_adjustment: Literal["none", "forward", "backward"] = "none"
+    corporate_actions: Literal["snapshot_bound", "disabled"] = "snapshot_bound"
+    t_plus_one: bool = False
+    limit_up_down: Literal["reject", "allow"] = "reject"
+    partial_fill: bool = False
+    commission_bps: float = Field(default=4, ge=0, le=10_000)
+    stamp_tax_bps: float = Field(default=0, ge=0, le=10_000)
+    slippage_bps: float = Field(default=0, ge=0, le=10_000)
+    maker_fee_bps: float = Field(default=0, ge=0, le=10_000)
+    taker_fee_bps: float = Field(default=0, ge=0, le=10_000)
+    funding_fee: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_mode_defaults(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        payload = dict(values)
+        mode = str(payload.get("mode") or "BAR").upper()
+        if "commission" in payload and "rate" not in payload:
+            payload["rate"] = payload["commission"]
+        if "stamp_tax" in payload and "stamp_tax_bps" not in payload:
+            payload["stamp_tax_bps"] = float(payload["stamp_tax"] or 0.0) * 10_000
+        if "commission_bps" not in payload:
+            payload["commission_bps"] = float(payload.get("rate", 0.0004)) * 10_000
+        if "stamp_tax_bps" not in payload:
+            payload["stamp_tax_bps"] = float(payload.get("stamp_tax", 0.0) or 0.0) * 10_000
+        if "commission" not in payload and "rate" in payload:
+            payload["commission"] = payload["rate"]
+        if "stamp_tax" not in payload and "stamp_tax_bps" in payload:
+            payload["stamp_tax"] = float(payload["stamp_tax_bps"]) / 10_000
+        if "signal_time" not in payload:
+            payload["signal_time"] = "tick" if mode == "TICK" else "bar_close"
+        if "entry_fill" not in payload:
+            payload["entry_fill"] = "next_tick" if mode == "TICK" else "next_bar_open"
+        if "exit_fill" not in payload:
+            payload["exit_fill"] = "next_tick" if mode == "TICK" else "next_bar_open"
+        if "matching_policy" not in payload:
+            payload["matching_policy"] = "tick_price_time" if mode == "TICK" else "bar_ohlc_conservative"
+        return payload
+
+    @model_validator(mode="after")
+    def validate_execution_semantics(self) -> "ExecutionModelV2":
+        if self.mode == "BAR":
+            if self.signal_time != "bar_close":
+                raise ValueError("BAR 模式 signal_time 必须为 bar_close")
+            if self.entry_fill == "next_tick" or self.exit_fill == "next_tick":
+                raise ValueError("BAR 模式不得使用 next_tick 成交")
+            if self.matching_policy == "tick_price_time":
+                raise ValueError("BAR 模式不得使用 tick_price_time 撮合")
+        else:
+            if self.signal_time != "tick":
+                raise ValueError("TICK 模式 signal_time 必须为 tick")
+            if self.entry_fill != "next_tick" or self.exit_fill != "next_tick":
+                raise ValueError("TICK 模式必须使用 next_tick 成交")
+            if self.matching_policy == "bar_ohlc_conservative":
+                raise ValueError("TICK 模式不得使用 bar_ohlc_conservative 撮合")
+        if abs(self.commission_bps / 10_000 - self.rate) > 1e-12:
+            raise ValueError("execution.rate 与 commission_bps 口径不一致")
+        if self.commission is not None and abs(self.commission - self.rate) > 1e-12:
+            raise ValueError("execution.commission 与 rate 口径不一致")
+        if self.stamp_tax is not None and abs(self.stamp_tax_bps / 10_000 - self.stamp_tax) > 1e-12:
+            raise ValueError("execution.stamp_tax 与 stamp_tax_bps 口径不一致")
+        return self
 
 
 class SearchDimensionV2(BaseModel):
@@ -572,6 +654,14 @@ class SubmitBacktestRequestV2(BaseModel):
         self, *, snapshot_manifest: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         self.validate_contract()
+        if snapshot_manifest is not None:
+            assert self.data.snapshot is not None
+            snapshot_manifest = validate_snapshot_manifest(
+                snapshot_manifest,
+                snapshot_id=self.data.snapshot.snapshot_id,
+                manifest_sha256=self.data.snapshot.manifest_sha256,
+                expected_datasets={item.name for item in self.data.snapshot.datasets},
+            )
         if self.engine_type in DAA_ENGINE_TYPES:
             if snapshot_manifest is None:
                 raise ValueError(f"{self.engine_type} 缺少内部快照清单")

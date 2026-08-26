@@ -67,7 +67,7 @@ if errorlevel 1 (
   echo [FAIL] Secret file preflight failed.
   goto :failed
 )
-"%BACKTEST_PYTHON%" -c "import aiosqlite, fastapi, optuna, pyarrow, uvicorn, vnpy; from app.main import create_app; from services.backtest_service.engine_runner import run_backtest_sync; print('Runtime OK: optuna=' + optuna.__version__ + ', pyarrow=' + pyarrow.__version__ + ', aiosqlite=' + aiosqlite.__version__)"
+"%BACKTEST_PYTHON%" -c "import aiosqlite, fastapi, optuna, pyarrow, uvicorn, vnpy; from zoneinfo import ZoneInfo; ZoneInfo('UTC'); from app.main import create_app; from services.backtest_service.engine_runner import run_backtest_sync; print('Runtime OK: optuna=' + optuna.__version__ + ', pyarrow=' + pyarrow.__version__ + ', tzdata=UTC, aiosqlite=' + aiosqlite.__version__)"
 if errorlevel 1 (
   echo [FAIL] The target Python cannot import the PXYLH backtest worker.
   goto :failed

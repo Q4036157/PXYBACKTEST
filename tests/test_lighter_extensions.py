@@ -38,3 +38,5 @@ def test_lighter_backtest_reports_flow_and_funding() -> None:
     assert result["metrics"]["active_buy_qty"] == 9
     assert result["metrics"]["active_sell_qty"] == 7
     assert "funding_pnl" in result["metrics"]
+    assert result["replay_audit"]["event_count"] >= len(rows)
+    assert len(result["replay_audit"]["chain_sha256"]) == 64

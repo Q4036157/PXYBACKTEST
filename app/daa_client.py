@@ -7,13 +7,31 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from .config import Settings
 
 A_SHARE_ADAPTER_CONTRACT = "pxybacktest.engine-adapter.a-share.v1"
 DAA_ENGINE_TYPES = {"a_share_portfolio", "factor_matrix", "event_sentiment"}
+PORTABLE_DAA_ENGINE_TYPES = {"vnpy_cta", "microstructure"}
+AI_CAPABLE_ENGINE_TYPES = DAA_ENGINE_TYPES | PORTABLE_DAA_ENGINE_TYPES
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _ai_strategy_directory_signature(root: Path) -> tuple[int, int]:
+    """返回 AI 策略目录的轻量签名，用于保存后即时失效能力缓存。"""
+    path = root
+    try:
+        files = [item for item in path.glob("*.py") if item.is_file()]
+    except OSError:
+        return (-1, -1)
+    if not files:
+        return (0, 0)
+    try:
+        return (len(files), max(item.stat().st_mtime_ns for item in files))
+    except OSError:
+        return (-1, -1)
 
 
 class DaaCapabilitiesError(RuntimeError):
@@ -34,6 +52,7 @@ class DaaAdapterClient:
     timeout_seconds: float = 12.0
     _cached_at: float = field(default=0.0, init=False)
     _cached: dict[str, Any] | None = field(default=None, init=False)
+    _cached_ai_signature: tuple[int, int] | None = field(default=None, init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False)
 
     @property
@@ -48,7 +67,14 @@ class DaaAdapterClient:
             raise DaaCapabilitiesError("DAA A 股适配器未安装")
         with self._lock:
             now = time.monotonic()
-            if self._cached is not None and now - self._cached_at < self.cache_seconds:
+            ai_signature = _ai_strategy_directory_signature(
+                self.settings.daa_root / "data" / "strategies" / "ai"
+            )
+            if (
+                self._cached is not None
+                and now - self._cached_at < self.cache_seconds
+                and ai_signature == self._cached_ai_signature
+            ):
                 return self._cached
             try:
                 process = subprocess.run(
@@ -79,6 +105,7 @@ class DaaAdapterClient:
             normalized = _validate_capabilities(payload)
             self._cached = normalized
             self._cached_at = now
+            self._cached_ai_signature = ai_signature
             return normalized
 
 
@@ -105,7 +132,7 @@ def _validate_capabilities(payload: Any) -> dict[str, Any]:
             dict.fromkeys(
                 str(value).strip()
                 for value in raw_engines
-                if str(value).strip() in DAA_ENGINE_TYPES
+                if str(value).strip() in AI_CAPABLE_ENGINE_TYPES
             )
         )
         if not engine_types:
@@ -118,6 +145,9 @@ def _validate_capabilities(payload: Any) -> dict[str, Any]:
                 "version": str(item.get("version") or "builtin"),
                 "source_hash": source_hash,
                 "entrypoint": str(item.get("entrypoint") or strategy_id),
+                "source": str(item.get("source") or "builtin"),
+                "execution_backend": str(item.get("execution_backend") or "matrix_native"),
+                "registry_status": str(item.get("registry_status") or "validated"),
                 "tags": list(item.get("tags") or []),
                 "asset_types": list(item.get("asset_types") or []),
                 "timeframes": list(item.get("timeframes") or []),

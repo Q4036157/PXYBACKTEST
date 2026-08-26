@@ -168,6 +168,7 @@ class TaskStore:
             "live_positions": [],
             "strategy_lines": [],
             "recent_replay_events": [],
+            "execution_snapshot": {},
             "event_seq": 0,
             "last_bar_replay_seq": 0,
             "events_pruned_through": 0,
@@ -436,6 +437,11 @@ class TaskStore:
                 )
         elif event_type.endswith("_snapshot"):
             key = event_type.removesuffix("_snapshot")
+            if key == "execution":
+                snapshot = payload.get("snapshot")
+                if isinstance(snapshot, dict):
+                    state["execution_snapshot"] = snapshot
+                return state
             mapping = {
                 "trades": "live_trades",
                 "orders": "live_orders",
@@ -641,6 +647,7 @@ class TaskStore:
             "live_positions",
             "strategy_lines",
             "recent_replay_events",
+            "execution_snapshot",
             "current_bar",
         )
         return {key: state.get(key) for key in keys}

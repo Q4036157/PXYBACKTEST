@@ -534,6 +534,14 @@ def test_v2_capabilities_exposes_factor_and_sentiment_engines(tmp_path: Path) ->
         "pxydata.factor_matrix_daily.v1"
     )
     assert engines["factor_matrix"]["strategies"][0]["id"] == "multi_factor_rank"
+    assert engines["factor_matrix"]["execution_stream"] == "complete_ordered_audited"
+    assert engines["event_sentiment"]["execution_stream"] == "complete_ordered_audited"
+    assert engines["microstructure"]["execution_stream"] == "complete_ordered_audited"
+    assert "factor" in engines["event_sentiment"]["event_domains"]
+    replay = response.json()["replay"]
+    assert replay["contract"] == "pxybacktest.replay.v1"
+    assert replay["execution_stream"] == "complete_ordered_audited"
+    assert replay["visual_projection"]["preserves_execution_events"] is True
 
 
 def test_daa_capabilities_validation_drops_internal_fields() -> None:
@@ -908,3 +916,24 @@ def test_result_v2_maps_factor_versions_and_research_metrics() -> None:
         "manifest_sha256": "e" * 64,
         "role": "factor_materialization_input",
     }
+
+
+def test_result_v2_uses_adapter_replay_audit_for_reproducibility() -> None:
+    task = _a_share_payload()
+    task["data"] = {"snapshot": _a_share_snapshot().model_dump(mode="json")}
+    audit = {
+        "contract_version": "pxybacktest.replay.v1",
+        "snapshot_id": _a_share_snapshot().snapshot_id,
+        "event_count": 42,
+        "chain_sha256": "c" * 64,
+    }
+    result = build_a_share_result_v2(
+        task_id="task-audit",
+        request={"_task_contract": task},
+        raw_result={"stats": {}, "replay_audit": audit},
+    )
+
+    assert result["replay_audit"] == audit
+    assert result["diagnostics"]["replay_audit"] == audit
+    assert result["reproducibility"]["event_log_sha256"] == "c" * 64
+    assert result["reproducibility"]["event_count"] == 42

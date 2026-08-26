@@ -237,6 +237,42 @@ def run_lighter_backtest(
     if not equity:
         equity = [{"date": factors[0].get("event_time"), "value": capital}]
     returns = [float(item["pnl_amount"]) / capital for item in deals]
+    from app.replay import build_replay_audit
+
+    snapshot = dict((task.get("data") or {}).get("snapshot") or {})
+    replay_events: list[dict[str, Any]] = []
+    for index, row in enumerate(factors):
+        replay_events.append(
+            {
+                "event_type": "order_book" if any(
+                    key in row for key in ("bid_price1", "ask_price1", "depth_imbalance")
+                ) else "factor",
+                "event_time": row.get("event_time"),
+                "available_at": row.get("available_at"),
+                "payload": row,
+                "symbol": row.get("symbol"),
+                "source_seq": index,
+            }
+        )
+    for index, item in enumerate(deals):
+        replay_events.append(
+            {
+                "event_type": "fill",
+                "event_time": item.get("exit_time") or item.get("entry_time"),
+                "payload": item,
+                "symbol": item.get("symbol"),
+                "source_seq": len(replay_events) + index,
+            }
+        )
+    for index, item in enumerate(equity):
+        replay_events.append(
+            {
+                "event_type": "account",
+                "event_time": item.get("date"),
+                "payload": item,
+                "source_seq": len(replay_events) + index,
+            }
+        )
     return {
         "schema_version": 2,
         "contract_version": "pxybacktest.task-result.v2",
@@ -250,6 +286,12 @@ def run_lighter_backtest(
         "deals": deals,
         "diagnostics": {"matching_model": "lighter_factor_or_l2_rebuild", "book_depth": int(parameters.get("book_depth") or 10), "data_source_policy": "pxydata_snapshot_only", "snapshot_enforcement": "manifest_bound", "warnings": ["Lighter 回测只生成研究结果，不提交真实订单。"]},
         "artifacts": [],
+        "replay_audit": build_replay_audit(
+            run_id=task_id,
+            snapshot_id=str(snapshot.get("snapshot_id") or task_id),
+            events=replay_events,
+        ),
+        "_replay_events": replay_events,
     }
 
 

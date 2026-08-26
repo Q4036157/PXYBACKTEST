@@ -164,6 +164,17 @@ class TaskManager:
         except queue.Full:
             return PlaybackControlResult(False, False, current_status)
 
+        if str(task.get("engine_type") or "") != "vnpy_cta":
+            # 非 CTA 引擎的暂停语义是冻结统一 ReplayClock/可视化事件游标；
+            # 适配器计算可以继续完成，命令会由 worker 在回放前保留并执行。
+            await asyncio.to_thread(
+                self.store.append_event,
+                task_id,
+                "state",
+                {"status": target_status},
+            )
+            return PlaybackControlResult(True, True, target_status)
+
         confirmed = await self._wait_for_state(
             user_id, task_id, status=target_status
         )
@@ -186,6 +197,14 @@ class TaskManager:
             handle.command_queue.put_nowait({"action": "speed", "speed": speed})
         except queue.Full:
             return False
+        if str(task.get("engine_type") or "") != "vnpy_cta":
+            await asyncio.to_thread(
+                self.store.append_event,
+                task_id,
+                "state",
+                {"speed": float(speed)},
+            )
+            return True
         return await self._wait_for_state(user_id, task_id, speed=speed)
 
     async def cancel(self, user_id: str, task_id: str) -> bool:

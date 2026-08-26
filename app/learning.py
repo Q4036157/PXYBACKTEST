@@ -275,19 +275,57 @@ def run_learning_backtest(
         equity_curve.append({"date": point["date"], "value": equity})
     drawdowns = [point["value"] / max(capital, max(p["value"] for p in equity_curve[:i + 1])) - 1.0 for i, point in enumerate(equity_curve)]
     volatility = statistics.pstdev(returns) if len(returns) > 1 else 0.0
+    from app.replay import build_replay_audit
+
+    snapshot = dict((task.get("data") or {}).get("snapshot") or {})
+    replay_events: list[dict[str, Any]] = [
+        {
+            "event_type": "factor",
+            "event_time": row.get("event_time"),
+            "available_at": row.get("available_at"),
+            "payload": row,
+            "symbol": row.get("symbol"),
+            "source_seq": index,
+        }
+        for index, row in enumerate(rows)
+    ]
+    replay_events.extend(
+        {
+            "event_type": "signal",
+            "event_time": item.get("date"),
+            "payload": item,
+            "source_seq": len(replay_events) + index,
+        }
+        for index, item in enumerate(all_daily)
+    )
+    replay_events.extend(
+        {
+            "event_type": "account",
+            "event_time": item.get("date"),
+            "payload": item,
+            "source_seq": len(replay_events) + index,
+        }
+        for index, item in enumerate(equity_curve)
+    )
     return {
         "schema_version": 2,
         "contract_version": "pxybacktest.task-result.v2",
         "task_id": task_id,
         "engine_type": str(task.get("engine_type") or "ml_factor"),
         "strategy": task.get("strategy") or {},
-        "data_snapshot": dict((task.get("data") or {}).get("snapshot") or {}),
+        "data_snapshot": snapshot,
         "run": {"universe": universe, "period": period, "execution": task.get("execution") or {}, "parameters": parameters, "random_seed": task.get("random_seed")},
         "metrics": {"total_return": equity / capital - 1.0, "final_equity": equity, "net_profit": equity - capital, "max_drawdown": min(drawdowns, default=0.0), "sharpe": (statistics.fmean(returns) / volatility * math.sqrt(252) if volatility > 0 else 0.0), "hit_rate": sum(value > 0 for value in returns) / len(returns), "n_trades": sum(int(point.get("n_selected") or 0) for point in all_daily), "n_days": len(all_daily)},
         "curves": {"equity": equity_curve, "drawdown": [{"date": p["date"], "value": drawdowns[i]} for i, p in enumerate(all_daily)]},
         "deals": [],
         "diagnostics": {"adapter": f"pxybacktest.{model_type}.v1", "data_source_policy": "pxydata_snapshot_only", "snapshot_enforcement": "manifest_bound", "strictly_reproducible": model_type in {"linear_regression", "linear_logit"}, "feature_columns": feature_columns, "label_column": label_column, "model_type": model_type, "task_type": task_type, "seq_len": int(parameters.get("seq_len") or 1), "purge_days": int(parameters.get("purge_days") or 0), "embargo_days": int(parameters.get("embargo_days") or 0), "folds": fold_meta, "warnings": ["学习回测只生成研究信号，不提交真实订单。"]},
         "artifacts": [],
+        "replay_audit": build_replay_audit(
+            run_id=task_id,
+            snapshot_id=str(snapshot.get("snapshot_id") or task_id),
+            events=replay_events,
+        ),
+        "_replay_events": replay_events,
     }
 
 

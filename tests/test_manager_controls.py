@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import queue
 import time
 from pathlib import Path
@@ -66,6 +67,24 @@ def build_manager(tmp_path: Path) -> tuple[TaskManager, TaskStore, str]:
     return TaskManager(configured, store), store, task_id
 
 
+def build_non_cta_manager(tmp_path: Path) -> tuple[TaskManager, TaskStore, str]:
+    configured = Settings(
+        runtime_root=tmp_path / "runtime",
+        pxylh_root=tmp_path / "PXYLH",
+        service_token="test-token",
+    )
+    store = TaskStore(configured.database_path)
+    request = copy.deepcopy(request_payload())
+    request["_task_contract"] = {
+        "schema_version": 2,
+        "engine_type": "factor_matrix",
+        "execution": {"speed": 50, "execution_mode": "visual"},
+    }
+    task_id = store.create_task(user_id="user-a", source_node="204", request=request)
+    store.mark_running(task_id)
+    return TaskManager(configured, store), store, task_id
+
+
 def test_pause_resume_and_speed_wait_for_worker_ack(tmp_path: Path) -> None:
     manager, store, task_id = build_manager(tmp_path)
     manager._workers[task_id] = WorkerHandle(
@@ -125,6 +144,32 @@ def test_pause_and_resume_are_idempotent(tmp_path: Path) -> None:
     assert resume_result.confirmed is True
     assert command_queue.commands == []
 
+
+def test_non_cta_visual_controls_confirm_when_command_is_queued(tmp_path: Path) -> None:
+    manager, store, task_id = build_non_cta_manager(tmp_path)
+    command_queue = RecordingQueue()
+    manager._workers[task_id] = WorkerHandle(
+        user_id="user-a",
+        process=AliveProcess(),  # type: ignore[arg-type]
+        event_queue=None,
+        command_queue=command_queue,
+    )
+    manager._wait_for_state = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    pause_result = asyncio.run(manager.pause("user-a", task_id))
+    assert pause_result.confirmed is True
+    assert pause_result.status == "paused"
+    assert asyncio.run(manager.set_speed("user-a", task_id, 50)) is True
+    resume_result = asyncio.run(manager.resume("user-a", task_id))
+
+    assert resume_result.confirmed is True
+    assert store.get_task("user-a", task_id)["status"] == "running"
+    assert store.get_task("user-a", task_id)["speed"] == 50
+    assert command_queue.commands == [
+        {"action": "pause"},
+        {"action": "speed", "speed": 50},
+        {"action": "resume"},
+    ]
 
 def test_unconfirmed_pause_never_enqueues_reverse_compensation(tmp_path: Path) -> None:
     manager, _store, task_id = build_manager(tmp_path)

@@ -9,7 +9,12 @@ from fastapi.responses import HTMLResponse
 
 from .auth import TrustedIdentity, build_identity_dependency
 from .config import Settings
-from .daa_client import DaaAdapterClient, DaaCapabilitiesClient, DaaCapabilitiesError
+from .daa_client import (
+    AI_CAPABLE_ENGINE_TYPES,
+    DaaAdapterClient,
+    DaaCapabilitiesClient,
+    DaaCapabilitiesError,
+)
 from .manager import QueueLimitError, TaskManager
 from .microstructure import (
     MICROSTRUCTURE_STRATEGY_HASH,
@@ -92,7 +97,7 @@ def _bind_factor_set_to_manifest(
 
 
 def _engine_strategies(catalog: dict, engine_type: str) -> list[dict]:
-    if engine_type not in DAA_ENGINE_TYPES:
+    if engine_type not in AI_CAPABLE_ENGINE_TYPES:
         return []
     return [
         item
@@ -208,6 +213,18 @@ def create_app(
         return {
             "task_contract": "pxybacktest.task-result.v2",
             "data_contract": "pxydata.backtest-data-snapshot.v1",
+            "replay": {
+                "contract": "pxybacktest.replay.v1",
+                "execution_stream": "complete_ordered_audited",
+                "visual_projection": {
+                    "mode": "framed_incremental_state",
+                    "default_frame_interval_ms": 33,
+                    "min_frame_interval_ms": 16,
+                    "preserves_execution_events": True,
+                },
+                "modes": ["real_tick", "bar", "pseudo_tick"],
+                "availability_time_enforced": True,
+            },
             "optimization": {
                 "methods": ["optuna", "walk_forward"],
                 "multi_objective": True,
@@ -241,6 +258,10 @@ def create_app(
                     "available": True,
                     "data_source_policy": "pxydata_preferred_with_runtime_fallback",
                     "snapshot_enforcement": "provenance_only",
+                    "replay_modes": ["bar", "pseudo_tick"],
+                    "event_domains": ["market_bar", "market_tick", "order", "fill", "position", "account"],
+                    "execution_stream": "complete_ordered_audited",
+                    "strategies": _engine_strategies(a_share_catalog, "vnpy_cta"),
                 },
                 {
                     "id": "a_share_portfolio",
@@ -248,6 +269,9 @@ def create_app(
                     "adapter_contract": "pxybacktest.engine-adapter.a-share.v1",
                     "intervals": ["1d"],
                     "snapshot_enforcement": "manifest_bound",
+                    "replay_modes": ["bar"],
+                    "event_domains": ["market_bar", "fundamental", "factor", "order", "fill", "position", "account"],
+                    "execution_stream": "complete_ordered_audited",
                     "price_adjustment": "none",
                     "worker_version": a_share_catalog.get("worker_version"),
                     "strategies": _engine_strategies(
@@ -264,6 +288,9 @@ def create_app(
                     "factor_contract": "pxydata.factor_matrix_daily.v1",
                     "intervals": ["1d"],
                     "snapshot_enforcement": "manifest_bound",
+                    "replay_modes": ["bar"],
+                    "event_domains": ["market_bar", "factor", "order", "fill", "position", "account"],
+                    "execution_stream": "complete_ordered_audited",
                     "strategies": _engine_strategies(
                         a_share_catalog,
                         "factor_matrix",
@@ -278,6 +305,9 @@ def create_app(
                     "factor_contract": "pxydata.factor_matrix_daily.v1",
                     "intervals": ["1d"],
                     "snapshot_enforcement": "manifest_bound",
+                    "replay_modes": ["bar"],
+                    "event_domains": ["market_bar", "news", "sentiment", "factor", "order", "fill", "position", "account"],
+                    "execution_stream": "complete_ordered_audited",
                     "strategies": _engine_strategies(
                         a_share_catalog,
                         "event_sentiment",
@@ -289,6 +319,9 @@ def create_app(
                     "intervals": ["tick"],
                     "snapshot_enforcement": "manifest_bound",
                     "tick_contract": "pxydata.market_ticks.v1",
+                    "replay_modes": ["real_tick"],
+                    "event_domains": ["market_tick", "order_book", "order", "fill", "position", "account"],
+                    "execution_stream": "complete_ordered_audited",
                     "strategies": [
                         {
                             "id": MICROSTRUCTURE_STRATEGY_ID,
@@ -304,13 +337,16 @@ def create_app(
                                 {"id": "quantity", "default": 1},
                             ],
                         }
-                    ],
+                    ] + _engine_strategies(a_share_catalog, "microstructure"),
                 },
                 {
                     "id": "ml_factor",
                     "available": learning_available,
                     "intervals": ["1d"],
                     "snapshot_enforcement": "manifest_bound",
+                    "replay_modes": ["bar"],
+                    "event_domains": ["market_bar", "factor", "signal", "account"],
+                    "execution_stream": "complete_ordered_audited",
                     "feature_contracts": [
                         "pxydata.ml_features_daily.v1",
                         "pxydata.factor_matrix_daily.v1",
@@ -343,6 +379,9 @@ def create_app(
                     "available": learning_available and learning_runtime_capabilities()["optional"]["torch"],
                     "intervals": ["1d"],
                     "snapshot_enforcement": "manifest_bound",
+                    "replay_modes": ["bar"],
+                    "event_domains": ["market_bar", "factor", "signal", "account"],
+                    "execution_stream": "complete_ordered_audited",
                     "models": [item for item in learning_runtime_capabilities()["models"] if item in {"lstm", "transformer", "transformer_seq", "ensemble"}],
                     "research_adapters": ["qlib", "rd-agent"],
                     "execution_mode": "offline_train_then_signal_only",
@@ -352,6 +391,9 @@ def create_app(
                     "available": lighter_available,
                     "intervals": ["tick", "1s", "100ms"],
                     "snapshot_enforcement": "manifest_bound",
+                    "replay_modes": ["real_tick"],
+                    "event_domains": ["market_tick", "order_book", "factor", "order", "fill", "account"],
+                    "execution_stream": "complete_ordered_audited",
                     "data_contracts": [
                         "pxydata.lighter_microstructure_factors.v1",
                         "pxydata.lighter_order_book_events.v1",
@@ -465,7 +507,7 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         a_share_catalog: dict = {}
-        if body.engine_type in DAA_ENGINE_TYPES and daa_adapter.configured:
+        if body.engine_type in AI_CAPABLE_ENGINE_TYPES and daa_adapter.configured:
             try:
                 a_share_catalog = await daa_adapter.get_capabilities()
             except DaaCapabilitiesError:
@@ -483,7 +525,7 @@ def create_app(
                 status_code=501,
                 detail=f"回测引擎尚未安装: {body.engine_type}",
             )
-        if body.engine_type in DAA_ENGINE_TYPES:
+        if body.engine_type in AI_CAPABLE_ENGINE_TYPES:
             selected_strategy = next(
                 (
                     item
@@ -492,20 +534,35 @@ def create_app(
                 ),
                 None,
             )
-            if selected_strategy is None:
+            # CTA/真实 Tick 的内置策略仍走各自 legacy/runtime 校验；只有
+            # DAA 目录中的 AI 策略才进入这里的哈希门禁。
+            builtin_strategy = (
+                body.engine_type == "microstructure"
+                and body.strategy.id == MICROSTRUCTURE_STRATEGY_ID
+            ) or (
+                body.engine_type == "vnpy_cta"
+                and not body.strategy.id.startswith("ai_")
+            )
+            if selected_strategy is None and not builtin_strategy:
                 raise HTTPException(
                     status_code=422,
-                    detail=f"DAA {body.engine_type} 策略不存在",
+                    detail=f"DAA {body.engine_type} 策略不存在或未注册",
                 )
-            if (
+            if selected_strategy is not None and (
                 selected_strategy.get("source_hash")
                 != body.strategy.source_hash.lower()
             ):
                 raise HTTPException(
-                    status_code=409, detail="DAA A 股策略源码版本已变化"
+                    status_code=409, detail="DAA 策略源码版本已变化"
                 )
+            if selected_strategy is not None and body.engine_type in {"vnpy_cta", "microstructure"}:
+                if selected_strategy.get("source") != "ai" or selected_strategy.get("execution_backend") != "polars_expr":
+                    raise HTTPException(
+                        status_code=422,
+                        detail="CTA/真实 Tick 只接受已验证的 DAA polars_expr 策略",
+                    )
 
-        if body.engine_type == "microstructure" and (
+        if body.engine_type == "microstructure" and not body.strategy.id.startswith("ai_") and (
             body.strategy.id != MICROSTRUCTURE_STRATEGY_ID
             or body.strategy.source_hash.lower() != MICROSTRUCTURE_STRATEGY_HASH
         ):

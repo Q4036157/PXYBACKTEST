@@ -2,4 +2,6 @@ fastapi==0.115.0
 pydantic==2.10.0
 uvicorn[standard]==0.32.0
 pyarrow>=16,<24
+polars>=1.30,<2
+tzdata>=2025.2
 optuna>=4.0,<5

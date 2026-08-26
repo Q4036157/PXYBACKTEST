@@ -174,3 +174,5 @@ def test_learning_derives_forward_return_from_factor_and_kline_snapshots(tmp_pat
     )
     assert result["metrics"]["n_days"] > 0
     assert result["diagnostics"]["label_column"] == "forward_return_2d"
+    assert result["replay_audit"]["event_count"] > result["metrics"]["n_days"]
+    assert len(result["replay_audit"]["chain_sha256"]) == 64

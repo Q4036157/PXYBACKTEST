@@ -14,10 +14,19 @@ def _attach_reproducibility(
     task = dict(request.get("_task_contract") or {})
     snapshot = dict((task.get("data") or {}).get("snapshot") or {})
     events = list(raw_result.get("events") or raw_result.get("replay_events") or [])
+    replay_audit = raw_result.get("replay_audit")
+    event_log_sha256 = (
+        str(replay_audit.get("chain_sha256") or "")
+        if isinstance(replay_audit, dict)
+        else stable_hash(events)
+    )
     result["reproducibility"] = {
         "input_contract_sha256": stable_hash(task),
         "manifest_sha256": snapshot.get("manifest_sha256"),
-        "event_log_sha256": stable_hash(events),
+        "event_log_sha256": event_log_sha256,
+        "event_count": int(replay_audit.get("event_count") or 0)
+        if isinstance(replay_audit, dict)
+        else len(events),
         "engine_version": str(raw_result.get("engine_version") or "unknown"),
     }
     result["reproducibility"]["result_sha256"] = stable_hash(result)
@@ -77,8 +86,10 @@ def build_result_v2(
             "data_source_policy": "pxydata_preferred_with_runtime_fallback",
             "snapshot_enforcement": "provenance_only",
             "strictly_reproducible": False,
+            "replay_audit": raw_result.get("replay_audit"),
             "warnings": warnings,
         },
+        "replay_audit": raw_result.get("replay_audit"),
         "artifacts": [],
     }
     return _attach_reproducibility(result, request=request, raw_result=raw_result)
@@ -179,10 +190,14 @@ def build_a_share_result_v2(
             "data_source_policy": "pxydata_snapshot_only",
             "snapshot_enforcement": adapter.get("snapshot_enforcement"),
             "strictly_reproducible": True,
+            "replay_audit": raw_result.get("replay_audit"),
             "price_adjustment": adapter.get("price_adjustment"),
             "corporate_actions_applied": bool(adapter.get("corporate_actions_applied")),
             "warnings": warnings,
         },
         "artifacts": [],
+        "replay_audit": raw_result.get("replay_audit"),
     }
+    if isinstance(raw_result.get("_replay_events"), list):
+        result["_replay_events"] = raw_result["_replay_events"]
     return _attach_reproducibility(result, request=request, raw_result=raw_result)

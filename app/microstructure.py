@@ -125,9 +125,11 @@ def run_microstructure_backtest(
     task: dict[str, Any],
     manifest: dict[str, Any],
     data_root: str | Path,
+    daa_root: str | Path | None = None,
 ) -> dict[str, Any]:
     strategy = dict(task.get("strategy") or {})
-    if strategy.get("id") != MICROSTRUCTURE_STRATEGY_ID:
+    strategy_id = str(strategy.get("id") or "")
+    if strategy_id != MICROSTRUCTURE_STRATEGY_ID and not strategy_id.startswith("ai_"):
         raise MicrostructureBacktestError("microstructure 策略不存在")
     universe = dict(task.get("universe") or {})
     period = dict(task.get("period") or {})
@@ -140,14 +142,69 @@ def run_microstructure_backtest(
         start=str(period.get("start") or ""),
         end=str(period.get("end") or ""),
     )
-    raw = replay_order_book_imbalance(
-        ticks,
-        capital=float(execution.get("capital") or 1_000_000),
-        fee_rate=float(execution.get("rate") or 0),
-        slippage_bps=float(execution.get("slippage") or 0),
-        parameters=parameters,
-    )
+    if strategy_id.startswith("ai_"):
+        if not daa_root:
+            raise MicrostructureBacktestError("DAA portable 策略缺少 DAA 根目录")
+        raw = replay_portable_daa_ticks(
+            ticks,
+            strategy=strategy,
+            daa_root=daa_root,
+            capital=float(execution.get("capital") or 1_000_000),
+            fee_rate=float(execution.get("rate") or 0),
+            slippage_bps=float(execution.get("slippage") or 0),
+            parameters=parameters,
+        )
+    else:
+        raw = replay_order_book_imbalance(
+            ticks,
+            capital=float(execution.get("capital") or 1_000_000),
+            fee_rate=float(execution.get("rate") or 0),
+            slippage_bps=float(execution.get("slippage") or 0),
+            parameters=parameters,
+        )
+    from app.replay import build_replay_audit
+
     snapshot = dict((task.get("data") or {}).get("snapshot") or {})
+    replay_events: list[dict[str, Any]] = [
+        {
+            "event_type": "market_tick",
+            "event_time": row.get("exchange_ts"),
+            "available_at": row.get("received_at") or row.get("received_ts_ms"),
+            "payload": row,
+            "symbol": row.get("symbol"),
+            "source_seq": index,
+        }
+        for index, row in enumerate(ticks)
+    ]
+    for index, item in enumerate(raw.get("orders") or []):
+        replay_events.append(
+            {
+                "event_type": "order",
+                "event_time": item.get("signal_time") or item.get("fill_time"),
+                "payload": item,
+                "symbol": item.get("symbol"),
+                "source_seq": len(replay_events) + index,
+            }
+        )
+    for index, item in enumerate(raw.get("deals") or []):
+        replay_events.append(
+            {
+                "event_type": "fill",
+                "event_time": item.get("exit_time") or item.get("fill_time"),
+                "payload": item,
+                "symbol": item.get("symbol"),
+                "source_seq": len(replay_events) + index,
+            }
+        )
+    for index, item in enumerate(raw.get("equity_curve") or []):
+        replay_events.append(
+            {
+                "event_type": "account",
+                "event_time": item.get("date"),
+                "payload": item,
+                "source_seq": len(replay_events) + index,
+            }
+        )
     return {
         "schema_version": 2,
         "contract_version": "pxybacktest.task-result.v2",
@@ -176,6 +233,94 @@ def run_microstructure_backtest(
             "snapshot_id": snapshot.get("snapshot_id"),
             "manifest_sha256": snapshot.get("manifest_sha256"),
         },
+        "replay_audit": build_replay_audit(
+            run_id=task_id,
+            snapshot_id=str(snapshot.get("snapshot_id") or task_id),
+            events=replay_events,
+        ),
+        "_replay_events": replay_events,
+    }
+
+
+def replay_portable_daa_ticks(
+    ticks: list[dict[str, Any]],
+    *,
+    strategy: dict[str, Any],
+    daa_root: str | Path,
+    capital: float,
+    fee_rate: float,
+    slippage_bps: float,
+    parameters: dict[str, Any],
+) -> dict[str, Any]:
+    """以真实 Tick、下一 Tick 成交和一档盘口撮合 DAA 信号。"""
+    from app.daa_portable import evaluate_filter, load_strategy, tick_frame
+
+    module = load_strategy(strategy=strategy, daa_root=daa_root)
+    meta = dict(getattr(module, "META", {}) or {})
+    direction = str(meta.get("direction") or "long").lower()
+    latency = max(1, int(parameters.get("latency_ticks", 1)))
+    max_hold = max(1, int(parameters.get("max_hold_ticks", 100)))
+    quantity = max(float(parameters.get("quantity", 1.0)), 0.0)
+    balance = capital
+    position: dict[str, Any] | None = None
+    pending: tuple[int, int] | None = None
+    orders: list[dict[str, Any]] = []
+    deals: list[dict[str, Any]] = []
+    equity_curve: list[dict[str, Any]] = []
+    signals = 0
+    for index, tick in enumerate(ticks):
+        if pending and index >= pending[0]:
+            target = pending[1]
+            price = float(tick["ask_price1"] if target > 0 else tick["bid_price1"])
+            price *= 1 + (slippage_bps / 10_000.0) * (1 if target > 0 else -1)
+            if position is None and target:
+                position = {"side": target, "entry_index": index, "entry_time": tick["exchange_ts"], "entry_price": price, "symbol": tick["symbol"]}
+                orders.append({"order_id": f"daa-tick-{index}", "symbol": tick["symbol"], "action": "enter_long" if target > 0 else "enter_short", "fill_time": tick["exchange_ts"], "price": price, "quantity": quantity, "status": "filled"})
+            elif position is not None and (target == 0 or target != int(position["side"])):
+                pnl = int(position["side"]) * (price - float(position["entry_price"])) * quantity
+                fees = (float(position["entry_price"]) + price) * quantity * fee_rate
+                net = pnl - fees
+                balance += net
+                deals.append({"symbol": position["symbol"], "side": "long" if position["side"] > 0 else "short", "entry_time": position["entry_time"], "exit_time": tick["exchange_ts"], "entry_price": position["entry_price"], "exit_price": price, "quantity": quantity, "pnl_amount": net, "pnl_pct": net / capital if capital else 0.0, "holding_ticks": index - int(position["entry_index"])})
+                orders.append({"order_id": f"daa-tick-{index}", "symbol": tick["symbol"], "action": "exit", "fill_time": tick["exchange_ts"], "price": price, "quantity": quantity, "status": "filled"})
+                equity_curve.append({"date": tick["exchange_ts"], "value": balance})
+                position = None
+                if target:
+                    pending = (index, target)
+                    continue
+            pending = None
+
+        if pending is not None:
+            continue
+        if index + latency >= len(ticks):
+            continue
+        strategy_params = parameters.get("strategy_params") if isinstance(parameters.get("strategy_params"), dict) else parameters
+        active = evaluate_filter(module, tick_frame(tick), strategy_params)
+        signals += int(active)
+        target = (1 if direction != "short" else -1) if active else 0
+        if position is not None and index - int(position["entry_index"]) >= max_hold:
+            target = 0
+        if (position is None and target) or (position is not None and target != int(position["side"])):
+            pending = (index + latency, target)
+
+    if position is not None:
+        final = ticks[-1]
+        price = float(final["bid_price1"] if position["side"] > 0 else final["ask_price1"])
+        pnl = int(position["side"]) * (price - float(position["entry_price"])) * quantity
+        fees = (float(position["entry_price"]) + price) * quantity * fee_rate
+        net = pnl - fees
+        balance += net
+        deals.append({"symbol": position["symbol"], "side": "long" if position["side"] > 0 else "short", "entry_time": position["entry_time"], "exit_time": final["exchange_ts"], "entry_price": position["entry_price"], "exit_price": price, "quantity": quantity, "pnl_amount": net, "pnl_pct": net / capital if capital else 0.0, "holding_ticks": len(ticks) - int(position["entry_index"]), "exit_reason": "end_of_snapshot"})
+        equity_curve.append({"date": final["exchange_ts"], "value": balance})
+    if not equity_curve:
+        equity_curve = [{"date": ticks[0]["exchange_ts"], "value": capital}]
+    return {
+        "metrics": {"total_return": balance / capital - 1 if capital else 0.0, "final_equity": balance, "net_profit": balance - capital, "n_trades": len(deals), "signals": signals, "fill_rate": 1.0 if orders else 0.0, "matching_model": "next_tick_visible_l1_daa_polars_expr"},
+        "equity_curve": equity_curve,
+        "drawdown_curve": [],
+        "orders": orders,
+        "deals": deals,
+        "diagnostics": {"tick_count": len(ticks), "signals_submitted": signals, "orders_filled": len(orders), "matching_model": "next_tick_visible_l1_daa_polars_expr", "daa_strategy": strategy.get("id")},
     }
 
 

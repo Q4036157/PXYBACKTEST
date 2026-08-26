@@ -111,6 +111,24 @@ def _stop_subprocess(process: subprocess.Popen) -> None:
         process.wait(timeout=1.0)
 
 
+def _drain_worker_commands(command_queue, deferred: list[dict[str, Any]]) -> bool:
+    """读取取消状态，同时保留暂停、继续和调速命令供 ReplayClock 使用。"""
+
+    cancelled = False
+    try:
+        while True:
+            command = command_queue.get_nowait()
+            if str(command.get("action") or "").strip().lower() == "cancel":
+                cancelled = True
+                if not any(item.get("action") == "cancel" for item in deferred):
+                    deferred.append({"action": "cancel"})
+            elif isinstance(command, dict):
+                deferred.append(command)
+    except queue.Empty:
+        pass
+    return cancelled
+
+
 def run_a_share_worker(
     task_id: str,
     request: dict[str, Any],
@@ -129,6 +147,7 @@ def run_a_share_worker(
     work_dir = Path(job_dir)
     final_path = Path(result_path)
     cancelled = False
+    deferred_commands: list[dict[str, Any]] = []
 
     try:
         if (
@@ -156,13 +175,9 @@ def run_a_share_worker(
 
         def cancel_requested() -> bool:
             nonlocal cancelled
-            try:
-                while True:
-                    command_message = command_queue.get_nowait()
-                    if str(command_message.get("action") or "") == "cancel":
-                        cancelled = True
-            except queue.Empty:
-                pass
+            cancelled = cancelled or _drain_worker_commands(
+                command_queue, deferred_commands
+            )
             return cancelled
 
         from app.optimization import run_task_optimization
@@ -234,7 +249,29 @@ def run_a_share_worker(
             evaluate,
             cancel_check=cancel_requested,
         )
+        outcome = _replay_non_cta_result(
+            event_queue,
+            command_queue,
+            task_id=task_id,
+            request=request,
+            result=result,
+            engine_type=str(task_contract.get("engine_type") or "a_share_portfolio"),
+            deferred_commands=deferred_commands,
+        )
         _atomic_json_write(final_path, result)
+        if not outcome["complete"]:
+            _emit(
+                event_queue,
+                "cancelled",
+                {
+                    "result_path": str(final_path),
+                    "result_available": True,
+                    "partial": True,
+                    "processed_events": outcome["processed_events"],
+                },
+                terminal=True,
+            )
+            return
         _emit(
             event_queue,
             "completed",
@@ -300,6 +337,7 @@ def run_preloaded_worker(
             result_path,
             event_queue,
             command_queue,
+            daa_root=daa_root,
         )
         return
     if engine_type in ML_ENGINE_TYPES:
@@ -330,6 +368,7 @@ def run_preloaded_worker(
         render_interval_ms,
         event_queue,
         command_queue,
+        daa_root=daa_root,
     )
 
 
@@ -340,19 +379,17 @@ def run_microstructure_worker(
     result_path: str,
     event_queue,
     command_queue,
+    daa_root: str | None = None,
 ) -> None:
     """在隔离 worker 中执行 manifest-bound 真实 Tick 回放。"""
     cancelled = False
+    deferred_commands: list[dict[str, Any]] = []
     try:
         def cancel_requested() -> bool:
             nonlocal cancelled
-            try:
-                while True:
-                    command = command_queue.get_nowait()
-                    if str(command.get("action") or "") == "cancel":
-                        cancelled = True
-            except queue.Empty:
-                pass
+            cancelled = cancelled or _drain_worker_commands(
+                command_queue, deferred_commands
+            )
             return cancelled
 
         if cancel_requested():
@@ -376,6 +413,7 @@ def run_microstructure_worker(
                 task=candidate,
                 manifest=manifest,
                 data_root=pxydata_root,
+                daa_root=daa_root,
             )
 
         result = run_task_optimization(
@@ -383,7 +421,29 @@ def run_microstructure_worker(
             evaluate,
             cancel_check=cancel_requested,
         )
+        outcome = _replay_non_cta_result(
+            event_queue,
+            command_queue,
+            task_id=task_id,
+            request=request,
+            result=result,
+            engine_type="microstructure",
+            deferred_commands=deferred_commands,
+        )
         _atomic_json_write(Path(result_path), result)
+        if not outcome["complete"]:
+            _emit(
+                event_queue,
+                "cancelled",
+                {
+                    "result_path": str(result_path),
+                    "result_available": True,
+                    "partial": True,
+                    "processed_events": outcome["processed_events"],
+                },
+                terminal=True,
+            )
+            return
         _emit(
             event_queue,
             "completed",
@@ -412,16 +472,13 @@ def run_learning_worker(
 ) -> None:
     """在隔离进程中执行快照绑定的 ML/深度学习研究回测。"""
     cancelled = False
+    deferred_commands: list[dict[str, Any]] = []
     try:
         def cancel_requested() -> bool:
             nonlocal cancelled
-            try:
-                while True:
-                    command = command_queue.get_nowait()
-                    if str(command.get("action") or "") == "cancel":
-                        cancelled = True
-            except queue.Empty:
-                pass
+            cancelled = cancelled or _drain_worker_commands(
+                command_queue, deferred_commands
+            )
             return cancelled
 
         if cancel_requested():
@@ -447,7 +504,29 @@ def run_learning_worker(
             manifest=manifest,
             data_root=pxydata_root,
         )
+        outcome = _replay_non_cta_result(
+            event_queue,
+            command_queue,
+            task_id=task_id,
+            request=request,
+            result=result,
+            engine_type=str(task.get("engine_type") or "ml_factor"),
+            deferred_commands=deferred_commands,
+        )
         _atomic_json_write(Path(result_path), result)
+        if not outcome["complete"]:
+            _emit(
+                event_queue,
+                "cancelled",
+                {
+                    "result_path": str(result_path),
+                    "result_available": True,
+                    "partial": True,
+                    "processed_events": outcome["processed_events"],
+                },
+                terminal=True,
+            )
+            return
         _emit(
             event_queue,
             "completed",
@@ -476,6 +555,7 @@ def run_lighter_worker(
 ) -> None:
     """执行 manifest-bound Lighter 资金费/盘口/主动成交回放。"""
     cancelled = False
+    deferred_commands: list[dict[str, Any]] = []
     try:
         task = request.get("_task_contract")
         manifest = request.get("_snapshot_manifest")
@@ -483,13 +563,9 @@ def run_lighter_worker(
             raise ValueError("Lighter worker 缺少任务契约或完整快照清单")
         def cancel_requested() -> bool:
             nonlocal cancelled
-            try:
-                while True:
-                    command = command_queue.get_nowait()
-                    if str(command.get("action") or "") == "cancel":
-                        cancelled = True
-            except queue.Empty:
-                pass
+            cancelled = cancelled or _drain_worker_commands(
+                command_queue, deferred_commands
+            )
             return cancelled
 
         cancel_requested()
@@ -527,10 +603,30 @@ def run_lighter_worker(
             evaluate,
             cancel_check=cancel_requested,
         )
-        if cancel_requested():
-            _emit(event_queue, "cancelled", {}, terminal=True)
-            return
+        cancel_requested()
+        outcome = _replay_non_cta_result(
+            event_queue,
+            command_queue,
+            task_id=task_id,
+            request=request,
+            result=result,
+            engine_type="lighter_microstructure",
+            deferred_commands=deferred_commands,
+        )
         _atomic_json_write(Path(result_path), result)
+        if not outcome["complete"]:
+            _emit(
+                event_queue,
+                "cancelled",
+                {
+                    "result_path": str(result_path),
+                    "result_available": True,
+                    "partial": True,
+                    "processed_events": outcome["processed_events"],
+                },
+                terminal=True,
+            )
+            return
         logger.info(
             "Lighter 回测完成: task_id=%s n_trades=%s total_return=%s optimized=%s",
             task_id,
@@ -580,6 +676,304 @@ def _emit(
         return False
 
 
+def _emit_result_execution_snapshot(
+    event_queue,
+    *,
+    task_id: str,
+    request: dict[str, Any],
+    result: dict[str, Any],
+    engine_type: str,
+) -> None:
+    """把非 CTA 子进程的最终结果投影为统一执行快照。"""
+
+    task = request.get("_task_contract") or {}
+    snapshot_ref = ((task.get("data") or {}).get("snapshot") or {})
+    period = task.get("period") or {}
+    diagnostics = result.get("diagnostics") or {}
+    market = result.get("market") or {}
+    curves = result.get("curves") or {}
+
+    def _symbol_map(value: Any) -> dict[str, Any]:
+        """把列表形式的跨引擎行情/盘口/持仓规整为 symbol map。"""
+        if isinstance(value, dict):
+            return dict(value)
+        if not isinstance(value, list):
+            return {}
+        mapped: dict[str, Any] = {}
+        for index, item in enumerate(value):
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or item.get("vt_symbol") or index)
+            mapped[symbol] = item
+        return mapped
+
+    bars = _symbol_map(
+        result.get("bars")
+        or market.get("bars")
+        or result.get("market_bars")
+    )
+    order_books = _symbol_map(
+        result.get("order_books")
+        or market.get("order_books")
+        or result.get("books")
+    )
+    positions = _symbol_map(result.get("positions"))
+    fills = result.get("deals") or result.get("trades") or []
+    if not isinstance(fills, list):
+        fills = []
+    if engine_type in {"microstructure", "lighter_microstructure"}:
+        replay_mode = "real_tick"
+        replay_source = "PXYDATA"
+    elif engine_type in {"factor_matrix", "event_sentiment", "ml_factor", "deep_learning"}:
+        replay_mode = "bar"
+        replay_source = "PXYDATA"
+    else:
+        replay_mode = "bar"
+        replay_source = "PXYDATA"
+    snapshot = {
+        "contract_version": "pxybacktest.replay.v1",
+        "run_id": task_id,
+        "snapshot_id": str(snapshot_ref.get("snapshot_id") or task_id),
+        "event_seq": int(len(result.get("deals") or result.get("trades") or [])),
+        "simulated_at": str(period.get("end") or ""),
+        "bars": bars,
+        "trades": result.get("trade_prints") or result.get("prints") or [],
+        "order_books": order_books,
+        "news": result.get("news") or result.get("events") or {},
+        "sentiment": result.get("sentiment") or {},
+        "fundamentals": result.get("fundamentals") or result.get("financials") or {},
+        "factors": result.get("factors") or {},
+        "signals": result.get("signals") or result.get("strategy_signals") or [],
+        "orders": result.get("orders") or [],
+        "fills": fills,
+        "positions": positions,
+        "account": {
+            "metrics": result.get("metrics") or {},
+            "equity_curve": curves.get("equity") or curves.get("daily") or [],
+        },
+        "queue_lag": 0,
+        "engine_type": engine_type,
+        "replay": {
+            "contract": "pxybacktest.replay.v1",
+            "mode": replay_mode,
+            "source": replay_source,
+            "execution_stream": "final_result_projection",
+            "availability_time_enforced": True,
+        },
+        "adapter": diagnostics.get("adapter"),
+        "audit": result.get("replay_audit"),
+    }
+    _emit(event_queue, "execution_snapshot", {"snapshot": snapshot})
+
+
+def _replay_non_cta_result(
+    event_queue,
+    command_queue,
+    *,
+    task_id: str,
+    request: dict[str, Any],
+    result: dict[str, Any],
+    engine_type: str,
+    deferred_commands: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """用统一 EventCursor/ReplayClock 回放适配器事件，并写回可持久化快照。"""
+
+    from app.replay import ResultReplayController
+
+    replay_events = result.pop("_replay_events", None)
+    if not isinstance(replay_events, list) or not replay_events:
+        _emit_result_execution_snapshot(
+            event_queue,
+            task_id=task_id,
+            request=request,
+            result=result,
+            engine_type=engine_type,
+        )
+        result["complete"] = True
+        result["termination_reason"] = "completed"
+        return {
+            "complete": True,
+            "termination_reason": "completed",
+            "processed_events": 0,
+            "remaining_events": 0,
+            "total_events": 0,
+            "execution_snapshot": {},
+            "replay_audit": result.get("replay_audit") or {},
+        }
+
+    task = dict(request.get("_task_contract") or {})
+    execution = dict(task.get("execution") or {})
+    snapshot_ref = dict((task.get("data") or {}).get("snapshot") or {})
+    speed = float(execution.get("speed") or request.get("speed") or 50)
+    mode = str(execution.get("execution_mode") or "visual")
+    pending = deferred_commands if deferred_commands is not None else []
+    original_audit = result.get("replay_audit") or {}
+    complete_stream = int(original_audit.get("event_count") or 0) == len(replay_events)
+
+    def read_commands() -> list[dict[str, Any]]:
+        commands = list(pending)
+        pending.clear()
+        try:
+            while True:
+                command = command_queue.get_nowait()
+                if isinstance(command, dict):
+                    commands.append(command)
+        except queue.Empty:
+            pass
+        return commands
+
+    def emit_state(state: dict[str, Any]) -> None:
+        payload = {"phase": "replaying_events", **state}
+        _emit(
+            event_queue,
+            "state",
+            payload,
+            reliable=payload.get("status") in {"paused", "running"},
+        )
+
+    def emit_snapshot(snapshot: dict[str, Any]) -> None:
+        replay = dict(snapshot.get("replay") or {})
+        processed = int(replay.get("processed_events") or 0)
+        total = max(1, len(replay_events))
+        replay.update(
+            {
+                "contract": "pxybacktest.replay.v1",
+                "source": "DAA" if engine_type in DAA_ENGINE_TYPES else "PXYDATA",
+                "execution_stream": (
+                    "complete_ordered_audited"
+                    if complete_stream
+                    else "ordered_audited_projection"
+                ),
+                "availability_time_enforced": True,
+            }
+        )
+        snapshot["replay"] = replay
+        snapshot["engine_type"] = engine_type
+        _emit(event_queue, "execution_snapshot", {"snapshot": snapshot})
+        _emit(
+            event_queue,
+            "state",
+            {
+                "status": snapshot.get("status") or "running",
+                "phase": "replaying_events",
+                "progress": min(99.0, 10.0 + processed / total * 89.0),
+                "processed_events": processed,
+                "total_events": len(replay_events),
+                "current_datetime": snapshot.get("simulated_at"),
+                "speed": replay.get("speed"),
+                "replay": replay,
+            },
+        )
+
+    controller = ResultReplayController(
+        run_id=task_id,
+        snapshot_id=str(snapshot_ref.get("snapshot_id") or task_id),
+        events=replay_events,
+        mode=mode,
+        speed=speed,
+    )
+    outcome = controller.run(
+        read_commands=read_commands,
+        on_snapshot=emit_snapshot,
+        on_state=emit_state,
+    )
+    snapshot = dict(outcome["execution_snapshot"])
+    snapshot["engine_type"] = engine_type
+    replay = dict(snapshot.get("replay") or {})
+    replay.update(
+        {
+            "contract": "pxybacktest.replay.v1",
+            "source": "DAA" if engine_type in DAA_ENGINE_TYPES else "PXYDATA",
+            "execution_stream": (
+                "complete_ordered_audited"
+                if complete_stream
+                else "ordered_audited_projection"
+            ),
+            "availability_time_enforced": True,
+        }
+    )
+    snapshot["replay"] = replay
+    result["complete"] = bool(outcome["complete"])
+    result["termination_reason"] = str(outcome["termination_reason"])
+    result["execution_snapshot"] = snapshot
+    result["replay_audit"] = outcome["replay_audit"]
+    diagnostics = dict(result.get("diagnostics") or {})
+    diagnostics["replay"] = {
+        "processed_events": outcome["processed_events"],
+        "remaining_events": outcome["remaining_events"],
+        "total_events": outcome["total_events"],
+        "execution_stream": replay["execution_stream"],
+    }
+    result["diagnostics"] = diagnostics
+
+    if not outcome["complete"]:
+        _apply_partial_execution_result(result, task=task, snapshot=snapshot)
+
+    reproducibility = dict(result.get("reproducibility") or {})
+    reproducibility.pop("result_sha256", None)
+    reproducibility["event_log_sha256"] = outcome["replay_audit"].get(
+        "chain_sha256"
+    )
+    reproducibility["event_count"] = int(
+        outcome["replay_audit"].get("event_count") or 0
+    )
+    result["reproducibility"] = reproducibility
+    reproducibility["result_sha256"] = _stable_hash(result)
+    return outcome
+
+
+def _apply_partial_execution_result(
+    result: dict[str, Any],
+    *,
+    task: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> None:
+    """取消时移除尚未回放的最终结果，只保留已执行区间。"""
+
+    fills = list(snapshot.get("fills") or [])
+    orders = list(snapshot.get("orders") or [])
+    positions = list(dict(snapshot.get("positions") or {}).values())
+    account_curve = list(snapshot.get("account_curve") or [])
+    bar_history = list(snapshot.get("bar_history") or [])
+    execution = dict(task.get("execution") or {})
+    initial_capital = float(execution.get("capital") or 1_000_000)
+    latest_account = dict(snapshot.get("account") or {})
+    final_equity = latest_account.get("value")
+    if final_equity is None:
+        final_equity = latest_account.get("equity")
+    if final_equity is None:
+        realized = sum(
+            float(
+                item.get("pnl_amount")
+                or item.get("net_pnl")
+                or item.get("pnl")
+                or 0.0
+            )
+            for item in fills
+            if isinstance(item, dict)
+        )
+        final_equity = initial_capital + realized
+    final_equity = float(final_equity)
+    result["orders"] = orders
+    result["deals"] = fills
+    result["positions"] = positions
+    result["curves"] = {"equity": account_curve}
+    result["market"] = {"bars": bar_history}
+    result["order_books"] = snapshot.get("order_books") or {}
+    result["sentiment"] = snapshot.get("sentiment") or {}
+    result["news"] = snapshot.get("news") or {}
+    result["factors"] = snapshot.get("factors") or {}
+    result["signals"] = snapshot.get("signals") or []
+    result["metrics"] = {
+        "initial_capital": initial_capital,
+        "final_equity": final_equity,
+        "net_profit": final_equity - initial_capital,
+        "total_return": final_equity / initial_capital - 1.0,
+        "n_trades": len(fills),
+        "partial": True,
+    }
+
+
 def run_backtest_worker(
     task_id: str,
     request: dict[str, Any],
@@ -588,6 +982,7 @@ def run_backtest_worker(
     render_interval_ms: int,
     event_queue,
     command_queue,
+    daa_root: str | None = None,
 ) -> None:
     startup_started_at = time.perf_counter()
     _emit(event_queue, "state", {"status": "running", "phase": "loading_runtime"})
@@ -645,6 +1040,18 @@ def run_backtest_worker(
         mode=str(request.get("mode") or "BAR").upper(),
         execution_mode=str(request.get("execution_mode") or "visual").lower(),
     )
+    task_contract = request.get("_task_contract") or {}
+    # CTA AI bridge 只从 DAA 版本化目录读取策略；把身份和根目录绑定到
+    # 当前 task，供 PXYLH engine_runner 的动态加载门禁使用。
+    task._task_contract = task_contract
+    if daa_root:
+        import os
+        os.environ["PXYBACKTEST_DAA_ROOT"] = str(daa_root)
+    snapshot_ref = ((task_contract.get("data") or {}).get("snapshot") or {})
+    execution_snapshot_id = str(snapshot_ref.get("snapshot_id") or task_id)
+    from app.replay import ReplayAudit
+
+    replay_audit = ReplayAudit(run_id=task_id, snapshot_id=execution_snapshot_id)
 
     holder: dict[str, Any] = {}
     cancelled = False
@@ -652,6 +1059,36 @@ def run_backtest_worker(
     requested_paused = False
     requested_speed = float(task.speed)
     runtime_loaded_ms = round((time.perf_counter() - startup_started_at) * 1000)
+
+    # 策略线程完整处理每个 Tick；这里只对发往浏览器的 bar 投影限帧。
+    # 这样不会改变成交和结果，只会减少伪 Tick 造成的 UI 事件洪峰。
+    visual_projection_gate = None
+    if str(getattr(task, "execution_mode", "visual")).lower() == "visual":
+        from app.replay import VisualProjectionGate
+
+        visual_projection_gate = VisualProjectionGate(
+            interval_ms=max(16, int(render_interval_ms or 33))
+        )
+
+    def emit_runtime_event(event_type: str, payload: dict[str, Any]) -> bool:
+        replay_audit.record(event_type, payload)
+        if visual_projection_gate is None or event_type != "bar":
+            return _emit(event_queue, event_type, payload, reliable=True)
+        pending = visual_projection_gate.offer((event_type, dict(payload)))
+        if pending is None:
+            return True
+        projected_type, projected_payload = pending
+        return _emit(
+            event_queue,
+            str(projected_type),
+            {
+                **dict(projected_payload),
+                # 前端只显示投影帧，不应把省略的伪 Tick 误判为回放断裂。
+                "coalesced": True,
+                "projection": "visual_frame",
+            },
+            reliable=True,
+        )
 
     def execute() -> None:
         try:
@@ -674,9 +1111,7 @@ def run_backtest_worker(
             holder["result"] = run_backtest_sync(
                 task,
                 None,
-                event_sink=lambda event_type, payload: _emit(
-                    event_queue, event_type, payload, reliable=True
-                ),
+                event_sink=emit_runtime_event,
             )
         except BaseException as exc:
             holder["error"] = f"{type(exc).__name__}: {exc}"
@@ -789,6 +1224,34 @@ def run_backtest_worker(
                     snapshot_hashes[name] = digest
                     _emit(event_queue, f"{name}_snapshot", {"items": items})
 
+            execution_snapshot = {
+                "contract_version": "pxybacktest.replay.v1",
+                "run_id": task.task_id,
+                "snapshot_id": execution_snapshot_id,
+                "event_seq": int(getattr(task, "replay_seq", 0) or 0),
+                "simulated_at": str(task.current_datetime or ""),
+                "bars": (
+                    {str(task.vt_symbol): dict(task.current_bar)}
+                    if isinstance(getattr(task, "current_bar", None), dict)
+                    else {}
+                ),
+                "orders": snapshots["orders"],
+                "fills": snapshots["trades"],
+                "positions": snapshots["positions"],
+                "strategy_lines": snapshots["strategy_lines"],
+                "queue_lag": 0,
+                "replay": replay,
+                "audit": replay_audit.to_dict(),
+            }
+            execution_digest = _stable_hash(execution_snapshot)
+            if execution_digest != snapshot_hashes.get("execution"):
+                snapshot_hashes["execution"] = execution_digest
+                _emit(
+                    event_queue,
+                    "execution_snapshot",
+                    {"snapshot": execution_snapshot},
+                )
+
         if now - last_replay_snapshot_at >= 1.0:
             last_replay_snapshot_at = now
             replay_events = build_replay_event_snapshot(task.replay_events)
@@ -804,6 +1267,20 @@ def run_backtest_worker(
         time.sleep(render_interval)
 
     thread.join(timeout=1.0)
+    if visual_projection_gate is not None:
+        pending = visual_projection_gate.flush()
+        if pending is not None:
+            projected_type, projected_payload = pending
+            _emit(
+                event_queue,
+                str(projected_type),
+                {
+                    **dict(projected_payload),
+                    "coalesced": True,
+                    "projection": "visual_frame",
+                },
+                reliable=True,
+            )
     if "error" in holder:
         _emit(
             event_queue,
@@ -816,6 +1293,7 @@ def run_backtest_worker(
     result = convert_numpy_types(holder.get("result") or {})
     result.update(
         {
+            "replay_audit": replay_audit.to_dict(),
             "complete": not cancelled,
             "termination_reason": "cancelled" if cancelled else "completed",
             "progress": float(task.progress or 0.0),

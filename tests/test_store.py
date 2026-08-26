@@ -215,6 +215,29 @@ def test_store_applies_event_batch_in_order(tmp_path: Path) -> None:
     assert task["event_seq"] == sequences[-1]
 
 
+def test_store_persists_unified_execution_snapshot_for_resync(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path / "backtest.sqlite3")
+    task_id = store.create_task(
+        user_id="user-a", source_node="204", request=request_payload()
+    )
+    store.mark_running(task_id)
+    payload = {
+        "contract_version": "pxybacktest.replay.v1",
+        "run_id": task_id,
+        "snapshot_id": "btsnap_v1_" + "a" * 32,
+        "event_seq": 42,
+        "simulated_at": "2026-08-01T01:00:00Z",
+        "bars": {"BTC": {"close": 100}},
+        "sentiment": {"news-1": {"score": 0.7}},
+        "factors": {"factor-v1": {"value": 1.1}},
+    }
+    store.append_event(task_id, "execution_snapshot", {"snapshot": payload})
+
+    task = store.get_task("user-a", task_id)
+    assert task["execution_snapshot"]["snapshot_id"] == payload["snapshot_id"]
+    assert task["execution_snapshot"]["bars"]["BTC"]["close"] == 100
+
+
 def test_store_prunes_events_by_interval_instead_of_every_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

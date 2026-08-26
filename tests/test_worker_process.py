@@ -9,11 +9,166 @@ from app import worker_process
 from app.worker_process import (
     _configure_backtest_worker_logging,
     _emit,
+    _emit_result_execution_snapshot,
+    _replay_non_cta_result,
     build_replay_event_snapshot,
     run_a_share_worker,
     run_lighter_worker,
     run_microstructure_worker,
 )
+
+
+def test_result_execution_snapshot_projects_non_cta_result() -> None:
+    events: list[dict] = []
+
+    class EventQueue:
+        def put_nowait(self, item: dict) -> None:
+            events.append(item)
+
+    request = {
+        "_task_contract": {
+            "engine_type": "factor_matrix",
+            "period": {"end": "2026-08-01T00:00:00Z"},
+            "data": {
+                "snapshot": {
+                    "snapshot_id": "btsnap_v1_" + "a" * 32,
+                }
+            },
+        }
+    }
+    _emit_result_execution_snapshot(
+        EventQueue(),
+        task_id="task-1",
+        request=request,
+        result={
+            "metrics": {"total_return": 0.1},
+            "curves": {"equity": [{"date": "2026-08-01", "equity": 1001}]},
+            "deals": [{"trade_id": "d1"}],
+            "factors": {"factor-v1": {"value": 1.2}},
+            "bars": [{"symbol": "600000.SH", "close": 10.2}],
+            "order_books": [{"symbol": "600000.SH", "bid_price1": 10.1}],
+            "positions": [{"symbol": "600000.SH", "quantity": 100}],
+            "fundamentals": {"report-1": {"eps": 1.2}},
+            "signals": [{"symbol": "600000.SH", "side": "buy"}],
+        },
+        engine_type="factor_matrix",
+    )
+    assert events[0]["type"] == "execution_snapshot"
+    snapshot = events[0]["data"]["snapshot"]
+    assert snapshot["engine_type"] == "factor_matrix"
+    assert snapshot["factors"]["factor-v1"]["value"] == 1.2
+    assert snapshot["fills"] == [{"trade_id": "d1"}]
+    assert snapshot["bars"]["600000.SH"]["close"] == 10.2
+    assert snapshot["order_books"]["600000.SH"]["bid_price1"] == 10.1
+    assert snapshot["positions"]["600000.SH"]["quantity"] == 100
+    assert snapshot["fundamentals"]["report-1"]["eps"] == 1.2
+    assert snapshot["signals"][0]["side"] == "buy"
+    assert snapshot["replay"]["mode"] == "bar"
+    assert snapshot["replay"]["availability_time_enforced"] is True
+
+
+def test_non_cta_replay_uses_event_cursor_and_removes_private_event_tape() -> None:
+    event_queue: queue.Queue = queue.Queue()
+    command_queue: queue.Queue = queue.Queue()
+    snapshot_id = "btsnap_v1_" + "b" * 32
+    result = {
+        "metrics": {"total_return": 0.1},
+        "_replay_events": [
+            {
+                "event_type": "market_bar",
+                "event_time": "2026-08-01",
+                "symbol": "600000.SH",
+                "payload": {
+                    "symbol": "600000.SH",
+                    "datetime": "2026-08-01",
+                    "open": 10,
+                    "high": 11,
+                    "low": 9,
+                    "close": 10.5,
+                },
+            },
+            {
+                "event_type": "account",
+                "event_time": "2026-08-01",
+                "payload": {"date": "2026-08-01", "value": 1_010_000},
+            },
+        ],
+        "replay_audit": {"event_count": 2},
+    }
+    request = {
+        "_task_contract": {
+            "engine_type": "factor_matrix",
+            "execution": {"capital": 1_000_000, "speed": 100, "execution_mode": "fast"},
+            "data": {"snapshot": {"snapshot_id": snapshot_id}},
+        }
+    }
+
+    outcome = _replay_non_cta_result(
+        event_queue,
+        command_queue,
+        task_id="task-replay",
+        request=request,
+        result=result,
+        engine_type="factor_matrix",
+    )
+
+    assert outcome["complete"] is True
+    assert "_replay_events" not in result
+    assert result["execution_snapshot"]["bar_history_count"] == 1
+    assert result["execution_snapshot"]["account_curve_count"] == 1
+    assert result["replay_audit"]["event_count"] == 2
+
+
+def test_non_cta_cancel_saves_only_processed_execution_snapshot() -> None:
+    event_queue: queue.Queue = queue.Queue()
+
+    class DelayedCancelQueue:
+        calls = 0
+
+        def get_nowait(self) -> dict:
+            self.calls += 1
+            if self.calls == 2:
+                return {"action": "cancel"}
+            raise queue.Empty
+
+    result = {
+        "metrics": {"total_return": 0.99},
+        "curves": {"equity": [{"date": "future", "value": 1_990_000}]},
+        "_replay_events": [
+            {
+                "event_type": "account",
+                "event_time": f"2026-08-0{day}",
+                "payload": {"date": f"2026-08-0{day}", "value": 1_000_000 + day * 1_000},
+            }
+            for day in range(1, 4)
+        ],
+        "replay_audit": {"event_count": 3},
+    }
+    request = {
+        "_task_contract": {
+            "engine_type": "event_sentiment",
+            "execution": {"capital": 1_000_000, "speed": 100, "execution_mode": "fast"},
+            "data": {"snapshot": {"snapshot_id": "btsnap_v1_" + "c" * 32}},
+        }
+    }
+
+    outcome = _replay_non_cta_result(
+        event_queue,
+        DelayedCancelQueue(),
+        task_id="task-partial",
+        request=request,
+        result=result,
+        engine_type="event_sentiment",
+    )
+
+    assert outcome["complete"] is False
+    assert outcome["processed_events"] == 1
+    assert result["complete"] is False
+    assert result["metrics"]["partial"] is True
+    assert result["metrics"]["final_equity"] == 1_001_000
+    assert result["curves"]["equity"] == [
+        {"date": "2026-08-01", "value": 1_001_000}
+    ]
 
 
 def test_emit_reliable_event_fails_closed_when_queue_is_full() -> None:

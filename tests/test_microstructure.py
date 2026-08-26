@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from app.microstructure import replay_order_book_imbalance
+from app.microstructure import replay_order_book_imbalance, run_microstructure_backtest
 from app.models import SubmitBacktestRequestV2
 
 
@@ -118,3 +118,25 @@ def test_microstructure_contract_accepts_tick_snapshot_selection() -> None:
 
     assert model.execution.mode == "TICK"
     assert model.data.selection is not None
+
+
+def test_microstructure_adapter_audits_all_real_ticks_and_fills(monkeypatch) -> None:
+    payload = _payload()
+    payload["data"] = {"snapshot": {"snapshot_id": "btsnap_v1_" + "a" * 32}}
+    ticks = [
+        _tick(0, bid_depth=10, ask_depth=2),
+        _tick(1, bid_depth=10, ask_depth=2),
+        _tick(2, bid_depth=2, ask_depth=10),
+        _tick(3, bid_depth=2, ask_depth=10),
+    ]
+    monkeypatch.setattr("app.microstructure.load_manifest_ticks", lambda **_: ticks)
+
+    result = run_microstructure_backtest(
+        task_id="micro-audit",
+        task=payload,
+        manifest={"datasets": []},
+        data_root=".",
+    )
+
+    assert result["replay_audit"]["event_count"] >= len(ticks)
+    assert result["replay_audit"]["snapshot_id"] == payload["data"]["snapshot"]["snapshot_id"]

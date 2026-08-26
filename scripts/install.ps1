@@ -25,7 +25,7 @@ if (!(Test-Path -LiteralPath $backendRoot -PathType Container)) {
 }
 
 $env:PYTHONPATH = "$repoRoot;$pxylhRoot;$backendRoot"
-& $python -c "import fastapi, pydantic, uvicorn; from app.main import create_app; from services.backtest_service.engine_runner import run_backtest_sync" 2>$null
+& $python -c "import fastapi, pydantic, uvicorn; from zoneinfo import ZoneInfo; ZoneInfo('UTC'); from app.main import create_app; from services.backtest_service.engine_runner import run_backtest_sync" 2>$null
 if ($LASTEXITCODE -ne 0) {
     & $python -m pip install -r (Join-Path $repoRoot "requirements.txt")
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -35,6 +35,11 @@ if ($hasOptuna -ne "1") {
     & $python -m pip install --disable-pip-version-check "optuna>=4.0,<5"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
+$hasPolars = (& $python -c "import importlib.util; print(int(importlib.util.find_spec('polars') is not None))").Trim()
+if ($hasPolars -ne "1") {
+    & $python -m pip install --disable-pip-version-check "polars>=1.30,<2"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 
-& $python -c "import optuna; from app.main import create_app; from services.backtest_service.engine_runner import run_backtest_sync; print('PXYBACKTEST runtime imports OK')"
+& $python -c "import optuna, polars; from zoneinfo import ZoneInfo; ZoneInfo('UTC'); from app.main import create_app; from services.backtest_service.engine_runner import run_backtest_sync; print('PXYBACKTEST runtime imports OK')"
 exit $LASTEXITCODE

@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 from .kernel import stable_hash
+from .metrics import drawdown_curve, enrich_metrics
+from .reporting import build_report_projection
 
 RESULT_CONTRACT_VERSION = "pxybacktest.task-result.v2"
 
@@ -49,6 +51,17 @@ def build_result_v2(
         ]
     )
     trades = list(raw_result.get("trades") or [])
+    daily_results = list(raw_result.get("daily_results") or [])
+    benchmark_curve = list(raw_result.get("benchmark_curve") or [])
+    parameters = dict(task.get("parameters") or {})
+    standard_metrics = enrich_metrics(
+        dict(raw_result.get("statistics") or {}),
+        daily_results,
+        deals=trades,
+        benchmark=benchmark_curve,
+        risk_free_rate=float(parameters.get("risk_free_rate") or 0.0),
+        periods_per_year=float(parameters.get("annualization") or 252),
+    )
     result = {
         "schema_version": 2,
         "contract_version": RESULT_CONTRACT_VERSION,
@@ -65,8 +78,17 @@ def build_result_v2(
             "parameters": task.get("parameters") or {},
             "random_seed": task.get("random_seed"),
         },
-        "metrics": dict(raw_result.get("statistics") or {}),
-        "curves": {"daily": list(raw_result.get("daily_results") or [])},
+        "metrics": standard_metrics,
+        "curves": {
+            "daily": daily_results,
+            "equity": daily_results,
+            "drawdown": [
+                {"date": point.get("date"), "value": value}
+                for point, value in zip(daily_results, drawdown_curve(daily_results))
+                if isinstance(point, dict)
+            ],
+            "benchmark": benchmark_curve,
+        },
         "market": {"bars": list(raw_result.get("bars") or [])},
         "orders": [],
         "deals": trades,
@@ -92,6 +114,7 @@ def build_result_v2(
         "replay_audit": raw_result.get("replay_audit"),
         "artifacts": [],
     }
+    result["report"] = build_report_projection(result)
     return _attach_reproducibility(result, request=request, raw_result=raw_result)
 
 
@@ -105,6 +128,16 @@ def build_a_share_result_v2(
     adapter = dict(stats.pop("adapter", {}) or {})
     trades = list(raw_result.get("trades") or [])
     benchmark_curve = list(raw_result.get("benchmark_curve") or [])
+    equity_curve = list(raw_result.get("equity_curve") or [])
+    parameters = dict(task.get("parameters") or {})
+    standard_metrics = enrich_metrics(
+        stats,
+        equity_curve,
+        deals=trades,
+        benchmark=benchmark_curve,
+        risk_free_rate=float(parameters.get("risk_free_rate") or 0.0),
+        periods_per_year=float(parameters.get("annualization") or 252),
+    )
     warnings = list(snapshot.get("warnings") or [])
     warnings.extend(
         [
@@ -144,9 +177,9 @@ def build_a_share_result_v2(
             "parameters": task.get("parameters") or {},
             "random_seed": task.get("random_seed"),
         },
-        "metrics": stats,
+        "metrics": standard_metrics,
         "curves": {
-            "equity": list(raw_result.get("equity_curve") or []),
+            "equity": equity_curve,
             "drawdown": list(raw_result.get("drawdown_curve") or []),
             "benchmark": benchmark_curve,
         },
@@ -200,4 +233,5 @@ def build_a_share_result_v2(
     }
     if isinstance(raw_result.get("_replay_events"), list):
         result["_replay_events"] = raw_result["_replay_events"]
+    result["report"] = build_report_projection(result)
     return _attach_reproducibility(result, request=request, raw_result=raw_result)

@@ -399,6 +399,76 @@ def test_visual_replay_speed_changes_wall_time_without_changing_event_count() ->
     assert count_20x == count_50x == 3
 
 
+def test_visual_and_fast_replay_have_identical_execution_snapshot() -> None:
+    """可视化帧降采样不能改变统一执行快照。"""
+    events = [
+        {
+            "event_type": event_type,
+            "event_time": f"2026-08-01T00:00:0{index}Z",
+            "symbol": "XAUUSDm",
+            "payload": payload,
+            "source_seq": index,
+        }
+        for index, (event_type, payload) in enumerate(
+            [
+                ("market_bar", {"symbol": "XAUUSDm", "close": 2000.0}),
+                ("order_book", {"symbol": "XAUUSDm", "bid_price1": 1999.9}),
+                ("factor", {"symbol": "XAUUSDm", "name": "trend", "value": 0.8}),
+                ("sentiment", {"symbol": "XAUUSDm", "score": 0.2}),
+                ("order", {"order_id": "o-1", "status": "filled"}),
+                ("fill", {"trade_id": "t-1", "price": 2000.1, "volume": 1}),
+                ("position", {"symbol": "XAUUSDm", "net": 1}),
+                ("account", {"value": 100000.0}),
+            ],
+            start=1,
+        )
+    ]
+
+    def replay(mode: str) -> tuple[dict, dict]:
+        snapshots: list[dict] = []
+        controller = ResultReplayController(
+            # 使用同一执行向量 ID，隔离 mode 对审计链的影响。
+            run_id="run-parity",
+            snapshot_id=SNAPSHOT,
+            events=events,
+            mode=mode,
+            speed=100,
+            render_interval_ms=10_000,
+        )
+        outcome = controller.run(on_snapshot=snapshots.append, sleep=lambda _: None)
+        return outcome["execution_snapshot"], outcome["replay_audit"]
+
+    visual, visual_audit = replay("visual")
+    fast, fast_audit = replay("fast")
+
+    comparable = (
+        "snapshot_id",
+        "event_seq",
+        "simulated_at",
+        "bars",
+        "trades",
+        "order_books",
+        "news",
+        "sentiment",
+        "fundamentals",
+        "factors",
+        "signals",
+        "orders",
+        "fills",
+        "positions",
+        "account",
+        "bar_history",
+        "factor_history",
+        "sentiment_timeline",
+        "account_curve",
+    )
+    assert {key: visual.get(key) for key in comparable} == {
+        key: fast.get(key) for key in comparable
+    }
+    assert visual_audit["chain_sha256"] == fast_audit["chain_sha256"]
+    assert visual_audit["event_count"] == fast_audit["event_count"] == len(events)
+
+
 def test_large_tick_replay_executes_every_tick_but_only_projects_frames() -> None:
     tick_count = 100_000
     executed = 0

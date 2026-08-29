@@ -49,7 +49,9 @@ class DaaCapabilitiesClient(Protocol):
 class DaaAdapterClient:
     settings: Settings
     cache_seconds: float = 60.0
-    timeout_seconds: float = 12.0
+    # DAA 首次启动会加载策略目录和研究依赖；工作站实测约 22 秒，
+    # 12 秒会把正常冷启动误判为能力不可用。
+    timeout_seconds: float = 45.0
     _cached_at: float = field(default=0.0, init=False)
     _cached: dict[str, Any] | None = field(default=None, init=False)
     _cached_ai_signature: tuple[int, int] | None = field(default=None, init=False)

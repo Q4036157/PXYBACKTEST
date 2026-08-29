@@ -16,6 +16,7 @@ class Settings:
     runtime_root: Path
     pxylh_root: Path
     service_token: str
+    # 工作站实际 DAA 仓库目录；可通过 PXYBACKTEST_DAA_ROOT 覆盖。
     daa_root: Path = Path(r"D:\x1\x2\DAA")
     pxydata_data_root: Path = Path(r"D:\x1\pxy-runtime\PXYDATA\data")
     pxydata_base_url: str = "http://127.0.0.1:3020"

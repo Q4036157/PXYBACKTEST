@@ -119,4 +119,31 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify.ps1
 ```
 
+## CLI 自动回测
+
+安装项目后可用 `python -m app.cli`（或安装脚本注册的 `pxybacktest`）调用与前端相同的任务 API。CLI 不绕过 PXYDATA 快照契约：请求文件应填写 `SubmitBacktestRequestV2`，使用 `data.selection` 时由服务自动创建并绑定数据快照。
+
+```powershell
+# 检查工作站服务
+python -m app.cli health
+python -m app.cli capabilities
+
+# 提交并等待终态；取消任务时仍会返回已保存的执行快照
+python -m app.cli run --request-file .\requests\gold.json --save .\results\gold.json
+
+# 批量自动回测（目录内 JSON 按文件名顺序执行）
+python -m app.cli batch --request-dir .\requests --continue-on-error
+
+# 任务控制
+python -m app.cli status <task-id>
+python -m app.cli pause <task-id>
+python -m app.cli resume <task-id>
+python -m app.cli speed <task-id> 80
+python -m app.cli cancel <task-id>
+python -m app.cli result <task-id> --save .\results\<task-id>.json
+```
+
+CLI 默认读取 `C:\ProgramData\PXY\secrets\pxy-backtest-service-token`，也可通过
+`PXYBACKTEST_SERVICE_TOKEN_FILE` 或 `--token-file` 指定；令牌不会写入请求文件。
+
 WinSW、端口、Caddy 和来源限制由 PXYOPS 管理。本仓库不保存生产令牌或节点地址。

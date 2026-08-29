@@ -10,12 +10,20 @@ from app.worker_process import (
     _configure_backtest_worker_logging,
     _emit,
     _emit_result_execution_snapshot,
+    _parse_request_rate,
     _replay_non_cta_result,
     build_replay_event_snapshot,
     run_a_share_worker,
     run_lighter_worker,
     run_microstructure_worker,
 )
+
+
+def test_parse_request_rate_preserves_explicit_zero() -> None:
+    assert _parse_request_rate({"rate": 0}) == 0.0
+    assert _parse_request_rate({"rate": 0.0}) == 0.0
+    assert _parse_request_rate({}) == 0.0004
+    assert _parse_request_rate({"rate": None}) == 0.0004
 
 
 def test_result_execution_snapshot_projects_non_cta_result() -> None:

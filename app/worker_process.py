@@ -21,6 +21,15 @@ RELIABLE_EVENT_TIMEOUT_SECONDS = 5.0
 logger = logging.getLogger("backtest_service")
 
 
+def _parse_request_rate(request: dict[str, Any], default: float = 0.0004) -> float:
+    """解析手续费率，保留调用方显式传入的 0。"""
+
+    value = request.get("rate")
+    if value is None:
+        return float(default)
+    return float(value)
+
+
 def _configure_backtest_worker_logging() -> None:
     """让工作进程输出回测数据链路的 INFO 日志。"""
     logger = logging.getLogger("backtest_service")
@@ -1034,7 +1043,7 @@ def run_backtest_worker(
         end_time=parse_backtest_end_to_beijing_naive(str(request["end_time"])),
         parameters=dict(request.get("parameters") or {}),
         capital=float(request.get("capital") or 1_000_000),
-        rate=float(request.get("rate") or 0.0004),
+        rate=_parse_request_rate(request),
         slippage=float(request.get("slippage") or 0),
         speed=float(request.get("speed") or 50),
         mode=str(request.get("mode") or "BAR").upper(),

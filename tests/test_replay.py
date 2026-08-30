@@ -204,6 +204,19 @@ def test_visual_gate_coalesces_without_dropping_execution_events() -> None:
     assert gate.flush() is None
 
 
+def test_visual_gate_interval_can_follow_speed_without_changing_event_order() -> None:
+    gate = VisualProjectionGate(interval_ms=33)
+    first = object()
+    second = object()
+    assert gate.offer(first, now=0.0) is first
+    assert gate.offer(second, now=0.015) is None
+
+    # 50x 对应 20ms；收紧门控后同一时间点可以立即投影，
+    # 但门控仍只返回最新帧，不会改变执行层事件顺序。
+    gate.set_interval_ms(20)
+    assert gate.offer(second, now=0.020) is second
+
+
 def test_replay_audit_chain_is_deterministic_and_counts_all_events() -> None:
     def build() -> ReplayAudit:
         audit = ReplayAudit(run_id="run-1", snapshot_id=SNAPSHOT)

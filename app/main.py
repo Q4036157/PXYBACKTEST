@@ -219,7 +219,8 @@ def create_app(
                 "visual_projection": {
                     "mode": "framed_incremental_state",
                     "default_frame_interval_ms": 33,
-                    "min_frame_interval_ms": 16,
+                    "min_frame_interval_ms": 8,
+                    "speed_scaled": True,
                     "preserves_execution_events": True,
                 },
                 "modes": ["real_tick", "bar", "pseudo_tick"],

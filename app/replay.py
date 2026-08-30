@@ -656,32 +656,42 @@ class VisualProjectionGate:
     """把完整执行事件降采样为固定显示帧，绝不影响执行层事件。"""
 
     def __init__(self, *, interval_ms: int = DEFAULT_RENDER_INTERVAL_MS) -> None:
-        if interval_ms < 1:
-            raise ReplayError("可视化帧间隔必须大于 0ms")
-        self.interval_seconds = interval_ms / 1000.0
+        self._lock = RLock()
+        self.interval_seconds = 0.0
+        self.set_interval_ms(interval_ms)
         self._last_emit: float | None = None
         self._pending: Any | None = None
 
+    def set_interval_ms(self, interval_ms: int) -> None:
+        """调整显示帧间隔，不触碰执行事件顺序。"""
+        value = int(interval_ms)
+        if value < 1:
+            raise ReplayError("可视化帧间隔必须大于 0ms")
+        with self._lock:
+            self.interval_seconds = value / 1000.0
+
     def offer(self, event: Any, *, now: float | None = None, force: bool = False) -> Any | None:
         current = time.monotonic() if now is None else float(now)
-        self._pending = event
-        if (
-            force
-            or self._last_emit is None
-            or current - self._last_emit >= self.interval_seconds
-        ):
-            self._last_emit = current
-            emitted = self._pending
-            self._pending = None
-            return emitted
-        return None
+        with self._lock:
+            self._pending = event
+            if (
+                force
+                or self._last_emit is None
+                or current - self._last_emit >= self.interval_seconds
+            ):
+                self._last_emit = current
+                emitted = self._pending
+                self._pending = None
+                return emitted
+            return None
 
     def flush(self) -> Any | None:
-        emitted = self._pending
-        self._pending = None
-        if emitted is not None:
-            self._last_emit = time.monotonic()
-        return emitted
+        with self._lock:
+            emitted = self._pending
+            self._pending = None
+            if emitted is not None:
+                self._last_emit = time.monotonic()
+            return emitted
 
 
 class ResultReplayController:

@@ -1072,11 +1072,23 @@ def run_backtest_worker(
     # 策略线程完整处理每个 Tick；这里只对发往浏览器的 bar 投影限帧。
     # 这样不会改变成交和结果，只会减少伪 Tick 造成的 UI 事件洪峰。
     visual_projection_gate = None
+
+    def visual_interval_ms(speed: float) -> int:
+        """按速度收紧显示帧门控，避免高倍速被固定 33ms 封顶。
+
+        引擎仍完整处理每个 Tick；这里仅控制浏览器投影频率。低于约
+        30x 时保留部署配置，高于该速度时按 1000/speed 收紧，最低 8ms
+        以避免无界 UI 事件洪峰。
+        """
+        configured = max(16, int(render_interval_ms or 33))
+        requested = max(1.0, min(100.0, float(speed or 1.0)))
+        return max(8, min(configured, int(round(1000.0 / requested))))
+
     if str(getattr(task, "execution_mode", "visual")).lower() == "visual":
         from app.replay import VisualProjectionGate
 
         visual_projection_gate = VisualProjectionGate(
-            interval_ms=max(16, int(render_interval_ms or 33))
+            interval_ms=visual_interval_ms(task.speed)
         )
 
     def emit_runtime_event(event_type: str, payload: dict[str, Any]) -> bool:
@@ -1155,6 +1167,10 @@ def run_backtest_worker(
                     )
                     task.speed = requested_speed
                     applied_speed = None
+                    if visual_projection_gate is not None:
+                        visual_projection_gate.set_interval_ms(
+                            visual_interval_ms(requested_speed)
+                        )
                 elif action == "cancel":
                     cancelled = True
                     requested_paused = False

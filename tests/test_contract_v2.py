@@ -542,6 +542,8 @@ def test_v2_capabilities_exposes_factor_and_sentiment_engines(tmp_path: Path) ->
     assert replay["contract"] == "pxybacktest.replay.v1"
     assert replay["execution_stream"] == "complete_ordered_audited"
     assert replay["visual_projection"]["preserves_execution_events"] is True
+    assert replay["visual_projection"]["speed_scaled"] is True
+    assert replay["visual_projection"]["min_frame_interval_ms"] == 8
 
 
 def test_daa_capabilities_validation_drops_internal_fields() -> None:

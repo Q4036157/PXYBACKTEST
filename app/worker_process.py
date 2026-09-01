@@ -1022,6 +1022,7 @@ def run_backtest_worker(
             parse_backtest_end_to_beijing_naive,
             parse_to_beijing_naive,
         )
+        from datetime import datetime, timezone
     except Exception as exc:
         _emit(
             event_queue,
@@ -1049,6 +1050,17 @@ def run_backtest_worker(
         mode=str(request.get("mode") or "BAR").upper(),
         execution_mode=str(request.get("execution_mode") or "visual").lower(),
     )
+    # PXYLH 任务内部统一使用北京时间 naive，但 MT5 Tester 的 FromDate /
+    # ToDate 必须保留请求原始时区。将明确带偏移的值传给 MT5 快照加载器，
+    # naive 旧请求按 UTC 解释，禁止在下游再次猜测时区。
+    def _mt5_request_bound(raw: str) -> datetime:
+        value = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    task._mt5_tester_start = _mt5_request_bound(str(request["start_time"]))
+    task._mt5_tester_end = _mt5_request_bound(str(request["end_time"]))
     task_contract = request.get("_task_contract") or {}
     # CTA AI bridge 只从 DAA 版本化目录读取策略；把身份和根目录绑定到
     # 当前 task，供 PXYLH engine_runner 的动态加载门禁使用。

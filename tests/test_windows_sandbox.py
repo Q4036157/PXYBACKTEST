@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -13,7 +14,9 @@ from app.windows_sandbox import (
     NETWORK_POLICY_FILE_ENV,
     NETWORK_POLICY_SHA256_ENV,
     SandboxCancelledError,
+    SandboxIdentity,
     SandboxLimits,
+    _set_task_directory_access,
     launch_sandboxed_process,
     network_policy_attestation,
 )
@@ -25,6 +28,30 @@ def _environment() -> dict[str, str]:
         for name in ("SYSTEMROOT", "WINDIR", "PATH", "TEMP", "TMP")
         if os.environ.get(name)
     }
+
+
+def test_task_acl_is_applied_and_checked_per_existing_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    strategy = tmp_path / "strategy.py"
+    request = tmp_path / "request.json"
+    strategy.write_text("pass\n", encoding="utf-8")
+    request.write_text("{}", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def record(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", record)
+    identity = SandboxIdentity(username="PXYTqSandbox", password="unused")
+
+    _set_task_directory_access(tmp_path, identity, grant=True)
+
+    assert {Path(command[1]) for command in calls} == {tmp_path, strategy, request}
+    assert all("/T" not in command and "/C" not in command for command in calls)
+    file_calls = [command for command in calls if Path(command[1]).is_file()]
+    assert all("PXYTqSandbox:M" in command for command in file_calls)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="仅验证 Windows 强制边界")

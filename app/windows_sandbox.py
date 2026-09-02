@@ -492,42 +492,53 @@ def _set_task_directory_access(
         if identity.domain not in {"", "."}
         else identity.username
     )
-    if grant:
-        command = [
-            "icacls.exe",
-            str(path),
-            "/inheritance:r",
-            "/grant:r",
-            f"{account}:(OI)(CI)M",
-            "SYSTEM:(OI)(CI)F",
-            "Administrators:(OI)(CI)F",
-            "/T",
-            "/C",
-            "/Q",
-        ]
-    else:
-        command = [
-            "icacls.exe",
-            str(path),
-            "/remove:g",
-            account,
-            "/T",
-            "/C",
-            "/Q",
-        ]
-    completed = subprocess.run(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-        check=False,
-    )
-    if completed.returncode != 0:
-        action = "授予" if grant else "撤销"
-        raise SandboxLaunchError(
-            f"{action}天勤沙箱任务目录 ACL 失败，exit_code={completed.returncode}"
+    # icacls /T /C 会在单个子项失败时继续处理，总退出码不能
+    # 作为每个已有文件获得 ACE 的证明。逐项执行并检查，确保
+    # request/strategy 可读，后续结果文件则继承任务目录的 ACE。
+    targets = [path, *sorted(path.rglob("*"), key=lambda item: str(item).lower())]
+    for target in targets:
+        inherited_rights = "(OI)(CI)F" if target.is_dir() else "F"
+        if grant:
+            sandbox_rights = "(OI)(CI)M" if target.is_dir() else "M"
+            command = [
+                "icacls.exe",
+                str(target),
+                "/inheritance:r",
+                "/grant:r",
+                f"{account}:{sandbox_rights}",
+                f"SYSTEM:{inherited_rights}",
+                f"Administrators:{inherited_rights}",
+            ]
+        else:
+            command = [
+                "icacls.exe",
+                str(target),
+                "/inheritance:r",
+                "/remove:g",
+                account,
+                "/grant:r",
+                f"SYSTEM:{inherited_rights}",
+                f"Administrators:{inherited_rights}",
+            ]
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            check=False,
         )
+        if completed.returncode != 0:
+            action = "授予" if grant else "撤销"
+            detail = " ".join(
+                f"{completed.stdout or ''} {completed.stderr or ''}".split()
+            )[-500:]
+            suffix = f"：{detail}" if detail else ""
+            raise SandboxLaunchError(
+                f"{action}天勤沙箱路径 ACL 失败，exit_code="
+                f"{completed.returncode}，path={target}{suffix}"
+            )
 
 
 def _launch_windows(

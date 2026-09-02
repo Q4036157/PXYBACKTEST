@@ -34,13 +34,25 @@ _AUTH_PASSWORD_FILE_ENV = "PXYBACKTEST_TQSDK_PASSWORD_FILE"
 _SANDBOX_USER_ENV = "PXYBACKTEST_TQSDK_SANDBOX_USER"
 _SANDBOX_PASSWORD_FILE_ENV = "PXYBACKTEST_TQSDK_SANDBOX_PASSWORD_FILE"
 _BOOTSTRAP_ERROR_ENV = "PXYBACKTEST_TQSDK_BOOTSTRAP_ERROR"
+_IMPORT_TRACE_ENV = "PXYBACKTEST_TQSDK_IMPORT_TRACE"
 _BOOTSTRAP_CODE = """
 import os
 import runpy
+import sys
 import traceback
 from pathlib import Path
 
 error_path = Path(os.environ["PXYBACKTEST_TQSDK_BOOTSTRAP_ERROR"])
+trace_path = Path(os.environ["PXYBACKTEST_TQSDK_IMPORT_TRACE"])
+trace_handle = trace_path.open("a", encoding="utf-8", buffering=1)
+
+def record_import(event, args):
+    if event == "import" and args:
+        trace_handle.write(str(args[0]) + "\\n")
+        trace_handle.flush()
+
+sys.addaudithook(record_import)
+trace_handle.write("<bootstrap:run_module>\\n")
 try:
     runpy.run_module(
         "app.tqsdk_native_worker", run_name="__main__", alter_sys=True
@@ -451,6 +463,7 @@ def launch_tqsdk_worker(
         raise TqSdkWorkerError(f"天勤 Python 不存在: {python_path}")
     request_path = request.task_root / "tqsdk-worker-request.json"
     bootstrap_error_path = request.task_root / "tqsdk-worker-bootstrap-error.log"
+    import_trace_path = request.task_root / "tqsdk-worker-import-trace.log"
     _write_result(request_path, request.model_dump(mode="json"))
 
     inherited_names = (
@@ -477,6 +490,7 @@ def launch_tqsdk_worker(
         child_env[_AUTH_PASSWORD_ENV] = password
     child_env.update(_TQ_ENDPOINTS)
     child_env[_BOOTSTRAP_ERROR_ENV] = str(bootstrap_error_path)
+    child_env[_IMPORT_TRACE_ENV] = str(import_trace_path)
     sandbox_user = os.getenv(_SANDBOX_USER_ENV, "").strip()
     sandbox_password = _secret_from_environment(
         "PXYBACKTEST_TQSDK_SANDBOX_PASSWORD", _SANDBOX_PASSWORD_FILE_ENV
@@ -543,8 +557,19 @@ def launch_tqsdk_worker(
             raise TqSdkWorkerError(
                 f"天勤策略子进程退出码 {completed.exit_code}: {diagnostic}"
             )
+        try:
+            imported = [
+                line.strip()
+                for line in import_trace_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        except OSError:
+            imported = []
+        import_tail = " -> ".join(imported[-12:])
+        import_suffix = f"，崩溃前导入: {import_tail}" if import_tail else ""
         raise TqSdkWorkerError(
-            f"天勤策略子进程退出码 {completed.exit_code}，且没有结构化错误"
+            f"天勤策略子进程退出码 {completed.exit_code}，"
+            f"且没有结构化错误{import_suffix}"
         )
     try:
         payload = json.loads(request.result_path.read_text(encoding="utf-8"))

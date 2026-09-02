@@ -224,6 +224,40 @@ def test_worker_main_preserves_primary_error_when_result_write_fails(
     assert "SystemExit: 1" not in diagnostic
 
 
+def test_worker_reports_last_imports_after_native_crash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    task_root = tmp_path / "task"
+    task_root.mkdir()
+    request = _request(task_root)
+    monkeypatch.setenv("PXYBACKTEST_TQSDK_USERNAME", "test-user")
+    monkeypatch.setenv("PXYBACKTEST_TQSDK_PASSWORD", "test-password")
+
+    class NativeCrash:
+        exit_code = 0xC06D007E
+
+    def crash(*_args: object, **kwargs: object) -> NativeCrash:
+        environment = kwargs["environment"]
+        assert isinstance(environment, dict)
+        trace_path = Path(str(environment["PXYBACKTEST_TQSDK_IMPORT_TRACE"]))
+        trace_path.write_text("numpy\nnumpy._core._multiarray_umath\n", encoding="utf-8")
+        return NativeCrash()
+
+    monkeypatch.setattr(
+        "app.windows_sandbox.launch_sandboxed_process", crash
+    )
+
+    with pytest.raises(
+        TqSdkWorkerError, match="numpy._core._multiarray_umath"
+    ):
+        launch_tqsdk_worker(
+            request,
+            python_executable=Path(sys.executable),
+            project_root=Path(__file__).parents[1],
+            timeout_seconds=5,
+        )
+
+
 def test_tqsdk_worker_redacts_credentials_from_structured_error(
     tmp_path: Path, monkeypatch
 ) -> None:

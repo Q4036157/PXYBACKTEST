@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import locale
 import subprocess
 import sys
 from pathlib import Path
@@ -38,9 +39,11 @@ def test_task_acl_is_applied_and_checked_per_existing_path(
     strategy.write_text("pass\n", encoding="utf-8")
     request.write_text("{}", encoding="utf-8")
     calls: list[list[str]] = []
+    run_kwargs: list[dict[str, object]] = []
 
     def record(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(command)
+        run_kwargs.append(_kwargs)
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", record)
@@ -52,6 +55,11 @@ def test_task_acl_is_applied_and_checked_per_existing_path(
     assert all("/T" not in command and "/C" not in command for command in calls)
     file_calls = [command for command in calls if Path(command[1]).is_file()]
     assert all("PXYTqSandbox:M" in command for command in file_calls)
+    assert all(
+        kwargs.get("encoding") == locale.getpreferredencoding(False)
+        and kwargs.get("errors") == "replace"
+        for kwargs in run_kwargs
+    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="仅验证 Windows 强制边界")

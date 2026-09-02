@@ -369,9 +369,17 @@ if os.name == "nt":
     ]
 
 
+def _win_error_from_code(action: str, code: int) -> SandboxLaunchError:
+    normalized = int(code) & 0xFFFFFFFF
+    format_code = normalized if normalized < 0x80000000 else normalized - 0x100000000
+    return SandboxLaunchError(
+        f"{action}失败，Win32错误={normalized} (0x{normalized:08X}): "
+        f"{ctypes.FormatError(format_code)}"
+    )
+
+
 def _win_error(action: str) -> SandboxLaunchError:
-    code = ctypes.get_last_error()
-    return SandboxLaunchError(f"{action}失败，Win32错误={code}: {ctypes.FormatError(code)}")
+    return _win_error_from_code(action, ctypes.get_last_error())
 
 
 def _environment_block(environment: Mapping[str, str]) -> ctypes.Array:
@@ -697,6 +705,7 @@ def _launch_windows(
                     ctypes.byref(process),
                 )
                 create_error = ctypes.get_last_error() if not created else 0
+                process_creation_error = create_error
                 if not created and create_error == 1314:
                     # 提权管理员通常有 SeImpersonatePrivilege，但默认没有
                     # SeAssignPrimaryToken/SeIncreaseQuota。保持同一受限主令牌，
@@ -719,10 +728,22 @@ def _launch_windows(
                         ctypes.byref(fallback_startup),
                         ctypes.byref(process),
                     )
+                    process_creation_error = (
+                        ctypes.get_last_error() if not created else 0
+                    )
             finally:
                 kernel32.SetErrorMode(previous_error_mode)
         if not created:
-            raise _win_error("使用受限令牌创建策略进程")
+            primary_suffix = (
+                f"，CreateProcessAsUserW首次错误={create_error}"
+                if process_creation_api == "CreateProcessWithTokenW"
+                else ""
+            )
+            raise _win_error_from_code(
+                f"使用受限令牌创建策略进程"
+                f"（API={process_creation_api}{primary_suffix}）",
+                process_creation_error,
+            )
         try:
             if not kernel32.AssignProcessToJobObject(job, process.hProcess):
                 kernel32.TerminateProcess(process.hProcess, 1)

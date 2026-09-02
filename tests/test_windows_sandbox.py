@@ -18,6 +18,7 @@ from app.windows_sandbox import (
     SandboxIdentity,
     SandboxLimits,
     _set_task_directory_access,
+    _win_error_from_code,
     launch_sandboxed_process,
     network_policy_attestation,
 )
@@ -29,6 +30,13 @@ def _environment() -> dict[str, str]:
         for name in ("SYSTEMROOT", "WINDIR", "PATH", "TEMP", "TMP")
         if os.environ.get(name)
     }
+
+
+def test_win_error_preserves_captured_code_and_hex() -> None:
+    error = _win_error_from_code("test", -2147024809)
+
+    assert "2147942487" in str(error)
+    assert "0x80070057" in str(error)
 
 
 def test_task_acl_is_applied_and_checked_per_existing_path(

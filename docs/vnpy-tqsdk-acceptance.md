@@ -50,6 +50,8 @@ python -m app.cli accept-vnpy
 
 - 策略与结果必须位于独立任务目录；
 - Windows 受限令牌（`Restricted Token`）和专用本地账户；
+- 服务环境优先使用 `CreateProcessAsUserW`；管理员直接运行验收若缺少错误码 1314
+  对应特权，则使用同一受限主令牌回退到 `CreateProcessWithTokenW`，不授予额外账户特权；
 - Job Object 的进程树终止、内存、CPU、活动进程数和超时/取消限制；
 - 子进程只继承 NUL 标准流和显式句柄白名单；
 - 仅在任务执行期间授予专用账户任务目录 ACL，结束后立即撤销；

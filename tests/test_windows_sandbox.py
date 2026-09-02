@@ -44,6 +44,11 @@ def test_windows_sandbox_uses_restricted_token_and_job_object(tmp_path: Path) ->
     assert result.exit_code == 0
     assert result.restricted_token is True
     assert result.job_object is True
+    assert result.process_creation_api in {
+        "CreateProcessAsUserW",
+        "CreateProcessWithTokenW",
+    }
+    assert result.security_state()["process_creation_api"] == result.process_creation_api
     assert output.read_text(encoding="utf-8") == "ok"
 
 

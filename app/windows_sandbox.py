@@ -83,6 +83,7 @@ class SandboxProcessResult:
     network_allowlist_enforced: bool
     network_policy_id: str | None
     network_policy_sha256: str | None
+    process_creation_api: str
     limits: SandboxLimits
 
     def security_state(self) -> dict[str, object]:
@@ -104,6 +105,7 @@ class SandboxProcessResult:
             "network_allowlist_enforced": self.network_allowlist_enforced,
             "network_policy_id": self.network_policy_id,
             "network_policy_sha256": self.network_policy_sha256,
+            "process_creation_api": self.process_creation_api,
             "limits": {
                 "timeout_seconds": self.limits.timeout_seconds,
                 "memory_mb": self.limits.memory_mb,
@@ -342,6 +344,18 @@ if os.name == "nt":
         ctypes.c_void_p,
         ctypes.c_void_p,
         wintypes.BOOL,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.LPCWSTR,
+        ctypes.POINTER(STARTUPINFOW),
+        ctypes.POINTER(PROCESS_INFORMATION),
+    ]
+    advapi32.CreateProcessWithTokenW.restype = wintypes.BOOL
+    advapi32.CreateProcessWithTokenW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
         wintypes.DWORD,
         ctypes.c_void_p,
         wintypes.LPCWSTR,
@@ -635,22 +649,50 @@ def _launch_windows(
             _set_task_directory_access(cwd, identity, grant=False)
         raise _win_error("设置沙箱继承句柄白名单")
     try:
-        if not advapi32.CreateProcessAsUserW(
+        creation_flags = (
+            CREATE_SUSPENDED
+            | CREATE_UNICODE_ENVIRONMENT
+            | CREATE_NO_WINDOW
+            | EXTENDED_STARTUPINFO_PRESENT
+        )
+        process_creation_api = "CreateProcessAsUserW"
+        created = advapi32.CreateProcessAsUserW(
             token,
             None,
             command_line,
             None,
             None,
             True,
-            CREATE_SUSPENDED
-            | CREATE_UNICODE_ENVIRONMENT
-            | CREATE_NO_WINDOW
-            | EXTENDED_STARTUPINFO_PRESENT,
+            creation_flags,
             ctypes.cast(env_block, ctypes.c_void_p),
             str(cwd),
             ctypes.cast(ctypes.byref(startup), ctypes.POINTER(STARTUPINFOW)),
             ctypes.byref(process),
-        ):
+        )
+        create_error = ctypes.get_last_error() if not created else 0
+        if not created and create_error == 1314:
+            # 提权管理员通常有 SeImpersonatePrivilege，但默认没有
+            # SeAssignPrimaryToken/SeIncreaseQuota。保持同一受限主令牌，
+            # 改用 CreateProcessWithTokenW，避免要求扩大本机账户特权。
+            process_creation_api = "CreateProcessWithTokenW"
+            command_line = ctypes.create_unicode_buffer(
+                subprocess.list2cmdline(list(command))
+            )
+            fallback_startup = STARTUPINFOW()
+            fallback_startup.cb = ctypes.sizeof(fallback_startup)
+            ctypes.set_last_error(0)
+            created = advapi32.CreateProcessWithTokenW(
+                token,
+                0,
+                None,
+                command_line,
+                creation_flags & ~EXTENDED_STARTUPINFO_PRESENT,
+                ctypes.cast(env_block, ctypes.c_void_p),
+                str(cwd),
+                ctypes.byref(fallback_startup),
+                ctypes.byref(process),
+            )
+        if not created:
             raise _win_error("使用受限令牌创建策略进程")
         try:
             if not kernel32.AssignProcessToJobObject(job, process.hProcess):
@@ -693,6 +735,7 @@ def _launch_windows(
                 network_allowlist_enforced=enforced,
                 network_policy_id=policy_id,
                 network_policy_sha256=policy_sha256,
+                process_creation_api=process_creation_api,
                 limits=limits,
             )
         finally:
@@ -747,6 +790,7 @@ def _launch_portable(
             network_allowlist_enforced=enforced,
             network_policy_id=policy_id,
             network_policy_sha256=policy_sha256,
+            process_creation_api="subprocess.Popen",
             limits=limits,
         )
     finally:

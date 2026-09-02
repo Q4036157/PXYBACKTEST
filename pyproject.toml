@@ -27,6 +27,9 @@ ml = [
 research = [
   "pyqlib>=0.9.6",
 ]
+tqsdk = [
+  "tqsdk>=3.10,<3.11",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

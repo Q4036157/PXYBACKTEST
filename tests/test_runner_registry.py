@@ -11,6 +11,13 @@ def _touch(path: Path) -> None:
     path.write_bytes(b"test")
 
 
+def _install_fake_module(python: Path, module: str) -> None:
+    _touch(python)
+    package = python.parent.parent / "Lib" / "site-packages" / module
+    package.mkdir(parents=True)
+    _touch(package / "__init__.py")
+
+
 def _package(
     *,
     platform: str,
@@ -117,7 +124,8 @@ def test_detected_native_platform_is_not_reported_as_submit_ready(
     tq_python = tmp_path / "tq" / "python.exe"
     mt4 = tmp_path / "mt4" / "terminal.exe"
     mt5 = tmp_path / "mt5" / "terminal64.exe"
-    for path in (tq_python, mt4, mt5):
+    _install_fake_module(tq_python, "tqsdk")
+    for path in (mt4, mt5):
         _touch(path)
 
     registry = build_runner_registry(
@@ -152,6 +160,57 @@ def test_detected_native_platform_is_not_reported_as_submit_ready(
     assert result["resolved"] is True
     assert result["submit_ready"] is False
     assert "worker 尚未接入" in result["reason"]
+
+
+def test_tqsdk_process_worker_is_adapter_ready_but_not_safe_to_submit(
+    tmp_path: Path,
+) -> None:
+    tq_python = tmp_path / "tq" / "python.exe"
+    worker = tmp_path / "PXYBACKTEST" / "app" / "tqsdk_native_worker.py"
+    _install_fake_module(tq_python, "tqsdk")
+    _touch(worker)
+
+    registry = build_runner_registry(
+        RunnerProbeConfig(
+            project_root=tmp_path / "PXYBACKTEST",
+            pxylh_root=tmp_path / "PXYLH",
+            tqsdk_python=tq_python,
+            mt4_terminal=tmp_path / "mt4.exe",
+            mt5_terminal=tmp_path / "mt5.exe",
+        )
+    )
+
+    tqsdk = next(
+        item for item in registry.capabilities if item.runner_id == "tqsdk_native"
+    )
+    assert tqsdk.runtime_detected is True
+    assert tqsdk.adapter_ready is True
+    assert tqsdk.submit_ready is False
+    assert "受限令牌" in str(tqsdk.reason)
+
+
+def test_tqsdk_python_without_installed_package_is_not_runtime_detected(
+    tmp_path: Path,
+) -> None:
+    tq_python = tmp_path / "tq" / "Scripts" / "python.exe"
+    _touch(tq_python)
+    registry = build_runner_registry(
+        RunnerProbeConfig(
+            project_root=Path(__file__).parents[1],
+            pxylh_root=tmp_path / "PXYLH",
+            tqsdk_python=tq_python,
+            mt4_terminal=tmp_path / "mt4.exe",
+            mt5_terminal=tmp_path / "mt5.exe",
+        )
+    )
+
+    tqsdk = next(
+        item for item in registry.capabilities if item.runner_id == "tqsdk_native"
+    )
+    assert tqsdk.runtime_detected is False
+    assert tqsdk.adapter_ready is True
+    assert tqsdk.submit_ready is False
+    assert "尚未安装 tqsdk" in str(tqsdk.reason)
 
 
 def test_runner_resolution_rejects_wrong_execution_semantics(tmp_path: Path) -> None:

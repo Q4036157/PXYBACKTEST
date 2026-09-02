@@ -104,3 +104,7 @@ lock hash。源码、运行时、数据或账户规格任一身份变化都生�
 C++ 内核只服务 `compat` 和 `portable_ir` 的高频热点：Tick 解码、撮合、订单状态机、
 账本和指标。`native_oracle` 仍由平台原生运行时执行。所有 C++ 路径必须与 Python 参考
 实现及原生 Oracle 对固定向量一致，不能为了速度改变策略语义。
+
+第一阶段的实际实现、已通过项目和未完成安全边界见
+`docs/vnpy-tqsdk-acceptance.md`。文档中的“sandbox”是目标状态；能力接口必须依据
+`restricted_token`、`job_object` 和 `network_allowlist_enforced` 的真实状态决定是否开放提交。

@@ -29,7 +29,9 @@ class AcceptanceCheck(BaseModel):
     @model_validator(mode="after")
     def validate_expected(self) -> "AcceptanceCheck":
         has_expected = "expected" in self.model_fields_set
-        if has_expected == bool(self.expected_sha256):
+        if self.expected_sha256 and self.expected is not None:
+            raise ValueError("expected 与 expected_sha256 必须且只能提供一个")
+        if not self.expected_sha256 and not has_expected:
             raise ValueError("expected 与 expected_sha256 必须且只能提供一个")
         if self.expected_sha256:
             self.expected_sha256 = self.expected_sha256.lower()
@@ -60,6 +62,22 @@ class AcceptanceVector(BaseModel):
     account: AcceptanceDimension
     visual: AcceptanceDimension
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def bind_declared_identity(self) -> "AcceptanceVector":
+        self.strategy_source_sha256 = self.strategy_source_sha256.lower()
+        self.data_manifest_sha256 = self.data_manifest_sha256.lower()
+        checks = {item.path: item for item in self.identity_checks}
+        required = {
+            "strategy.source_hash": self.strategy_source_sha256,
+            "data_snapshot.manifest_sha256": self.data_manifest_sha256,
+            "diagnostics.runtime_identity": self.runtime_identity,
+        }
+        for path, expected in required.items():
+            check = checks.get(path)
+            if check is None or check.expected_sha256 or check.expected != expected:
+                raise ValueError(f"固定向量身份未绑定或不一致: {path}")
+        return self
 
 
 class CheckComparison(BaseModel):

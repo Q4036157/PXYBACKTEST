@@ -142,6 +142,24 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("health", help="读取服务健康状态")
     sub.add_parser("capabilities", help="读取引擎能力目录")
 
+    accept_result = sub.add_parser(
+        "accept-result", help="离线执行成交、账户、可视化三维一致性验收"
+    )
+    accept_result.add_argument("--vector", required=True, help="固定验收向量 JSON")
+    accept_result.add_argument("--actual", required=True, help="待验收统一结果 JSON")
+    accept_vnpy = sub.add_parser(
+        "accept-vnpy", help="运行内置 vn.py 原生固定向量并执行三维验收"
+    )
+    accept_vnpy.add_argument(
+        "--vector",
+        default=str(
+            Path(__file__).parents[1]
+            / "acceptance"
+            / "vectors"
+            / "vnpy_cta_native_v1.json"
+        ),
+    )
+
     submit = sub.add_parser("submit", help="提交一个 JSON 回测任务")
     submit.add_argument("--request-file", required=True, help="SubmitBacktestRequest(V2) JSON 文件")
 
@@ -175,6 +193,30 @@ def main(argv: list[str] | None = None, *, output: TextIO | None = None) -> int:
     out = output or sys.stdout
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "accept-result":
+            from .parity_acceptance import (
+                AcceptanceVector,
+                compare_acceptance_vector,
+            )
+
+            vector = AcceptanceVector.model_validate(_read_json(args.vector))
+            result = compare_acceptance_vector(vector, _read_json(args.actual))
+            _write_json(result.model_dump(mode="json"), out)
+            return 0 if result.all_passed else 2
+        if args.command == "accept-vnpy":
+            from .parity_acceptance import (
+                AcceptanceVector,
+                compare_acceptance_vector,
+            )
+            from .vnpy_acceptance import run_vnpy_acceptance_vector
+
+            vector = AcceptanceVector.model_validate(_read_json(args.vector))
+            result = compare_acceptance_vector(
+                vector,
+                run_vnpy_acceptance_vector(),
+            )
+            _write_json(result.model_dump(mode="json"), out)
+            return 0 if result.all_passed else 2
         if args.command == "health":
             # 健康接口不需要服务令牌。
             client = BacktestApiClient(

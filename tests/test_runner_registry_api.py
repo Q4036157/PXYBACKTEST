@@ -116,6 +116,7 @@ def test_capabilities_publish_contract_and_honest_runner_states(
     contracts = payload["strategy_runtime_contracts"]
     assert contracts["strategy_package"] == "pxybacktest.strategy-package.v1"
     assert contracts["event_envelope"] == "pxybacktest.event-envelope.v1"
+    assert contracts["parity_acceptance"] == "pxybacktest.parity-acceptance.v1"
     assert contracts["parity_gate"]["required_dimensions"] == [
         "trades",
         "account",

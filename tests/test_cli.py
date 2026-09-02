@@ -35,6 +35,65 @@ def test_health_does_not_require_token(monkeypatch):
     assert calls == [("GET", "/health", False)]
 
 
+def test_accept_result_runs_offline_without_service_token(tmp_path):
+    actual_file = tmp_path / "actual.json"
+    vector_file = tmp_path / "vector.json"
+    actual_file.write_text(
+        json.dumps(
+            {
+                "strategy": {"source_hash": "a" * 64},
+                "data_snapshot": {"manifest_sha256": "b" * 64},
+                "diagnostics": {"runtime_identity": "runtime"},
+                "deals": [],
+                "account": [],
+                "visual": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    vector_file.write_text(
+        json.dumps(
+            {
+                "vector_id": "offline-vector",
+                "platform": "vnpy",
+                "strategy_source_sha256": "a" * 64,
+                "data_manifest_sha256": "b" * 64,
+                "runtime_identity": "runtime",
+                "identity_checks": [
+                    {"path": "strategy.source_hash", "expected": "a" * 64},
+                    {
+                        "path": "data_snapshot.manifest_sha256",
+                        "expected": "b" * 64,
+                    },
+                    {
+                        "path": "diagnostics.runtime_identity",
+                        "expected": "runtime",
+                    },
+                ],
+                "trades": {"checks": [{"path": "deals", "expected": []}]},
+                "account": {"checks": [{"path": "account", "expected": []}]},
+                "visual": {"checks": [{"path": "visual", "expected": {}}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = io.StringIO()
+
+    code = cli.main(
+        [
+            "accept-result",
+            "--vector",
+            str(vector_file),
+            "--actual",
+            str(actual_file),
+        ],
+        output=output,
+    )
+
+    assert code == 0
+    assert json.loads(output.getvalue())["all_passed"] is True
+
+
 def test_run_saves_terminal_snapshot(tmp_path, monkeypatch):
     request_file = tmp_path / "request.json"
     save_file = tmp_path / "result.json"

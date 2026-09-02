@@ -22,6 +22,7 @@ from .strategy_package import (
     StrategyPackage,
     VerificationLevel,
 )
+from .parity_acceptance import PARITY_ACCEPTANCE_CONTRACT
 
 
 RUNNER_REGISTRY_CONTRACT = "pxybacktest.runner-registry.v1"
@@ -198,6 +199,20 @@ class RunnerRegistry:
         }
 
 
+def _venv_module_installed(python: Path | None, module: str) -> bool:
+    if python is None or not python.is_file():
+        return False
+    venv_root = python.parent.parent
+    candidates = [
+        venv_root / "Lib" / "site-packages" / module,
+        venv_root / "lib" / "site-packages" / module,
+    ]
+    lib_root = venv_root / "lib"
+    if lib_root.is_dir():
+        candidates.extend(lib_root.glob(f"python*/site-packages/{module}"))
+    return any(path.is_dir() or path.with_suffix(".py").is_file() for path in candidates)
+
+
 def build_runner_registry(config: RunnerProbeConfig) -> RunnerRegistry:
     """从当前源码与显式运行时路径构建注册表，不执行第三方代码。"""
 
@@ -215,9 +230,13 @@ def build_runner_registry(config: RunnerProbeConfig) -> RunnerRegistry:
     vnpy_adapter_ready = all(path.is_file() for path in vnpy_adapter_files)
     vnpy_submit_ready = vnpy_runtime_detected and vnpy_adapter_ready
 
-    tq_runtime_detected = bool(
+    tq_python_configured = bool(
         config.tqsdk_python is not None and config.tqsdk_python.is_file()
     )
+    tq_runtime_detected = _venv_module_installed(config.tqsdk_python, "tqsdk")
+    tq_adapter_ready = (
+        config.project_root / "app" / "tqsdk_native_worker.py"
+    ).is_file()
     mt4_runtime_detected = config.mt4_terminal.is_file()
     mt5_runtime_detected = config.mt5_terminal.is_file()
 
@@ -260,15 +279,19 @@ def build_runner_registry(config: RunnerProbeConfig) -> RunnerRegistry:
                 execution_semantics=["tqsdk"],
                 event_kinds=market_events,
                 runtime_detected=tq_runtime_detected,
-                adapter_ready=False,
+                adapter_ready=tq_adapter_ready,
                 submit_ready=False,
                 runtime_identity=(
                     "configured-tqsdk-python" if tq_runtime_detected else None
                 ),
                 reason=(
-                    "TqSdk Python 已配置，但 worker 适配器尚未实现"
+                    "TqSdk worker 已实现进程隔离，但受限令牌、Job Object、网络白名单和任务队列尚未接通"
                     if tq_runtime_detected
-                    else "未配置专用 TqSdk Python（PXYBACKTEST_TQSDK_PYTHON）"
+                    else (
+                        "专用 Python 尚未安装 tqsdk 3.10.x"
+                        if tq_python_configured
+                        else "未配置专用 TqSdk Python（PXYBACKTEST_TQSDK_PYTHON）"
+                    )
                 ),
             ),
             RunnerCapability(
@@ -322,6 +345,7 @@ def runner_contract_capabilities() -> dict:
         "strategy_package": STRATEGY_PACKAGE_CONTRACT,
         "event_envelope": EVENT_ENVELOPE_CONTRACT,
         "runner_registry": RUNNER_REGISTRY_CONTRACT,
+        "parity_acceptance": PARITY_ACCEPTANCE_CONTRACT,
         "parity_gate": {
             "required_dimensions": list(PARITY_DIMENSIONS),
             "rule": "all_dimensions_must_pass",

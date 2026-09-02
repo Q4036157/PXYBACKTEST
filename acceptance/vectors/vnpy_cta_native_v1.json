@@ -1,0 +1,103 @@
+{
+  "contract_version": "pxybacktest.parity-acceptance.v1",
+  "vector_id": "vnpy-cta-native-v1",
+  "platform": "vnpy",
+  "strategy_source_sha256": "6be5f623e6c84cbf00283a3b6923748d6734c295b0f7728d0c12f44f728d0b42",
+  "data_manifest_sha256": "f4843956d31cdd2d63c99bde2b5dfd067cfe1b1e36f399cf897bf85366bab521",
+  "runtime_identity": "vnpy-4.2.0+vnpy_ctastrategy-1.4.0",
+  "identity_checks": [
+    {
+      "path": "strategy.source_hash",
+      "expected": "6be5f623e6c84cbf00283a3b6923748d6734c295b0f7728d0c12f44f728d0b42"
+    },
+    {
+      "path": "data_snapshot.manifest_sha256",
+      "expected": "f4843956d31cdd2d63c99bde2b5dfd067cfe1b1e36f399cf897bf85366bab521"
+    },
+    {
+      "path": "diagnostics.runtime_identity",
+      "expected": "vnpy-4.2.0+vnpy_ctastrategy-1.4.0"
+    }
+  ],
+  "trades": {
+    "checks": [
+      {
+        "path": "deals",
+        "expected": [
+          {
+            "trade_id": "1",
+            "order_id": "1",
+            "symbol": "TEST.LOCAL",
+            "datetime": "2026-01-05T09:01:00",
+            "direction": "long",
+            "offset": "open",
+            "price": 101.0,
+            "volume": 1.0
+          },
+          {
+            "trade_id": "2",
+            "order_id": "2",
+            "symbol": "TEST.LOCAL",
+            "datetime": "2026-01-05T09:02:00",
+            "direction": "short",
+            "offset": "close",
+            "price": 102.0,
+            "volume": 1.0
+          }
+        ]
+      }
+    ]
+  },
+  "account": {
+    "checks": [
+      {
+        "path": "execution_snapshot.account_curve",
+        "expected": [
+          {
+            "date": "2026-01-05",
+            "balance": 100005.797,
+            "net_pnl": 5.797000000000001,
+            "commission": 0.203,
+            "slippage": 4.0,
+            "turnover": 2030.0,
+            "trade_count": 2
+          }
+        ]
+      }
+    ]
+  },
+  "visual": {
+    "checks": [
+      {
+        "path": "replay_audit",
+        "expected": {
+          "event_count": 9,
+          "chain_sha256": "db918ece9c3168723c6c85cd602a859793dac699132175981a3d1852acc9ff4a"
+        }
+      },
+      {
+        "path": "execution_snapshot.bar_history",
+        "expected_sha256": "f4843956d31cdd2d63c99bde2b5dfd067cfe1b1e36f399cf897bf85366bab521"
+      },
+      {
+        "path": "execution_snapshot",
+        "expected": {
+          "event_seq": 9,
+          "bar_history_count": 6,
+          "account_curve_count": 1,
+          "history_truncated": {
+            "bars": false,
+            "account": false
+          },
+          "status": "completed"
+        }
+      }
+    ]
+  },
+  "metadata": {
+    "oracle_type": "pinned_vnpy_native_runtime",
+    "data_type": "deterministic_synthetic_bars",
+    "scope": "runtime_regression_only_not_all_vnpy_strategies",
+    "verified_command": "python -m app.cli accept-vnpy"
+  }
+}

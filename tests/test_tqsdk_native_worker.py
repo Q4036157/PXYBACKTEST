@@ -274,6 +274,19 @@ def test_worker_reports_last_imports_after_native_crash(
         captured_command.extend(str(item) for item in command)
         environment = kwargs["environment"]
         assert isinstance(environment, dict)
+        profile = task_root / ".sandbox-profile"
+        assert environment["HOME"] == str(profile)
+        assert environment["USERPROFILE"] == str(profile)
+        assert environment["APPDATA"] == str(profile / "AppData" / "Roaming")
+        assert environment["LOCALAPPDATA"] == str(
+            profile / "AppData" / "Local"
+        )
+        assert environment["TEMP"] == str(profile / "Temp")
+        assert environment["TMP"] == str(profile / "Temp")
+        assert profile.is_dir()
+        assert (profile / "AppData" / "Roaming").is_dir()
+        assert (profile / "AppData" / "Local").is_dir()
+        assert (profile / "Temp").is_dir()
         trace_path = Path(str(environment["PXYBACKTEST_TQSDK_IMPORT_TRACE"]))
         trace_path.write_text("numpy\nnumpy._core._multiarray_umath\n", encoding="utf-8")
         return NativeCrash()

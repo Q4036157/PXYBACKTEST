@@ -499,6 +499,30 @@ def launch_tqsdk_worker(
     child_env["PYTHONNOUSERSITE"] = "1"
     child_env[_BOOTSTRAP_ERROR_ENV] = str(bootstrap_error_path)
     child_env[_IMPORT_TRACE_ENV] = str(import_trace_path)
+    # TqSdk 在导入阶段会调用 Path.home() 初始化 .tqsdk/otg_logs。
+    # 受限环境不能继承真实用户 Profile；为每个任务提供独立 Profile，
+    # 既保证原生 SDK 可导入，也把配置、缓存和临时文件限制在任务目录内。
+    sandbox_profile = request.task_root / ".sandbox-profile"
+    sandbox_temp = sandbox_profile / "Temp"
+    sandbox_appdata = sandbox_profile / "AppData" / "Roaming"
+    sandbox_local_appdata = sandbox_profile / "AppData" / "Local"
+    for directory in (
+        sandbox_profile,
+        sandbox_temp,
+        sandbox_appdata,
+        sandbox_local_appdata,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    child_env.update(
+        {
+            "HOME": str(sandbox_profile),
+            "USERPROFILE": str(sandbox_profile),
+            "APPDATA": str(sandbox_appdata),
+            "LOCALAPPDATA": str(sandbox_local_appdata),
+            "TEMP": str(sandbox_temp),
+            "TMP": str(sandbox_temp),
+        }
+    )
     sandbox_user = os.getenv(_SANDBOX_USER_ENV, "").strip()
     sandbox_password = _secret_from_environment(
         "PXYBACKTEST_TQSDK_SANDBOX_PASSWORD", _SANDBOX_PASSWORD_FILE_ENV
@@ -508,9 +532,6 @@ def launch_tqsdk_worker(
         if sandbox_user and sandbox_password
         else None
     )
-    if sandbox_identity is not None:
-        child_env["TEMP"] = str(request.task_root)
-        child_env["TMP"] = str(request.task_root)
     child_env["PYTHONPATH"] = os.pathsep.join(
         str(path.resolve()) for path in (project_root, *runtime_pythonpaths)
     )

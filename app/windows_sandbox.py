@@ -14,7 +14,6 @@ import locale
 import os
 import re
 import subprocess
-import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from ctypes import wintypes
@@ -25,7 +24,6 @@ from pathlib import Path
 NETWORK_POLICY_ID_ENV = "PXYBACKTEST_TQSDK_NETWORK_POLICY_ID"
 NETWORK_POLICY_SHA256_ENV = "PXYBACKTEST_TQSDK_NETWORK_POLICY_SHA256"
 NETWORK_POLICY_FILE_ENV = "PXYBACKTEST_TQSDK_NETWORK_POLICY_FILE"
-_ERROR_MODE_LOCK = threading.Lock()
 
 
 def _normalized_path(path: Path) -> str:
@@ -316,8 +314,6 @@ if os.name == "nt":
         ctypes.c_void_p,
     ]
     kernel32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
-    kernel32.SetErrorMode.restype = wintypes.UINT
-    kernel32.SetErrorMode.argtypes = [wintypes.UINT]
     advapi32.OpenProcessToken.argtypes = [
         wintypes.HANDLE,
         wintypes.DWORD,
@@ -681,58 +677,47 @@ def _launch_windows(
             | CREATE_NO_WINDOW
             | EXTENDED_STARTUPINFO_PRESENT
         )
-        # 防止原生 DLL 崩溃弹出阻塞验收的 Windows 应用程序错误框。
-        # 错误模式由子进程在创建时继承，创建后立即恢复父进程。
-        SEM_FAILCRITICALERRORS = 0x0001
-        SEM_NOGPFAULTERRORBOX = 0x0002
-        with _ERROR_MODE_LOCK:
-            previous_error_mode = kernel32.SetErrorMode(
-                SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX
+        process_creation_api = "CreateProcessAsUserW"
+        created = advapi32.CreateProcessAsUserW(
+            token,
+            None,
+            command_line,
+            None,
+            None,
+            True,
+            creation_flags,
+            ctypes.cast(env_block, ctypes.c_void_p),
+            str(cwd),
+            ctypes.cast(ctypes.byref(startup), ctypes.POINTER(STARTUPINFOW)),
+            ctypes.byref(process),
+        )
+        create_error = ctypes.get_last_error() if not created else 0
+        process_creation_error = create_error
+        if not created and create_error == 1314:
+            # 提权管理员通常有 SeImpersonatePrivilege，但默认没有
+            # SeAssignPrimaryToken/SeIncreaseQuota。保持同一受限主令牌，
+            # 改用 CreateProcessWithTokenW，避免要求扩大本机账户特权。
+            process_creation_api = "CreateProcessWithTokenW"
+            command_line = ctypes.create_unicode_buffer(
+                subprocess.list2cmdline(list(command))
             )
-            try:
-                process_creation_api = "CreateProcessAsUserW"
-                created = advapi32.CreateProcessAsUserW(
-                    token,
-                    None,
-                    command_line,
-                    None,
-                    None,
-                    True,
-                    creation_flags,
-                    ctypes.cast(env_block, ctypes.c_void_p),
-                    str(cwd),
-                    ctypes.cast(ctypes.byref(startup), ctypes.POINTER(STARTUPINFOW)),
-                    ctypes.byref(process),
-                )
-                create_error = ctypes.get_last_error() if not created else 0
-                process_creation_error = create_error
-                if not created and create_error == 1314:
-                    # 提权管理员通常有 SeImpersonatePrivilege，但默认没有
-                    # SeAssignPrimaryToken/SeIncreaseQuota。保持同一受限主令牌，
-                    # 改用 CreateProcessWithTokenW，避免要求扩大本机账户特权。
-                    process_creation_api = "CreateProcessWithTokenW"
-                    command_line = ctypes.create_unicode_buffer(
-                        subprocess.list2cmdline(list(command))
-                    )
-                    fallback_startup = STARTUPINFOW()
-                    fallback_startup.cb = ctypes.sizeof(fallback_startup)
-                    ctypes.set_last_error(0)
-                    created = advapi32.CreateProcessWithTokenW(
-                        token,
-                        0,
-                        None,
-                        command_line,
-                        creation_flags & ~EXTENDED_STARTUPINFO_PRESENT,
-                        ctypes.cast(env_block, ctypes.c_void_p),
-                        str(cwd),
-                        ctypes.byref(fallback_startup),
-                        ctypes.byref(process),
-                    )
-                    process_creation_error = (
-                        ctypes.get_last_error() if not created else 0
-                    )
-            finally:
-                kernel32.SetErrorMode(previous_error_mode)
+            fallback_startup = STARTUPINFOW()
+            fallback_startup.cb = ctypes.sizeof(fallback_startup)
+            ctypes.set_last_error(0)
+            created = advapi32.CreateProcessWithTokenW(
+                token,
+                0,
+                None,
+                command_line,
+                creation_flags & ~EXTENDED_STARTUPINFO_PRESENT,
+                ctypes.cast(env_block, ctypes.c_void_p),
+                str(cwd),
+                ctypes.byref(fallback_startup),
+                ctypes.byref(process),
+            )
+            process_creation_error = (
+                ctypes.get_last_error() if not created else 0
+            )
         if not created:
             primary_suffix = (
                 f"，CreateProcessAsUserW首次错误={create_error}"

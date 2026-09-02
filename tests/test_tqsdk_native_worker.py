@@ -166,6 +166,58 @@ def test_tqsdk_worker_requires_controlled_credentials(
         )
 
 
+def test_tqsdk_worker_structures_strategy_system_exit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    task_root = tmp_path / "task"
+    task_root.mkdir()
+    runtime = _fake_tqsdk(tmp_path / "fake-runtime")
+    request = _request(task_root)
+    request.strategy_path.write_text(
+        "from tqsdk import TqApi\napi = TqApi()\nraise SystemExit('planned-exit')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PXYBACKTEST_TQSDK_USERNAME", "test-user")
+    monkeypatch.setenv("PXYBACKTEST_TQSDK_PASSWORD", "test-password")
+
+    with pytest.raises(TqSdkWorkerError, match="SystemExit: planned-exit"):
+        launch_tqsdk_worker(
+            request,
+            python_executable=Path(sys.executable),
+            project_root=Path(__file__).parents[1],
+            timeout_seconds=5,
+            runtime_pythonpaths=[runtime],
+        )
+
+
+def test_tqsdk_worker_redacts_credentials_from_structured_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    task_root = tmp_path / "task"
+    task_root.mkdir()
+    runtime = _fake_tqsdk(tmp_path / "fake-runtime")
+    request = _request(task_root)
+    request.strategy_path.write_text(
+        "import os\nfrom tqsdk import TqApi\napi = TqApi()\n"
+        "raise SystemExit(os.environ['PXYBACKTEST_TQSDK_PASSWORD'])\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PXYBACKTEST_TQSDK_USERNAME", "test-user")
+    monkeypatch.setenv("PXYBACKTEST_TQSDK_PASSWORD", "test-password")
+
+    with pytest.raises(TqSdkWorkerError) as raised:
+        launch_tqsdk_worker(
+            request,
+            python_executable=Path(sys.executable),
+            project_root=Path(__file__).parents[1],
+            timeout_seconds=5,
+            runtime_pythonpaths=[runtime],
+        )
+
+    assert "test-password" not in str(raised.value)
+    assert "<redacted>" in str(raised.value)
+
+
 def test_tqsdk_worker_rejects_strategy_outside_task_root(tmp_path: Path) -> None:
     outside = tmp_path / "outside.py"
     outside.write_text("pass", encoding="utf-8")

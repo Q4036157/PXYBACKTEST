@@ -39,6 +39,26 @@ _AUTH_USER_FILE_ENV = "PXYBACKTEST_TQSDK_USERNAME_FILE"
 _AUTH_PASSWORD_FILE_ENV = "PXYBACKTEST_TQSDK_PASSWORD_FILE"
 _SANDBOX_USER_ENV = "PXYBACKTEST_TQSDK_SANDBOX_USER"
 _SANDBOX_PASSWORD_FILE_ENV = "PXYBACKTEST_TQSDK_SANDBOX_PASSWORD_FILE"
+_BOOTSTRAP_ERROR_ENV = "PXYBACKTEST_TQSDK_BOOTSTRAP_ERROR"
+_BOOTSTRAP_CODE = """
+import os
+import runpy
+import traceback
+from pathlib import Path
+
+error_path = Path(os.environ["PXYBACKTEST_TQSDK_BOOTSTRAP_ERROR"])
+try:
+    runpy.run_module(
+        "app.tqsdk_native_worker", run_name="__main__", alter_sys=True
+    )
+except SystemExit as exc:
+    if exc.code not in (None, 0) and not error_path.exists():
+        error_path.write_text(traceback.format_exc(), encoding="utf-8")
+    raise
+except BaseException:
+    error_path.write_text(traceback.format_exc(), encoding="utf-8")
+    raise
+"""
 _TQ_ENDPOINTS = {
     "TQ_AUTH_URL": "https://auth.shinnytech.com",
     "TQ_INS_URL": "https://openmd.shinnytech.com/t/md/symbols/latest.json",
@@ -97,6 +117,14 @@ class TqSdkWorkerRequest(BaseModel):
 
 class TqSdkWorkerError(RuntimeError):
     pass
+
+
+def _safe_child_error(value: Any, *secrets: str) -> str:
+    message = str(value or "")
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "<redacted>")
+    return " ".join(message.split())[-2000:]
 
 
 def _plain(value: Any) -> Any:
@@ -328,7 +356,7 @@ def run_tqsdk_strategy(request: TqSdkWorkerRequest) -> dict[str, Any]:
         runpy.run_path(str(request.strategy_path), run_name="__main__")
     except finished_error:
         pass
-    except Exception as exc:  # noqa: BLE001 - 错误需要写入任务结果
+    except BaseException as exc:  # noqa: BLE001 - SystemExit 也必须结构化
         execution_error = exc
     finally:
         tqsdk.TqApi = original_api
@@ -418,6 +446,7 @@ def launch_tqsdk_worker(
     if not python_path.is_file():
         raise TqSdkWorkerError(f"天勤 Python 不存在: {python_path}")
     request_path = request.task_root / "tqsdk-worker-request.json"
+    bootstrap_error_path = request.task_root / "tqsdk-worker-bootstrap-error.log"
     _write_result(request_path, request.model_dump(mode="json"))
 
     inherited_names = (
@@ -443,6 +472,7 @@ def launch_tqsdk_worker(
     if password:
         child_env[_AUTH_PASSWORD_ENV] = password
     child_env.update(_TQ_ENDPOINTS)
+    child_env[_BOOTSTRAP_ERROR_ENV] = str(bootstrap_error_path)
     sandbox_user = os.getenv(_SANDBOX_USER_ENV, "").strip()
     sandbox_password = _secret_from_environment(
         "PXYBACKTEST_TQSDK_SANDBOX_PASSWORD", _SANDBOX_PASSWORD_FILE_ENV
@@ -460,8 +490,10 @@ def launch_tqsdk_worker(
     )
     command = [
         str(python_path),
-        "-m",
-        "app.tqsdk_native_worker",
+        "-X",
+        "utf8",
+        "-c",
+        _BOOTSTRAP_CODE,
         "--request",
         str(request_path),
     ]
@@ -489,13 +521,24 @@ def launch_tqsdk_worker(
             )
         except (OSError, json.JSONDecodeError):
             failed_payload = {}
-        structured_error = (
+        structured_error = _safe_child_error(
             str(failed_payload.get("error") or "").strip()
             if isinstance(failed_payload, dict)
-            else ""
+            else "",
+            username,
+            password,
         )
         if structured_error:
             raise TqSdkWorkerError(structured_error)
+        try:
+            diagnostic = bootstrap_error_path.read_text(encoding="utf-8")
+        except OSError:
+            diagnostic = ""
+        diagnostic = _safe_child_error(diagnostic, username, password)
+        if diagnostic:
+            raise TqSdkWorkerError(
+                f"天勤策略子进程退出码 {completed.exit_code}: {diagnostic}"
+            )
         raise TqSdkWorkerError(
             f"天勤策略子进程退出码 {completed.exit_code}，且没有结构化错误"
         )
@@ -520,7 +563,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = run_tqsdk_strategy(request)
         _write_result(request.result_path, result)
         return 0
-    except Exception as exc:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001 - SystemExit 也必须落盘
         error = {
             "contract_version": TQSDK_WORKER_CONTRACT,
             "ok": False,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -236,7 +237,12 @@ def test_worker_reports_last_imports_after_native_crash(
     class NativeCrash:
         exit_code = 0xC06D007E
 
-    def crash(*_args: object, **kwargs: object) -> NativeCrash:
+    captured_command: list[str] = []
+
+    def crash(*args: object, **kwargs: object) -> NativeCrash:
+        command = args[0]
+        assert isinstance(command, list)
+        captured_command.extend(str(item) for item in command)
         environment = kwargs["environment"]
         assert isinstance(environment, dict)
         trace_path = Path(str(environment["PXYBACKTEST_TQSDK_IMPORT_TRACE"]))
@@ -256,6 +262,9 @@ def test_worker_reports_last_imports_after_native_crash(
             project_root=Path(__file__).parents[1],
             timeout_seconds=5,
         )
+
+    assert "app.tqsdk_worker_bootstrap" in captured_command
+    assert len(subprocess.list2cmdline(captured_command)) < 1024
 
 
 def test_tqsdk_worker_redacts_credentials_from_structured_error(

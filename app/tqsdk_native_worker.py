@@ -35,36 +35,6 @@ _SANDBOX_USER_ENV = "PXYBACKTEST_TQSDK_SANDBOX_USER"
 _SANDBOX_PASSWORD_FILE_ENV = "PXYBACKTEST_TQSDK_SANDBOX_PASSWORD_FILE"
 _BOOTSTRAP_ERROR_ENV = "PXYBACKTEST_TQSDK_BOOTSTRAP_ERROR"
 _IMPORT_TRACE_ENV = "PXYBACKTEST_TQSDK_IMPORT_TRACE"
-_BOOTSTRAP_CODE = """
-import os
-import runpy
-import sys
-import traceback
-from pathlib import Path
-
-error_path = Path(os.environ["PXYBACKTEST_TQSDK_BOOTSTRAP_ERROR"])
-trace_path = Path(os.environ["PXYBACKTEST_TQSDK_IMPORT_TRACE"])
-trace_handle = trace_path.open("a", encoding="utf-8", buffering=1)
-
-def record_import(event, args):
-    if event == "import" and args:
-        trace_handle.write(str(args[0]) + "\\n")
-        trace_handle.flush()
-
-sys.addaudithook(record_import)
-trace_handle.write("<bootstrap:run_module>\\n")
-try:
-    runpy.run_module(
-        "app.tqsdk_native_worker", run_name="__main__", alter_sys=True
-    )
-except SystemExit as exc:
-    if exc.code not in (None, 0) and not error_path.exists():
-        error_path.write_text(traceback.format_exc(), encoding="utf-8")
-    raise
-except BaseException:
-    error_path.write_text(traceback.format_exc(), encoding="utf-8")
-    raise
-"""
 _TQ_ENDPOINTS = {
     "TQ_AUTH_URL": "https://auth.shinnytech.com",
     "TQ_INS_URL": "https://openmd.shinnytech.com/t/md/symbols/latest.json",
@@ -510,8 +480,8 @@ def launch_tqsdk_worker(
         str(python_path),
         "-X",
         "utf8",
-        "-c",
-        _BOOTSTRAP_CODE,
+        "-m",
+        "app.tqsdk_worker_bootstrap",
         "--request",
         str(request_path),
     ]

@@ -273,7 +273,7 @@ def build_runner_registry(config: RunnerProbeConfig) -> RunnerRegistry:
                 platform=SourcePlatform.TQSDK,
                 integration_phase=1,
                 adapter_id="tqsdk-native",
-                adapter_version="planned-v1",
+                adapter_version="process-isolation-v1",
                 aliases=["tqsdk_native"],
                 modes=[RunnerMode.NATIVE_SANDBOX, RunnerMode.COMPAT],
                 execution_semantics=["tqsdk"],

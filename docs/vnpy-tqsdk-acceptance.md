@@ -71,3 +71,7 @@ python -m app.cli accept-vnpy
 TqSdk 是 PXYBACKTEST 可选依赖 `tqsdk>=3.10,<3.11`。专用 Python 通过
 `PXYBACKTEST_TQSDK_PYTHON` 配置；不能引用或复制 PXYFUTURES 的虚拟环境。凭据文件、
 WinSW 环境变量、E 盘发布路径和服务重启由 PXYOPS 管理，本仓库不保存密钥。
+
+2026-09-03 工作站开发环境 `D:/x1/x2/PXYBACKTEST/.venv` 已离线导入验证 TqSdk
+3.10.2；这只是开发运行时已安装，不代表 E 盘发布快照或 WinSW 服务已配置。服务环境
+读取到专用 Python 且完成安全门禁前，能力状态仍必须保持 `submit_ready=false`。

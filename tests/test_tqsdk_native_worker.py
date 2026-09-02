@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ from app import tqsdk_native_worker
 from app.tqsdk_native_worker import (
     TqSdkWorkerError,
     TqSdkWorkerRequest,
+    _isolated_python_path,
     launch_tqsdk_worker,
 )
 
@@ -119,6 +121,33 @@ def _request(task_root: Path) -> TqSdkWorkerRequest:
         end_date="2026-09-02",
         initial_balance=100_000,
     )
+
+
+def test_isolated_python_path_excludes_parent_development_tools(tmp_path: Path) -> None:
+    base_root = tmp_path / "Python312"
+    (base_root / "DLLs").mkdir(parents=True)
+    system_root = tmp_path / "Windows"
+    (system_root / "System32").mkdir(parents=True)
+    venv_root = tmp_path / "venv"
+    scripts = venv_root / "Scripts"
+    scripts.mkdir(parents=True)
+    python_path = scripts / "python.exe"
+    python_path.write_bytes(b"launcher")
+    (venv_root / "pyvenv.cfg").write_text(
+        f"home = {base_root}\nversion = 3.12.10\n", encoding="utf-8"
+    )
+
+    isolated = _isolated_python_path(python_path, system_root).split(os.pathsep)
+
+    assert isolated == [
+        str(scripts.resolve()),
+        str(base_root.resolve()),
+        str((base_root / "DLLs").resolve()),
+        str((system_root / "System32").resolve()),
+        str(system_root.resolve()),
+    ]
+    assert "Python311" not in os.pathsep.join(isolated)
+    assert "Codex" not in os.pathsep.join(isolated)
 
 
 def test_tqsdk_worker_runs_original_script_in_dedicated_process(

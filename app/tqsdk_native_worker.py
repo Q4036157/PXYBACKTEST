@@ -95,6 +95,38 @@ class TqSdkWorkerError(RuntimeError):
     pass
 
 
+def _isolated_python_path(python_path: Path, system_root: Path) -> str:
+    """只保留天勤子进程需要的 Python/Windows DLL 搜索路径。"""
+
+    venv_root = python_path.parent.parent
+    base_root = python_path.parent
+    config_path = venv_root / "pyvenv.cfg"
+    if config_path.is_file():
+        try:
+            for line in config_path.read_text(encoding="utf-8").splitlines():
+                name, separator, value = line.partition("=")
+                if separator and name.strip().lower() == "home" and value.strip():
+                    base_root = Path(value.strip()).resolve()
+                    break
+        except OSError:
+            pass
+    candidates = (
+        python_path.parent,
+        base_root,
+        base_root / "DLLs",
+        system_root / "System32",
+        system_root,
+    )
+    unique: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = os.path.normcase(str(candidate.resolve()))
+        if normalized not in seen and candidate.is_dir():
+            seen.add(normalized)
+            unique.append(str(candidate.resolve()))
+    return os.pathsep.join(unique)
+
+
 def _safe_child_error(value: Any, *secrets: str) -> str:
     message = str(value or "")
     for secret in secrets:
@@ -443,7 +475,6 @@ def launch_tqsdk_worker(
         "PATHEXT",
         "TEMP",
         "TMP",
-        "PATH",
         _AUTH_USER_ENV,
         _AUTH_PASSWORD_ENV,
     )
@@ -459,6 +490,13 @@ def launch_tqsdk_worker(
     if password:
         child_env[_AUTH_PASSWORD_ENV] = password
     child_env.update(_TQ_ENDPOINTS)
+    system_root = Path(
+        child_env.get("SYSTEMROOT") or child_env.get("WINDIR") or r"C:\Windows"
+    )
+    child_env["PATH"] = _isolated_python_path(python_path, system_root)
+    child_env["PYTHONUTF8"] = "1"
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    child_env["PYTHONNOUSERSITE"] = "1"
     child_env[_BOOTSTRAP_ERROR_ENV] = str(bootstrap_error_path)
     child_env[_IMPORT_TRACE_ENV] = str(import_trace_path)
     sandbox_user = os.getenv(_SANDBOX_USER_ENV, "").strip()

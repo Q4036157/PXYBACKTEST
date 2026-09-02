@@ -11,5 +11,5 @@ app:
   auth_mode: trusted_service_header
   compute_location: workstation_only
   health_path: /health
-  runtime_root: D:/x1/pxy-runtime/PXYBACKTEST
+  runtime_root: E:/pxy-runtime/PXYBACKTEST
   secrets_source: local_file_only

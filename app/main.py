@@ -47,7 +47,13 @@ from .pxydata_client import (
     SnapshotClient,
     SnapshotProviderError,
 )
+from .runner_registry import (
+    RunnerProbeConfig,
+    build_runner_registry,
+    runner_contract_capabilities,
+)
 from .store import TaskNotFoundError
+from .strategy_package import StrategyPackage
 
 A_SHARE_WARMUP_CALENDAR_DAYS = 120
 LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
@@ -174,6 +180,9 @@ def create_app(
     lighter_available = (
         configured.pxydata_data_root.is_dir() and lighter_runtime_available()
     )
+    runner_registry = build_runner_registry(
+        RunnerProbeConfig.from_environment(pxylh_root=configured.pxylh_root)
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -213,6 +222,8 @@ def create_app(
         return {
             "task_contract": "pxybacktest.task-result.v2",
             "data_contract": "pxydata.backtest-data-snapshot.v1",
+            "strategy_runtime_contracts": runner_contract_capabilities(),
+            "runners": runner_registry.catalog(),
             "replay": {
                 "contract": "pxybacktest.replay.v1",
                 "execution_stream": "complete_ordered_audited",
@@ -421,6 +432,15 @@ def create_app(
                 {"id": "mt5_native", "available": False},
             ],
         }
+
+    @app.post("/api/v2/strategy-packages/validate")
+    async def validate_strategy_package_route(
+        body: StrategyPackage,
+        _: TrustedIdentity = Depends(identity_dependency),
+    ) -> dict:
+        """只校验并解析策略包，不创建任务或执行第三方策略。"""
+
+        return runner_registry.resolve(body)
 
     @app.post("/api/v2/workflows/validate")
     async def validate_workflow_route(

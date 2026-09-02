@@ -17,6 +17,7 @@ from app.windows_sandbox import (
     SandboxCancelledError,
     SandboxIdentity,
     SandboxLimits,
+    _fallback_startup_info,
     _set_task_directory_access,
     _win_error_from_code,
     launch_sandboxed_process,
@@ -37,6 +38,16 @@ def test_win_error_preserves_captured_code_and_hex() -> None:
 
     assert "2147942487" in str(error)
     assert "0x80070057" in str(error)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="仅验证 Windows 启动结构")
+def test_fallback_startup_info_has_valid_standard_handles() -> None:
+    startup = _fallback_startup_info(101, 202)
+
+    assert startup.dwFlags & 0x00000100
+    assert startup.hStdInput == 101
+    assert startup.hStdOutput == 202
+    assert startup.hStdError == 202
 
 
 def test_task_acl_is_applied_and_checked_per_existing_path(

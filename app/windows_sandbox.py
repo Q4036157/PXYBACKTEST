@@ -24,6 +24,7 @@ from pathlib import Path
 NETWORK_POLICY_ID_ENV = "PXYBACKTEST_TQSDK_NETWORK_POLICY_ID"
 NETWORK_POLICY_SHA256_ENV = "PXYBACKTEST_TQSDK_NETWORK_POLICY_SHA256"
 NETWORK_POLICY_FILE_ENV = "PXYBACKTEST_TQSDK_NETWORK_POLICY_FILE"
+_STARTF_USESTDHANDLES = 0x00000100
 
 
 def _normalized_path(path: Path) -> str:
@@ -378,6 +379,20 @@ def _win_error(action: str) -> SandboxLaunchError:
     return _win_error_from_code(action, ctypes.get_last_error())
 
 
+def _fallback_startup_info(
+    stdin_handle: wintypes.HANDLE, stdout_handle: wintypes.HANDLE
+) -> STARTUPINFOW:
+    """为 CreateProcessWithTokenW 构造有效标准流。"""
+
+    startup = STARTUPINFOW()
+    startup.cb = ctypes.sizeof(startup)
+    startup.dwFlags = _STARTF_USESTDHANDLES
+    startup.hStdInput = stdin_handle
+    startup.hStdOutput = stdout_handle
+    startup.hStdError = stdout_handle
+    return startup
+
+
 def _environment_block(environment: Mapping[str, str]) -> ctypes.Array:
     entries = [
         f"{key}={value}"
@@ -566,7 +581,6 @@ def _launch_windows(
     CREATE_NO_WINDOW = 0x08000000
     EXTENDED_STARTUPINFO_PRESENT = 0x00080000
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
-    STARTF_USESTDHANDLES = 0x00000100
     GENERIC_READ = 0x80000000
     GENERIC_WRITE = 0x40000000
     FILE_SHARE_READ = 0x00000001
@@ -632,7 +646,7 @@ def _launch_windows(
         if task_acl_applied and identity is not None:
             _set_task_directory_access(cwd, identity, grant=False)
         raise _win_error("打开沙箱 NUL 标准流")
-    startup.StartupInfo.dwFlags |= STARTF_USESTDHANDLES
+    startup.StartupInfo.dwFlags |= _STARTF_USESTDHANDLES
     startup.StartupInfo.hStdInput = null_in
     startup.StartupInfo.hStdOutput = null_out
     startup.StartupInfo.hStdError = null_out
@@ -701,8 +715,7 @@ def _launch_windows(
             command_line = ctypes.create_unicode_buffer(
                 subprocess.list2cmdline(list(command))
             )
-            fallback_startup = STARTUPINFOW()
-            fallback_startup.cb = ctypes.sizeof(fallback_startup)
+            fallback_startup = _fallback_startup_info(null_in, null_out)
             ctypes.set_last_error(0)
             created = advapi32.CreateProcessWithTokenW(
                 token,

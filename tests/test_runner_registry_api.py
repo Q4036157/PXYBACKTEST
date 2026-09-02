@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
+from test_tqsdk_submission import submission_payload
 
 
 class IdleManager:
@@ -178,3 +179,35 @@ def test_validate_strategy_package_rejects_mt5_without_binary(
 
     assert response.status_code == 422
     assert "binary artifact" in response.text
+
+
+def test_tqsdk_submission_stays_closed_before_security_and_parity_gate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    tq_python = tmp_path / "tq-venv" / "Scripts" / "python.exe"
+    tq_python.parent.mkdir(parents=True)
+    tq_python.write_bytes(b"python")
+    package = tq_python.parent.parent / "Lib" / "site-packages" / "tqsdk"
+    package.mkdir(parents=True)
+    metadata = (
+        package.parent / "tqsdk-3.10.2.dist-info" / "METADATA"
+    )
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("Name: tqsdk\nVersion: 3.10.2\n", encoding="utf-8")
+    monkeypatch.setenv("PXYBACKTEST_TQSDK_PYTHON", str(tq_python))
+    app = create_app(
+        _settings(tmp_path),
+        IdleManager(),  # type: ignore[arg-type]
+        UnconfiguredSnapshots(),  # type: ignore[arg-type]
+        UnconfiguredDaa(),  # type: ignore[arg-type]
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v2/tqsdk/tasks",
+            json=submission_payload(),
+            headers=_headers(),
+        )
+
+    assert response.status_code == 409
+    assert "受限令牌" in response.text or "门禁" in response.text

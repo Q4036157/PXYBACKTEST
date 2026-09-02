@@ -1,8 +1,8 @@
 """天勤 TqSdk 原生回测子进程适配器。
 
-该模块只提供受控任务目录、清理后的环境变量和超时隔离。当前尚未使用 Windows
-受限令牌、Job Object 和网络目标白名单，因此结果明确标记为
-``process_isolation_only``，不能宣称已经达到不可信代码安全沙箱等级。
+父进程使用 Windows 受限令牌、专用本地账户、Job Object、任务目录 ACL 和
+PXYOPS 网络白名单启动本模块。任一安全证明缺失时结果保持
+``submit_ready=false``，任务提交接口不会开放。
 """
 
 from __future__ import annotations
@@ -13,21 +13,52 @@ import json
 import math
 import os
 import runpy
-import subprocess
 import sys
 from collections.abc import Mapping
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .kernel import stable_hash
+from .tqsdk_replay import build_tqsdk_replay
+from .windows_sandbox import (
+    SandboxCancelledError,
+    SandboxIdentity,
+    SandboxLimits,
+    SandboxTimeoutError,
+    launch_sandboxed_process,
+)
 
 
 TQSDK_WORKER_CONTRACT = "pxybacktest.tqsdk-native-worker.v1"
 _AUTH_USER_ENV = "PXYBACKTEST_TQSDK_USERNAME"
 _AUTH_PASSWORD_ENV = "PXYBACKTEST_TQSDK_PASSWORD"
+_AUTH_USER_FILE_ENV = "PXYBACKTEST_TQSDK_USERNAME_FILE"
+_AUTH_PASSWORD_FILE_ENV = "PXYBACKTEST_TQSDK_PASSWORD_FILE"
+_SANDBOX_USER_ENV = "PXYBACKTEST_TQSDK_SANDBOX_USER"
+_SANDBOX_PASSWORD_FILE_ENV = "PXYBACKTEST_TQSDK_SANDBOX_PASSWORD_FILE"
+_TQ_ENDPOINTS = {
+    "TQ_AUTH_URL": "https://auth.shinnytech.com",
+    "TQ_INS_URL": "https://openmd.shinnytech.com/t/md/symbols/latest.json",
+    "TQ_MD_URL": "wss://backtest.shinnytech.com/t/md/front/mobile",
+    "TQ_CHINESE_HOLIDAY_URL": "https://files.shinnytech.com/shinny_chinese_holiday.json",
+    "TQ_CONT_TABLE_URL": "https://files.shinnytech.com/continuous_table.json",
+}
+
+
+def _secret_from_environment(value_name: str, file_name: str) -> str:
+    direct = os.getenv(value_name, "").strip()
+    if direct:
+        return direct
+    path_raw = os.getenv(file_name, "").strip()
+    if not path_raw:
+        return ""
+    try:
+        return Path(path_raw).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 class TqSdkWorkerRequest(BaseModel):
@@ -44,6 +75,8 @@ class TqSdkWorkerRequest(BaseModel):
     end_date: date
     initial_balance: float = Field(gt=0)
     require_auth: bool = True
+    memory_mb: int = Field(default=4096, ge=128, le=262144)
+    cpu_cores: int = Field(default=1, ge=1, le=128)
 
     @model_validator(mode="after")
     def validate_paths_and_period(self) -> "TqSdkWorkerRequest":
@@ -147,6 +180,107 @@ def _extract_simulation(sim: Any, api: Any | None) -> dict[str, Any]:
     }
 
 
+class _MarketCapture:
+    """记录策略真实订阅到的 K 线、Tick 和 Quote，不参与撮合。"""
+
+    def __init__(self, api: Any):
+        self.api = api
+        self._serials: list[tuple[str, str, Any]] = []
+        self._quotes: list[tuple[str, Any]] = []
+        self._seen: set[tuple[str, str, str]] = set()
+        self.events: list[dict[str, Any]] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.api, name)
+
+    def get_kline_serial(self, symbol: str, *args: Any, **kwargs: Any) -> Any:
+        frame = self.api.get_kline_serial(symbol, *args, **kwargs)
+        self._serials.append(("market_bar", str(symbol), frame))
+        self.capture()
+        return frame
+
+    def get_tick_serial(self, symbol: str, *args: Any, **kwargs: Any) -> Any:
+        frame = self.api.get_tick_serial(symbol, *args, **kwargs)
+        self._serials.append(("market_tick", str(symbol), frame))
+        self.capture()
+        return frame
+
+    def get_quote(self, symbol: str, *args: Any, **kwargs: Any) -> Any:
+        quote = self.api.get_quote(symbol, *args, **kwargs)
+        self._quotes.append((str(symbol), quote))
+        self.capture()
+        return quote
+
+    def wait_update(self, *args: Any, **kwargs: Any) -> Any:
+        updated = self.api.wait_update(*args, **kwargs)
+        self.capture()
+        return updated
+
+    def close(self) -> Any:
+        self.capture()
+        return self.api.close()
+
+    @staticmethod
+    def _records(frame: Any) -> list[dict[str, Any]]:
+        try:
+            records = frame.to_dict("records")
+        except (AttributeError, TypeError, ValueError):
+            try:
+                records = [vars(row) for row in frame.itertuples(index=False)]
+            except (AttributeError, TypeError, ValueError):
+                return []
+        return [dict(item) for item in records if isinstance(item, Mapping)]
+
+    def capture(self) -> None:
+        for event_type, symbol, frame in self._serials:
+            for raw in self._records(frame):
+                payload = _plain(raw)
+                if not isinstance(payload, dict):
+                    continue
+                timestamp = payload.get("datetime") or payload.get("datetime_ns")
+                if not timestamp or not math.isfinite(float(timestamp)):
+                    continue
+                key = (event_type, symbol, str(int(float(timestamp))))
+                if key in self._seen:
+                    continue
+                self._seen.add(key)
+                self.events.append(
+                    {
+                        "event_type": event_type,
+                        "symbol": symbol,
+                        "datetime_ns": int(float(timestamp)),
+                        **{
+                            name: value
+                            for name, value in payload.items()
+                            if name not in {"datetime", "datetime_ns"}
+                        },
+                    }
+                )
+        for symbol, quote in self._quotes:
+            payload = _plain(quote)
+            if not isinstance(payload, dict):
+                continue
+            timestamp = payload.get("datetime") or payload.get("datetime_ns")
+            if not timestamp:
+                continue
+            key = ("market_tick", symbol, str(timestamp))
+            if key in self._seen:
+                continue
+            self._seen.add(key)
+            self.events.append(
+                {
+                    "event_type": "market_tick",
+                    "symbol": symbol,
+                    "datetime": str(timestamp),
+                    **{
+                        name: value
+                        for name, value in payload.items()
+                        if name not in {"datetime", "datetime_ns"}
+                    },
+                }
+            )
+
+
 def run_tqsdk_strategy(request: TqSdkWorkerRequest) -> dict[str, Any]:
     """在当前子进程中以 TqBacktest/TqSim 强制覆盖策略的 TqApi。"""
 
@@ -166,6 +300,7 @@ def run_tqsdk_strategy(request: TqSdkWorkerRequest) -> dict[str, Any]:
     backtest = tqsdk.TqBacktest(request.start_date, request.end_date)
     auth = tqsdk.TqAuth(username, password) if username and password else None
     created: list[Any] = []
+    captures: list[_MarketCapture] = []
 
     def controlled_api(*args: Any, **kwargs: Any) -> Any:
         if created:
@@ -182,7 +317,9 @@ def run_tqsdk_strategy(request: TqSdkWorkerRequest) -> dict[str, Any]:
         del args
         api = original_api(sim, backtest=backtest, **kwargs)
         created.append(api)
-        return api
+        captured = _MarketCapture(api)
+        captures.append(captured)
+        return captured
 
     tqsdk.TqApi = controlled_api
     finished_error = getattr(exceptions, "BacktestFinished")
@@ -197,6 +334,9 @@ def run_tqsdk_strategy(request: TqSdkWorkerRequest) -> dict[str, Any]:
         tqsdk.TqApi = original_api
 
     api = created[0] if created else None
+    capture = captures[0] if captures else None
+    if capture is not None:
+        capture.capture()
     before_close = _extract_simulation(sim, api)
     if api is not None:
         try:
@@ -205,6 +345,10 @@ def run_tqsdk_strategy(request: TqSdkWorkerRequest) -> dict[str, Any]:
             pass
     after_close = _extract_simulation(sim, None)
     extracted = after_close if after_close["account_curve"] else before_close
+    if extracted is after_close:
+        for name in ("orders", "positions", "final_account"):
+            if not extracted.get(name) and before_close.get(name):
+                extracted[name] = before_close[name]
     if execution_error is not None:
         raise TqSdkWorkerError(
             f"天勤策略执行失败: {type(execution_error).__name__}: {execution_error}"
@@ -212,6 +356,19 @@ def run_tqsdk_strategy(request: TqSdkWorkerRequest) -> dict[str, Any]:
     if api is None:
         raise TqSdkWorkerError("策略没有创建 TqApi，无法执行原生回测")
 
+    fallback_time = datetime.combine(
+        request.end_date, datetime.max.time(), tzinfo=timezone.utc
+    ).isoformat()
+    replay = build_tqsdk_replay(
+        run_id=request.task_id,
+        market_events=capture.events if capture is not None else [],
+        deals=extracted["deals"],
+        orders=extracted["orders"],
+        positions=extracted["positions"],
+        account_curve=extracted["account_curve"],
+        final_account=extracted["final_account"],
+        fallback_time=fallback_time,
+    )
     return {
         "contract_version": TQSDK_WORKER_CONTRACT,
         "ok": True,
@@ -219,7 +376,7 @@ def run_tqsdk_strategy(request: TqSdkWorkerRequest) -> dict[str, Any]:
         "platform": "tqsdk",
         "runtime_identity": f"tqsdk-{getattr(tqsdk, '__version__', 'unknown')}",
         "sandbox": {
-            "strength": "process_isolation_only",
+            "strength": "child_execution",
             "restricted_token": False,
             "job_object": False,
             "network_allowlist_enforced": False,
@@ -230,10 +387,7 @@ def run_tqsdk_strategy(request: TqSdkWorkerRequest) -> dict[str, Any]:
             "end_date": request.end_date.isoformat(),
         },
         **extracted,
-        "visual": {
-            "available": False,
-            "reason": "原生 TqSdk 图表事件尚未转换为统一 ReplayEvent",
-        },
+        **replay,
     }
 
 
@@ -254,6 +408,9 @@ def launch_tqsdk_worker(
     project_root: Path,
     timeout_seconds: int,
     runtime_pythonpaths: Sequence[Path] = (),
+    memory_mb: int | None = None,
+    cpu_cores: int | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """使用专用 Python 启动子进程，并限制继承环境与输出大小。"""
 
@@ -279,6 +436,25 @@ def launch_tqsdk_worker(
         for name in inherited_names
         if os.environ.get(name)
     }
+    username = _secret_from_environment(_AUTH_USER_ENV, _AUTH_USER_FILE_ENV)
+    password = _secret_from_environment(_AUTH_PASSWORD_ENV, _AUTH_PASSWORD_FILE_ENV)
+    if username:
+        child_env[_AUTH_USER_ENV] = username
+    if password:
+        child_env[_AUTH_PASSWORD_ENV] = password
+    child_env.update(_TQ_ENDPOINTS)
+    sandbox_user = os.getenv(_SANDBOX_USER_ENV, "").strip()
+    sandbox_password = _secret_from_environment(
+        "PXYBACKTEST_TQSDK_SANDBOX_PASSWORD", _SANDBOX_PASSWORD_FILE_ENV
+    )
+    sandbox_identity = (
+        SandboxIdentity(username=sandbox_user, password=sandbox_password)
+        if sandbox_user and sandbox_password
+        else None
+    )
+    if sandbox_identity is not None:
+        child_env["TEMP"] = str(request.task_root)
+        child_env["TMP"] = str(request.task_root)
     child_env["PYTHONPATH"] = os.pathsep.join(
         str(path.resolve()) for path in (project_root, *runtime_pythonpaths)
     )
@@ -290,22 +466,23 @@ def launch_tqsdk_worker(
         str(request_path),
     ]
     try:
-        completed = subprocess.run(
+        completed = launch_sandboxed_process(
             command,
-            cwd=str(request.task_root),
-            env=child_env,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=max(1, int(timeout_seconds)),
-            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
-            check=False,
+            cwd=request.task_root,
+            environment=child_env,
+            limits=SandboxLimits(
+                timeout_seconds=max(1, int(timeout_seconds)),
+                memory_mb=memory_mb or request.memory_mb,
+                cpu_cores=cpu_cores or request.cpu_cores,
+            ),
+            cancel_check=cancel_check,
+            identity=sandbox_identity,
         )
-    except subprocess.TimeoutExpired as exc:
+    except SandboxCancelledError as exc:
+        raise TqSdkWorkerError("天勤策略任务已取消") from exc
+    except SandboxTimeoutError as exc:
         raise TqSdkWorkerError("天勤策略子进程执行超时") from exc
-    if completed.returncode != 0:
+    if completed.exit_code != 0:
         try:
             failed_payload = json.loads(
                 request.result_path.read_text(encoding="utf-8")
@@ -319,9 +496,8 @@ def launch_tqsdk_worker(
         )
         if structured_error:
             raise TqSdkWorkerError(structured_error)
-        message = " ".join((completed.stderr or completed.stdout).split())[-2000:]
         raise TqSdkWorkerError(
-            f"天勤策略子进程退出码 {completed.returncode}: {message}"
+            f"天勤策略子进程退出码 {completed.exit_code}，且没有结构化错误"
         )
     try:
         payload = json.loads(request.result_path.read_text(encoding="utf-8"))
@@ -329,6 +505,7 @@ def launch_tqsdk_worker(
         raise TqSdkWorkerError("天勤策略子进程未生成有效结果") from exc
     if not isinstance(payload, dict) or not payload.get("ok"):
         raise TqSdkWorkerError(str(payload.get("error") or "天勤 worker 返回失败"))
+    payload["sandbox"] = completed.security_state()
     return payload
 
 

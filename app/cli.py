@@ -104,7 +104,13 @@ def _client(args: argparse.Namespace) -> BacktestApiClient:
 
 
 def _submit(client: BacktestApiClient, request_payload: dict[str, Any]) -> dict[str, Any]:
-    path = "/api/v2/tasks" if request_payload.get("schema_version") == 2 else "/api/v1/tasks"
+    if (
+        request_payload.get("contract_version")
+        == "pxybacktest.tqsdk-task-submission.v1"
+    ):
+        path = "/api/v2/tqsdk/tasks"
+    else:
+        path = "/api/v2/tasks" if request_payload.get("schema_version") == 2 else "/api/v1/tasks"
     result = client.request("POST", path, request_payload)
     if not isinstance(result, dict) or not result.get("task_id"):
         raise CliError("提交成功响应缺少 task_id")
@@ -159,6 +165,17 @@ def build_parser() -> argparse.ArgumentParser:
             / "vnpy_cta_native_v1.json"
         ),
     )
+    record_tqsdk = sub.add_parser(
+        "record-tqsdk", help="首次真实执行并记录天勤固定 Oracle 向量"
+    )
+    record_tqsdk.add_argument("--vector-output", required=True)
+    record_tqsdk.add_argument("--actual-output", default=None)
+    accept_tqsdk = sub.add_parser(
+        "accept-tqsdk", help="第二次独立执行天勤固定向量并生成三维门禁"
+    )
+    accept_tqsdk.add_argument("--vector", required=True)
+    accept_tqsdk.add_argument("--gate-output", required=True)
+    accept_tqsdk.add_argument("--actual-output", default=None)
 
     submit = sub.add_parser("submit", help="提交一个 JSON 回测任务")
     submit.add_argument("--request-file", required=True, help="SubmitBacktestRequest(V2) JSON 文件")
@@ -217,6 +234,62 @@ def main(argv: list[str] | None = None, *, output: TextIO | None = None) -> int:
             )
             _write_json(result.model_dump(mode="json"), out)
             return 0 if result.all_passed else 2
+        if args.command == "record-tqsdk":
+            from .tqsdk_acceptance import (
+                build_tqsdk_acceptance_vector,
+                run_tqsdk_acceptance_candidate,
+                write_json,
+            )
+
+            actual = run_tqsdk_acceptance_candidate()
+            vector = build_tqsdk_acceptance_vector(actual)
+            write_json(Path(args.vector_output), vector)
+            if args.actual_output:
+                write_json(Path(args.actual_output), actual)
+            _write_json(
+                {
+                    "recorded": True,
+                    "vector": str(Path(args.vector_output).resolve()),
+                    "vector_id": vector.vector_id,
+                    "next_step": "必须再次独立运行 accept-tqsdk，首次记录不能直接放行",
+                },
+                out,
+            )
+            return 0
+        if args.command == "accept-tqsdk":
+            from .parity_acceptance import AcceptanceVector, compare_acceptance_vector
+            from .tqsdk_acceptance import (
+                build_tqsdk_acceptance_gate,
+                run_tqsdk_acceptance_candidate,
+                write_json,
+            )
+
+            vector = AcceptanceVector.model_validate(_read_json(args.vector))
+            actual = run_tqsdk_acceptance_candidate()
+            result = compare_acceptance_vector(vector, actual)
+            if args.actual_output:
+                write_json(Path(args.actual_output), actual)
+            if not result.all_passed:
+                _write_json(result.model_dump(mode="json"), out)
+                return 2
+            try:
+                gate = build_tqsdk_acceptance_gate(
+                    vector=vector,
+                    actual=actual,
+                    result=result,
+                )
+            except ValueError as exc:
+                raise CliError(str(exc)) from exc
+            write_json(Path(args.gate_output), gate)
+            _write_json(
+                {
+                    "all_passed": True,
+                    "gate": str(Path(args.gate_output).resolve()),
+                    "acceptance": result.model_dump(mode="json"),
+                },
+                out,
+            )
+            return 0
         if args.command == "health":
             # 健康接口不需要服务令牌。
             client = BacktestApiClient(

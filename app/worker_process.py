@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import queue
 import subprocess
 import sys
@@ -17,6 +18,7 @@ A_SHARE_ADAPTER_CONTRACT = "pxybacktest.engine-adapter.a-share.v1"
 DAA_ENGINE_TYPES = {"a_share_portfolio", "factor_matrix", "event_sentiment"}
 ML_ENGINE_TYPES = {"ml_factor", "deep_learning"}
 LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
+TQSDK_ENGINE_TYPES = {"tqsdk_native"}
 RELIABLE_EVENT_TIMEOUT_SECONDS = 5.0
 logger = logging.getLogger("backtest_service")
 
@@ -369,6 +371,16 @@ def run_preloaded_worker(
             command_queue,
         )
         return
+    if engine_type in TQSDK_ENGINE_TYPES:
+        run_tqsdk_queue_worker(
+            task_id,
+            request,
+            result_path,
+            job_dir,
+            event_queue,
+            command_queue,
+        )
+        return
     run_backtest_worker(
         task_id,
         request,
@@ -379,6 +391,242 @@ def run_preloaded_worker(
         command_queue,
         daa_root=daa_root,
     )
+
+
+def _tqsdk_result_v2(
+    *,
+    task_id: str,
+    task: dict[str, Any],
+    native: dict[str, Any],
+) -> dict[str, Any]:
+    """把天勤原生结果封装为统一 task-result.v2。"""
+
+    execution = dict(task.get("execution") or {})
+    initial_capital = float(execution.get("capital") or 1_000_000)
+    final_account = dict(native.get("final_account") or {})
+    final_equity = float(
+        final_account.get("balance")
+        or final_account.get("equity")
+        or initial_capital
+    )
+    deals = list(native.get("deals") or [])
+    orders_raw = native.get("orders") or {}
+    orders = (
+        list(orders_raw.values()) if isinstance(orders_raw, dict) else list(orders_raw)
+    )
+    positions_raw = native.get("positions") or {}
+    if isinstance(positions_raw, dict):
+        positions = [
+            {"symbol": str(symbol), **dict(value)}
+            for symbol, value in positions_raw.items()
+            if isinstance(value, dict)
+        ]
+    else:
+        positions = list(positions_raw)
+    account_curve = list(native.get("account_curve") or [])
+    manifest_sha256 = str(native.get("data_manifest_sha256") or "")
+    snapshot_id = f"tqsdk_v1_{manifest_sha256[:32]}"
+    strategy = dict(task.get("strategy") or {})
+    replay_events = list(native.get("replay_events") or [])
+    result = {
+        "schema_version": 2,
+        "contract_version": "pxybacktest.task-result.v2",
+        "task_id": task_id,
+        "engine_type": "tqsdk_native",
+        "strategy": strategy,
+        "data_snapshot": {
+            "provider": "tqsdk",
+            "snapshot_id": snapshot_id,
+            "manifest_sha256": manifest_sha256,
+            "captured_event_count": int(
+                (native.get("visual") or {}).get("market_event_count") or 0
+            ),
+            "capture_policy": "materialize_subscribed_market_events",
+        },
+        "run": {
+            "universe": task.get("universe") or {},
+            "period": task.get("period") or {},
+            "execution": execution,
+            "parameters": task.get("parameters") or {},
+        },
+        "metrics": {
+            "initial_capital": initial_capital,
+            "final_equity": final_equity,
+            "net_profit": final_equity - initial_capital,
+            "total_return": final_equity / initial_capital - 1.0,
+            "n_trades": len(deals),
+            "commission": sum(float(item.get("commission") or 0) for item in deals),
+            **dict(native.get("native_metrics") or {}),
+        },
+        "curves": {"equity": account_curve},
+        "orders": orders,
+        "deals": deals,
+        "positions": positions,
+        "execution_snapshot": native.get("execution_snapshot") or {},
+        "replay_audit": native.get("replay_audit") or {},
+        "diagnostics": {
+            "adapter": "tqsdk.native.v1",
+            "runtime_identity": native.get("runtime_identity"),
+            "sandbox": native.get("sandbox") or {},
+            "native_trade_log_sha256": native.get("native_trade_log_sha256"),
+            "data_manifest_sha256": manifest_sha256,
+            "pause_scope": "replay_only",
+            "native_execution_pause_supported": False,
+            "warnings": [
+                "暂停和调速只驱动原生计算完成后的 ReplayClock；取消会终止整个受限进程树。"
+            ],
+        },
+        "reproducibility": {
+            "strategy_source_sha256": strategy.get("source_hash"),
+            "data_manifest_sha256": manifest_sha256,
+            "runtime_identity": native.get("runtime_identity"),
+            "event_log_sha256": (native.get("replay_audit") or {}).get(
+                "chain_sha256"
+            ),
+            "event_count": len(replay_events),
+        },
+        "_replay_events": replay_events,
+    }
+    result["reproducibility"]["result_sha256"] = _stable_hash(
+        {key: value for key, value in result.items() if key != "_replay_events"}
+    )
+    return result
+
+
+def run_tqsdk_queue_worker(
+    task_id: str,
+    request: dict[str, Any],
+    result_path: str,
+    job_dir: str,
+    event_queue,
+    command_queue,
+) -> None:
+    """在现有用户隔离队列中执行天勤原生安全沙箱。"""
+
+    cancelled = False
+    deferred_commands: list[dict[str, Any]] = []
+    work_dir = Path(job_dir).resolve()
+    final_path = Path(result_path)
+    try:
+        task = request.get("_task_contract")
+        source_code = request.get("_tqsdk_source_code")
+        permissions = request.get("_tqsdk_permissions")
+        if not isinstance(task, dict) or not isinstance(source_code, str):
+            raise ValueError("天勤 worker 缺少任务契约或策略源码")
+        if not isinstance(permissions, dict):
+            raise ValueError("天勤 worker 缺少沙箱权限契约")
+        strategy = dict(task.get("strategy") or {})
+        expected_hash = str(strategy.get("source_hash") or "").lower()
+        actual_hash = hashlib.sha256(source_code.encode("utf-8")).hexdigest()
+        if not expected_hash or actual_hash != expected_hash:
+            raise ValueError("天勤策略源码 SHA256 与任务契约不一致")
+        entrypoint = str(strategy.get("entrypoint") or "strategy.py")
+        if Path(entrypoint).name != entrypoint or not entrypoint.lower().endswith(".py"):
+            raise ValueError("天勤策略入口必须是任务目录内的 Python 文件名")
+
+        work_dir.mkdir(parents=True, exist_ok=True)
+        strategy_path = work_dir / entrypoint
+        strategy_path.write_text(source_code, encoding="utf-8", newline="\n")
+        native_result_path = work_dir / "tqsdk-native-result.json"
+        period = dict(task.get("period") or {})
+        execution = dict(task.get("execution") or {})
+        python_raw = os.getenv("PXYBACKTEST_TQSDK_PYTHON", "").strip()
+        python_path = (
+            Path(python_raw)
+            if python_raw
+            else Path(__file__).resolve().parents[1]
+            / ".venv"
+            / "Scripts"
+            / "python.exe"
+        )
+
+        def cancel_requested() -> bool:
+            nonlocal cancelled
+            cancelled = cancelled or _drain_worker_commands(
+                command_queue, deferred_commands
+            )
+            return cancelled
+
+        if cancel_requested():
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
+        _emit(
+            event_queue,
+            "state",
+            {
+                "status": "running",
+                "phase": "running_tqsdk_native",
+                "progress": 5.0,
+                "pause_scope": "replay_only",
+            },
+        )
+
+        from app.tqsdk_native_worker import (
+            TqSdkWorkerRequest,
+            launch_tqsdk_worker,
+        )
+
+        native = launch_tqsdk_worker(
+            TqSdkWorkerRequest(
+                task_id=task_id,
+                task_root=work_dir,
+                strategy_path=strategy_path,
+                result_path=native_result_path,
+                start_date=period.get("start"),
+                end_date=period.get("end"),
+                initial_balance=float(execution.get("capital") or 1_000_000),
+                memory_mb=int(permissions.get("memory_mb") or 4096),
+                cpu_cores=int(permissions.get("cpu_cores") or 1),
+            ),
+            python_executable=python_path,
+            project_root=Path(__file__).resolve().parents[1],
+            timeout_seconds=int(permissions.get("timeout_seconds") or 3600),
+            cancel_check=cancel_requested,
+        )
+        sandbox = dict(native.get("sandbox") or {})
+        if not sandbox.get("submit_ready"):
+            raise RuntimeError("天勤网络白名单部署证明缺失，队列拒绝保存执行结果")
+
+        result = _tqsdk_result_v2(task_id=task_id, task=task, native=native)
+        outcome = _replay_non_cta_result(
+            event_queue,
+            command_queue,
+            task_id=task_id,
+            request=request,
+            result=result,
+            engine_type="tqsdk_native",
+            deferred_commands=deferred_commands,
+        )
+        _atomic_json_write(final_path, result)
+        if not outcome["complete"]:
+            _emit(
+                event_queue,
+                "cancelled",
+                {
+                    "result_path": str(final_path),
+                    "result_available": True,
+                    "partial": True,
+                    "processed_events": outcome["processed_events"],
+                },
+                terminal=True,
+            )
+            return
+        _emit(
+            event_queue,
+            "completed",
+            {"result_path": str(final_path), "progress": 100.0},
+            terminal=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if cancelled or "已取消" in str(exc):
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
+        _emit(
+            event_queue,
+            "failed",
+            {"error": f"天勤原生回测失败: {type(exc).__name__}: {exc}"},
+            terminal=True,
+        )
 
 
 def run_microstructure_worker(
@@ -818,6 +1066,13 @@ def _replay_non_cta_result(
     pending = deferred_commands if deferred_commands is not None else []
     original_audit = result.get("replay_audit") or {}
     complete_stream = int(original_audit.get("event_count") or 0) == len(replay_events)
+    replay_source = (
+        "DAA"
+        if engine_type in DAA_ENGINE_TYPES
+        else "tqsdk-native"
+        if engine_type in TQSDK_ENGINE_TYPES
+        else "PXYDATA"
+    )
 
     def read_commands() -> list[dict[str, Any]]:
         commands = list(pending)
@@ -847,7 +1102,7 @@ def _replay_non_cta_result(
         replay.update(
             {
                 "contract": "pxybacktest.replay.v1",
-                "source": "DAA" if engine_type in DAA_ENGINE_TYPES else "PXYDATA",
+                "source": replay_source,
                 "execution_stream": (
                     "complete_ordered_audited"
                     if complete_stream
@@ -892,7 +1147,7 @@ def _replay_non_cta_result(
     replay.update(
         {
             "contract": "pxybacktest.replay.v1",
-            "source": "DAA" if engine_type in DAA_ENGINE_TYPES else "PXYDATA",
+            "source": replay_source,
             "execution_stream": (
                 "complete_ordered_audited"
                 if complete_stream

@@ -54,6 +54,7 @@ from .runner_registry import (
 )
 from .store import TaskNotFoundError
 from .strategy_package import StrategyPackage
+from .tqsdk_submission import TqSdkTaskSubmission
 
 A_SHARE_WARMUP_CALENDAR_DAYS = 120
 LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
@@ -441,6 +442,46 @@ def create_app(
         """只校验并解析策略包，不创建任务或执行第三方策略。"""
 
         return runner_registry.resolve(body)
+
+    @app.post("/api/v2/tqsdk/tasks", status_code=status.HTTP_202_ACCEPTED)
+    async def submit_tqsdk_task(
+        body: TqSdkTaskSubmission,
+        identity: TrustedIdentity = Depends(identity_dependency),
+    ) -> dict:
+        """提交天勤原生策略；安全和三维验收未通过时保持关闭。"""
+
+        resolution = runner_registry.resolve(body.package)
+        if not resolution.get("resolved"):
+            raise HTTPException(
+                status_code=422,
+                detail=str(resolution.get("reason") or "天勤运行器不匹配"),
+            )
+        if not resolution.get("submit_ready"):
+            raise HTTPException(
+                status_code=409,
+                detail=str(
+                    resolution.get("reason")
+                    or "天勤逐笔成交、账户、可视化或安全门禁尚未全部通过"
+                ),
+            )
+        try:
+            task_id = await task_manager.submit(
+                user_id=identity.user_id,
+                source_node=identity.source_node,
+                request=body.to_worker_request(),
+            )
+        except QueueLimitError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        return {
+            "success": True,
+            "task_id": task_id,
+            "schema_version": 2,
+            "contract_version": "pxybacktest.task-result.v2",
+            "engine_type": "tqsdk_native",
+            "execution_backend": "windows-restricted-sandbox",
+            "event_stream": "delta-poll",
+            "pause_scope": "replay_only",
+        }
 
     @app.post("/api/v2/workflows/validate")
     async def validate_workflow_route(

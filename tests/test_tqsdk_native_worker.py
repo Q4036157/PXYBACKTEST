@@ -60,6 +60,14 @@ class TqSim:
             }
         }
 
+class FakeFrame:
+    def to_dict(self, orient):
+        assert orient == "records"
+        return [
+            {"datetime": 1788231540000000000, "open": 499.8, "high": 500.1, "low": 499.7, "close": 500.0, "volume": 12},
+            {"datetime": 1788231600000000000, "open": 500.0, "high": 500.4, "low": 499.9, "close": 500.2, "volume": 15},
+        ]
+
 class TqApi:
     def __init__(self, account=None, backtest=None, auth=None, **kwargs):
         self.account = account
@@ -68,6 +76,9 @@ class TqApi:
 
     def wait_update(self, deadline=None):
         raise BacktestFinished()
+
+    def get_kline_serial(self, symbol, duration_seconds, data_length):
+        return FakeFrame()
 
     def get_order(self):
         return {"O1": {"status": "FINISHED"}}
@@ -89,7 +100,7 @@ class TqApi:
 def _request(task_root: Path) -> TqSdkWorkerRequest:
     strategy = task_root / "strategy.py"
     strategy.write_text(
-        "from tqsdk import TqApi\napi = TqApi()\nwhile True:\n    api.wait_update()\n",
+        "from tqsdk import TqApi\napi = TqApi()\nbars = api.get_kline_serial('SHFE.au2612', 60, 2)\nwhile True:\n    api.wait_update()\n",
         encoding="utf-8",
     )
     return TqSdkWorkerRequest(
@@ -125,9 +136,15 @@ def test_tqsdk_worker_runs_original_script_in_dedicated_process(
     assert result["deals"][0]["direction"] == "buy"
     assert result["account_curve"][0]["balance"] == 100090.0
     assert result["native_metrics"] == {"ror": 0.0009}
-    assert result["sandbox"]["strength"] == "process_isolation_only"
+    assert result["sandbox"]["strength"] == "windows_partial"
+    assert result["sandbox"]["restricted_token"] is True
+    assert result["sandbox"]["job_object"] is True
+    assert result["sandbox"]["network_allowlist_enforced"] is False
     assert result["sandbox"]["submit_ready"] is False
-    assert result["visual"]["available"] is False
+    assert result["visual"]["available"] is True
+    assert result["visual"]["bar_history_count"] == 2
+    assert result["execution_snapshot"]["bar_history_count"] == 2
+    assert len(result["replay_events"]) == 6
 
 
 def test_tqsdk_worker_requires_controlled_credentials(

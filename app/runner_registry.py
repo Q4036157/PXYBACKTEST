@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Mapping
@@ -23,6 +24,8 @@ from .strategy_package import (
     VerificationLevel,
 )
 from .parity_acceptance import PARITY_ACCEPTANCE_CONTRACT
+from .tqsdk_acceptance import load_tqsdk_acceptance_gate
+from .windows_sandbox import network_policy_attestation
 
 
 RUNNER_REGISTRY_CONTRACT = "pxybacktest.runner-registry.v1"
@@ -73,6 +76,7 @@ class RunnerProbeConfig:
     tqsdk_python: Path | None
     mt4_terminal: Path
     mt5_terminal: Path
+    tqsdk_acceptance_path: Path | None = None
 
     @classmethod
     def from_environment(
@@ -84,6 +88,9 @@ class RunnerProbeConfig:
     ) -> "RunnerProbeConfig":
         values = environ if environ is not None else os.environ
         tq_raw = values.get("PXYBACKTEST_TQSDK_PYTHON", "").strip()
+        tq_acceptance_raw = values.get(
+            "PXYBACKTEST_TQSDK_ACCEPTANCE_FILE", ""
+        ).strip()
         return cls(
             project_root=(project_root or Path(__file__).resolve().parents[1]),
             pxylh_root=pxylh_root,
@@ -99,6 +106,9 @@ class RunnerProbeConfig:
                     "PXYBACKTEST_MT5_TERMINAL",
                     r"D:\x1\x2\MetaTrader 5 EXNESS\terminal64.exe",
                 )
+            ),
+            tqsdk_acceptance_path=(
+                Path(tq_acceptance_raw) if tq_acceptance_raw else None
             ),
         )
 
@@ -213,6 +223,36 @@ def _venv_module_installed(python: Path | None, module: str) -> bool:
     return any(path.is_dir() or path.with_suffix(".py").is_file() for path in candidates)
 
 
+def _venv_distribution_version(python: Path | None, distribution: str) -> str | None:
+    """只读取 dist-info 元数据，不在 API 进程导入第三方运行时。"""
+
+    if python is None or not python.is_file():
+        return None
+    venv_root = python.parent.parent
+    site_roots = [
+        venv_root / "Lib" / "site-packages",
+        venv_root / "lib" / "site-packages",
+    ]
+    lib_root = venv_root / "lib"
+    if lib_root.is_dir():
+        site_roots.extend(lib_root.glob("python*/site-packages"))
+    normalized = distribution.replace("-", "_").lower()
+    for site_root in site_roots:
+        if not site_root.is_dir():
+            continue
+        for metadata in sorted(site_root.glob("*.dist-info/METADATA")):
+            stem = metadata.parent.name.removesuffix(".dist-info")
+            if not stem.lower().startswith(f"{normalized}-"):
+                continue
+            try:
+                for line in metadata.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("Version:"):
+                        return line.partition(":")[2].strip() or None
+            except OSError:
+                continue
+    return None
+
+
 def build_runner_registry(config: RunnerProbeConfig) -> RunnerRegistry:
     """从当前源码与显式运行时路径构建注册表，不执行第三方代码。"""
 
@@ -233,10 +273,76 @@ def build_runner_registry(config: RunnerProbeConfig) -> RunnerRegistry:
     tq_python_configured = bool(
         config.tqsdk_python is not None and config.tqsdk_python.is_file()
     )
-    tq_runtime_detected = _venv_module_installed(config.tqsdk_python, "tqsdk")
+    tq_version = _venv_distribution_version(config.tqsdk_python, "tqsdk")
+    tq_runtime_detected = bool(
+        _venv_module_installed(config.tqsdk_python, "tqsdk")
+        and tq_version
+        and tq_version.startswith("3.10.")
+    )
+    tq_strategy_path = (
+        config.project_root
+        / "app"
+        / "acceptance_strategies"
+        / "tqsdk_native_v1.py"
+    )
+    tq_strategy_sha256 = (
+        hashlib.sha256(tq_strategy_path.read_bytes()).hexdigest()
+        if tq_strategy_path.is_file()
+        else None
+    )
     tq_adapter_ready = (
         config.project_root / "app" / "tqsdk_native_worker.py"
-    ).is_file()
+    ).is_file() and all(
+        (config.project_root / "app" / name).is_file()
+        for name in (
+            "windows_sandbox.py",
+            "tqsdk_replay.py",
+            "tqsdk_submission.py",
+            "tqsdk_acceptance.py",
+            "worker_process.py",
+        )
+    ) and tq_strategy_sha256 is not None
+    network_enforced, _network_policy_id, network_policy_sha256 = (
+        network_policy_attestation()
+    )
+    tq_gate = load_tqsdk_acceptance_gate(
+        config.tqsdk_acceptance_path,
+        network_policy_sha256=network_policy_sha256,
+        runtime_identity=f"tqsdk-{tq_version}" if tq_version else None,
+        strategy_source_sha256=tq_strategy_sha256,
+    )
+    tq_parity = {
+        name: (
+            str(tq_gate.evidence[name].get("status") or "not_verified")
+            if tq_gate is not None
+            else "not_verified"
+        )
+        for name in PARITY_DIMENSIONS
+    }
+    tq_submit_ready = bool(
+        tq_runtime_detected
+        and tq_adapter_ready
+        and os.name == "nt"
+        and network_enforced
+        and tq_gate is not None
+        and tq_gate.all_passed
+    )
+    if tq_submit_ready:
+        tq_reason = None
+    elif not tq_runtime_detected:
+        tq_reason = (
+            "专用 Python 尚未安装 tqsdk 3.10.x"
+            if tq_python_configured
+            else "未配置专用 TqSdk Python（PXYBACKTEST_TQSDK_PYTHON）"
+        )
+    elif os.name != "nt":
+        tq_reason = "天勤原生安全沙箱仅在 Windows 工作站开放"
+    elif not network_enforced:
+        tq_reason = "受限令牌和 Job Object 已实现，但 PXYOPS 网络白名单部署证明缺失"
+    elif tq_gate is None:
+        tq_reason = "天勤真实固定向量的逐笔成交、账户和可视化三维门禁尚未通过"
+    else:
+        tq_reason = "天勤安全或三维验收门禁不完整"
     mt4_runtime_detected = config.mt4_terminal.is_file()
     mt5_runtime_detected = config.mt5_terminal.is_file()
 
@@ -273,26 +379,28 @@ def build_runner_registry(config: RunnerProbeConfig) -> RunnerRegistry:
                 platform=SourcePlatform.TQSDK,
                 integration_phase=1,
                 adapter_id="tqsdk-native",
-                adapter_version="process-isolation-v1",
+                adapter_version="windows-restricted-v1",
                 aliases=["tqsdk_native"],
                 modes=[RunnerMode.NATIVE_SANDBOX, RunnerMode.COMPAT],
                 execution_semantics=["tqsdk"],
                 event_kinds=market_events,
                 runtime_detected=tq_runtime_detected,
                 adapter_ready=tq_adapter_ready,
-                submit_ready=False,
+                submit_ready=tq_submit_ready,
                 runtime_identity=(
-                    "configured-tqsdk-python" if tq_runtime_detected else None
-                ),
-                reason=(
-                    "TqSdk worker 已实现进程隔离，但受限令牌、Job Object、网络白名单和任务队列尚未接通"
+                    tq_gate.runtime_identity
+                    if tq_gate is not None
+                    else f"tqsdk-{tq_version}"
                     if tq_runtime_detected
-                    else (
-                        "专用 Python 尚未安装 tqsdk 3.10.x"
-                        if tq_python_configured
-                        else "未配置专用 TqSdk Python（PXYBACKTEST_TQSDK_PYTHON）"
-                    )
+                    else None
                 ),
+                verification_level=(
+                    VerificationLevel.PARITY_VERIFIED
+                    if tq_submit_ready
+                    else VerificationLevel.IMPORTED
+                ),
+                parity_dimensions=tq_parity,  # type: ignore[arg-type]
+                reason=tq_reason,
             ),
             RunnerCapability(
                 runner_id="mt4_native",

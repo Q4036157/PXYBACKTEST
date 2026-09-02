@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from app import tqsdk_native_worker
 from app.tqsdk_native_worker import (
     TqSdkWorkerError,
     TqSdkWorkerRequest,
@@ -193,6 +194,34 @@ def test_tqsdk_worker_structures_strategy_system_exit(
             timeout_seconds=5,
             runtime_pythonpaths=[runtime],
         )
+
+
+def test_worker_main_preserves_primary_error_when_result_write_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    task_root = tmp_path / "task"
+    task_root.mkdir()
+    request = _request(task_root)
+    request_path = task_root / "request.json"
+    request_path.write_text(request.model_dump_json(), encoding="utf-8")
+    diagnostic_path = task_root / "bootstrap-error.log"
+
+    def fail_strategy(_request: TqSdkWorkerRequest) -> dict[str, object]:
+        raise RuntimeError("primary-worker-failure")
+
+    def fail_result_write(_path: Path, _payload: object) -> None:
+        raise OSError("result-write-failure")
+
+    monkeypatch.setenv(
+        "PXYBACKTEST_TQSDK_BOOTSTRAP_ERROR", str(diagnostic_path)
+    )
+    monkeypatch.setattr(tqsdk_native_worker, "run_tqsdk_strategy", fail_strategy)
+    monkeypatch.setattr(tqsdk_native_worker, "_write_result", fail_result_write)
+
+    assert tqsdk_native_worker.main(["--request", str(request_path)]) == 1
+    diagnostic = diagnostic_path.read_text(encoding="utf-8")
+    assert "RuntimeError: primary-worker-failure" in diagnostic
+    assert "SystemExit: 1" not in diagnostic
 
 
 def test_tqsdk_worker_redacts_credentials_from_structured_error(

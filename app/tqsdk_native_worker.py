@@ -14,6 +14,7 @@ import math
 import os
 import runpy
 import sys
+import traceback
 from collections.abc import Mapping
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -567,6 +568,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_result(request.result_path, result)
         return 0
     except BaseException as exc:  # noqa: BLE001 - SystemExit 也必须落盘
+        # 先保留第一现场。结果 JSON 若因 ACL、路径或磁盘问题写入失败，
+        # 外层 bootstrap 依然能读到真实异常，而不是只看到 SystemExit: 1。
+        diagnostic_raw = os.getenv(_BOOTSTRAP_ERROR_ENV, "").strip()
+        if diagnostic_raw:
+            try:
+                Path(diagnostic_raw).write_text(
+                    traceback.format_exc(), encoding="utf-8"
+                )
+            except OSError:
+                pass
         error = {
             "contract_version": TQSDK_WORKER_CONTRACT,
             "ok": False,

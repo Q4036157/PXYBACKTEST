@@ -100,7 +100,12 @@ class TqApi:
 def _request(task_root: Path) -> TqSdkWorkerRequest:
     strategy = task_root / "strategy.py"
     strategy.write_text(
-        "from tqsdk import TqApi\napi = TqApi()\nbars = api.get_kline_serial('SHFE.au2612', 60, 2)\nwhile True:\n    api.wait_update()\n",
+        "import sys\n"
+        "assert 'app.windows_sandbox' not in sys.modules\n"
+        "from tqsdk import TqApi\n"
+        "api = TqApi()\n"
+        "bars = api.get_kline_serial('SHFE.au2612', 60, 2)\n"
+        "while True:\n    api.wait_update()\n",
         encoding="utf-8",
     )
     return TqSdkWorkerRequest(

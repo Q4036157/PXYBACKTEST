@@ -23,13 +23,6 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .kernel import stable_hash
 from .tqsdk_replay import build_tqsdk_replay
-from .windows_sandbox import (
-    SandboxCancelledError,
-    SandboxIdentity,
-    SandboxLimits,
-    SandboxTimeoutError,
-    launch_sandboxed_process,
-)
 
 
 TQSDK_WORKER_CONTRACT = "pxybacktest.tqsdk-native-worker.v1"
@@ -441,6 +434,16 @@ def launch_tqsdk_worker(
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """使用专用 Python 启动子进程，并限制继承环境与输出大小。"""
+
+    # 仅父进程需要 ctypes/Win32 沙箱 API。延迟导入可避免已经受限的策略
+    # 子进程再次加载 _ctypes.pyd；安全令牌和 Job Object 在此调用之前已建立。
+    from .windows_sandbox import (
+        SandboxCancelledError,
+        SandboxIdentity,
+        SandboxLimits,
+        SandboxTimeoutError,
+        launch_sandboxed_process,
+    )
 
     python_path = python_executable.resolve()
     if not python_path.is_file():

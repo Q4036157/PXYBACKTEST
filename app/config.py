@@ -18,12 +18,12 @@ class Settings:
     service_token: str
     # 工作站实际 DAA 仓库目录；可通过 PXYBACKTEST_DAA_ROOT 覆盖。
     daa_root: Path = Path(r"D:\x1\x2\DAA")
-    pxydata_data_root: Path = Path(r"D:\x1\pxy-runtime\PXYDATA\data")
+    pxydata_data_root: Path = Path(r"E:\pxy-runtime\PXYDATA\data")
     pxydata_base_url: str = "http://127.0.0.1:3020"
     pxydata_api_key: str = ""
     llm_base_url: str = ""
     llm_api_key: str = ""
-    custom_nodes_root: Path = Path(r"D:\x1\pxy-runtime\PXYBACKTEST\custom_nodes")
+    custom_nodes_root: Path = Path(r"E:\pxy-runtime\PXYBACKTEST\custom_nodes")
     max_concurrent_tasks: int = 1
     max_queued_per_user: int = 3
     render_interval_ms: int = 50

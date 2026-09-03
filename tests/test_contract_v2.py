@@ -614,8 +614,71 @@ def test_v2_capabilities_degrades_without_failing_when_daa_times_out(
 
     assert response.status_code == 200
     engines = {item["id"]: item for item in response.json()["engines"]}
-    assert engines["vnpy_cta"]["available"] is True
+    assert engines["vnpy_cta"]["available"] is False
+    assert engines["vnpy_cta"]["runtime_available"] is False
+    assert engines["vnpy_cta"]["blockers"]
     assert engines["a_share_portfolio"]["available"] is False
+
+
+def test_v2_capabilities_blocks_data_engine_when_certification_fails(
+    tmp_path: Path,
+) -> None:
+    class QualitySnapshots(FakeSnapshotClient):
+        async def get_data_quality(self, required_datasets: list[str]) -> dict:
+            assert "kline_daily" in required_datasets
+            return {
+                "report": {
+                    "report_id": "quality-failed",
+                    "generated_at_utc": "2026-09-03T00:00:00+00:00",
+                    "certification_available": True,
+                    "scan_complete": True,
+                    "stale": False,
+                    "datasets": {
+                        name: {
+                            "status": "healthy",
+                            "quality_grade": "PASS",
+                        }
+                        for name in required_datasets
+                    },
+                }
+            }
+
+    settings = _settings(tmp_path)
+    _enable_a_share_adapter(settings)
+    snapshots = QualitySnapshots(_a_share_snapshot())
+    manager = StoreOnlyManager(TaskStore(settings.database_path))
+    app = create_app(
+        settings,
+        manager,
+        snapshots,
+        FakeDaaClient(),  # type: ignore[arg-type]
+    )
+
+    async def failed_quality(required_datasets: list[str]) -> dict:
+        payload = await QualitySnapshots.get_data_quality(
+            snapshots, required_datasets
+        )
+        payload["report"]["datasets"]["kline_daily"] = {
+            "status": "blocked",
+            "quality_grade": "FAIL",
+        }
+        return payload
+
+    snapshots.get_data_quality = failed_quality  # type: ignore[method-assign]
+    with TestClient(app) as client:
+        response = client.get("/api/v2/capabilities", headers=_headers())
+
+    engine = next(
+        item
+        for item in response.json()["engines"]
+        if item["id"] == "a_share_portfolio"
+    )
+    assert engine["runtime_available"] is True
+    assert engine["available"] is False
+    assert engine["submit_ready"] is False
+    assert engine["required_datasets"] == ["kline_daily"]
+    assert "kline_daily" in engine["blockers"][0]
+    assert engine["quality_report_id"] == "quality-failed"
 
 
 def test_v2_model_rejects_invalid_data_choice_and_compares_actual_instants() -> None:

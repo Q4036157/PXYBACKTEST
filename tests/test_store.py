@@ -4,7 +4,12 @@ from threading import Barrier
 
 import pytest
 
-from app.store import QueueLimitReachedError, TaskNotFoundError, TaskStore
+from app.store import (
+    IdempotencyConflictError,
+    QueueLimitReachedError,
+    TaskNotFoundError,
+    TaskStore,
+)
 from app import store as store_module
 from app.config import Settings
 from app.manager import TaskManager
@@ -74,6 +79,59 @@ def test_create_task_if_queue_available_is_atomic_across_store_instances(
     assert sorted(results) == [False, True]
 
 
+def test_idempotency_key_reuses_same_task_and_rejects_changed_request(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(tmp_path / "backtest.sqlite3")
+    first = store.create_task_if_queue_available(
+        user_id="user-a",
+        source_node="204",
+        request=request_payload(),
+        max_queued=3,
+        idempotency_key="submit-1",
+    )
+    replay = store.create_task_if_queue_available(
+        user_id="user-a",
+        source_node="109",
+        request=request_payload(),
+        max_queued=3,
+        idempotency_key="submit-1",
+    )
+
+    assert replay.task_id == first.task_id
+    assert replay.idempotent_replay is True
+    changed = request_payload()
+    changed["capital"] = 200_000
+    with pytest.raises(IdempotencyConflictError):
+        store.create_task_if_queue_available(
+            user_id="user-a",
+            source_node="204",
+            request=changed,
+            max_queued=3,
+            idempotency_key="submit-1",
+        )
+
+
+def test_same_idempotency_key_is_isolated_by_user(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path / "backtest.sqlite3")
+    first = store.create_task_if_queue_available(
+        user_id="user-a",
+        source_node="204",
+        request=request_payload(),
+        max_queued=3,
+        idempotency_key="shared-key",
+    )
+    second = store.create_task_if_queue_available(
+        user_id="user-b",
+        source_node="204",
+        request=request_payload(),
+        max_queued=3,
+        idempotency_key="shared-key",
+    )
+
+    assert first.task_id != second.task_id
+
+
 def test_store_applies_incremental_bar_events(tmp_path: Path) -> None:
     store = TaskStore(tmp_path / "backtest.sqlite3")
     task_id = store.create_task(
@@ -99,6 +157,52 @@ def test_store_applies_incremental_bar_events(tmp_path: Path) -> None:
     assert task["event_seq"] == second_seq
     events = store.events_after("user-a", task_id, first_seq)
     assert [event["seq"] for event in events] == [second_seq]
+
+
+def test_terminal_task_publishes_seven_day_result_expiration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.time, "time", lambda: 1_000.0)
+    store = TaskStore(tmp_path / "backtest.sqlite3")
+    task_id = store.create_task(
+        user_id="user-a", source_node="204", request=request_payload()
+    )
+
+    store.append_event(
+        task_id,
+        "completed",
+        {"result_path": str(tmp_path / "result.json")},
+    )
+
+    task = store.get_task("user-a", task_id)
+    listed = store.list_tasks("user-a")[0]
+    assert task["completed_at"] == 1_000.0
+    assert task["expires_at"] == 1_000.0 + 7 * 24 * 60 * 60
+    assert listed["expires_at"] == task["expires_at"]
+
+
+def test_expired_result_is_marked_unavailable_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.time, "time", lambda: 1_000.0)
+    store = TaskStore(tmp_path / "backtest.sqlite3")
+    task_id = store.create_task(
+        user_id="user-a", source_node="204", request=request_payload()
+    )
+    store.append_event(
+        task_id,
+        "completed",
+        {"result_path": str(tmp_path / "result.json")},
+    )
+
+    expired = store.expire_due_results(1_000.0 + 7 * 24 * 60 * 60 + 1)
+
+    assert expired == [task_id]
+    assert store.expire_due_results(9_999_999.0) == []
+    task = store.get_task("user-a", task_id)
+    assert task["result_available"] is False
+    assert task["result_expired"] is True
+    assert store.get_result_path(task_id) == Path("")
 
 
 def test_store_keeps_all_replayed_bars_in_execution_snapshot(tmp_path: Path) -> None:
@@ -238,74 +342,69 @@ def test_store_persists_unified_execution_snapshot_for_resync(tmp_path: Path) ->
     assert task["execution_snapshot"]["bars"]["BTC"]["close"] == 100
 
 
-def test_store_prunes_events_by_interval_instead_of_every_batch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(store_module, "EVENT_RETENTION", 5)
-    monkeypatch.setattr(store_module, "EVENT_PRUNE_INTERVAL", 3)
+def test_store_keeps_complete_append_only_event_history(tmp_path: Path) -> None:
     store = TaskStore(tmp_path / "backtest.sqlite3")
     task_id = store.create_task(
         user_id="user-a", source_node="204", request=request_payload()
     )
 
-    store.append_events(task_id, [("state", {"progress": 1})] * 2)
-    assert task_id not in store._last_pruned_seq
+    sequences = store.append_events(
+        task_id, [("state", {"progress": index}) for index in range(5_100)]
+    )
+    events = store.events_after("user-a", task_id, 0, limit=6_000)
 
-    store.append_event(task_id, "state", {"progress": 2})
-    assert store._last_pruned_seq[task_id] == 3
-
-    store.append_events(task_id, [("state", {"progress": 3})] * 3)
-    events = store.events_after("user-a", task_id, 0, limit=20)
-    assert len(events) == 5
+    assert sequences == list(range(1, 5_101))
+    assert [event["seq"] for event in events] == sequences
 
 
-def test_event_page_returns_execution_snapshot_after_history_is_pruned(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(store_module, "EVENT_RETENTION", 5)
-    monkeypatch.setattr(store_module, "EVENT_PRUNE_INTERVAL", 1)
+def test_private_draft_is_versioned_and_user_isolated(tmp_path: Path) -> None:
     store = TaskStore(tmp_path / "backtest.sqlite3")
-    task_id = store.create_task(
+
+    first = store.save_draft("user-a", "workbench", {"symbol": "A"})
+    second = store.save_draft("user-a", "workbench", {"symbol": "B"})
+    store.save_draft("user-b", "workbench", {"symbol": "C"})
+
+    assert first["version"] == 1
+    assert second["version"] == 2
+    assert store.get_draft("user-a", "workbench")["payload"] == {"symbol": "B"}
+    assert store.get_draft("user-b", "workbench")["payload"] == {"symbol": "C"}
+    assert store.delete_draft("user-a", "workbench") is True
+    with pytest.raises(TaskNotFoundError):
+        store.get_draft("user-a", "workbench")
+
+
+def test_event_sequences_are_contiguous_per_task_when_tasks_interleave(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(tmp_path / "backtest.sqlite3")
+    first_task_id = store.create_task(
         user_id="user-a", source_node="204", request=request_payload()
     )
-
-    sequences = []
-    for minute in range(7):
-        sequences.append(
-            store.append_event(
-                task_id,
-                "bar",
-                {
-                    "bar": {
-                        "datetime": f"2026-08-01 00:0{minute}:00",
-                        "open": minute,
-                        "close": minute + 1,
-                    },
-                    "replay_seq": minute + 1,
-                },
-            )
-        )
-
-    page = store.event_page(
-        "user-a", task_id, after_seq=sequences[0], limit=2
+    second_task_id = store.create_task(
+        user_id="user-b", source_node="109", request=request_payload()
     )
 
-    assert page["history_truncated"] is True
-    assert page["earliest_seq"] == sequences[2]
-    assert page["latest_seq"] == sequences[-1]
-    assert page["next_seq"] == sequences[3]
-    assert [event["seq"] for event in page["events"]] == sequences[2:4]
-    assert page["resync"]["event_seq"] == sequences[-1]
-    assert [bar["datetime"] for bar in page["resync"]["live_bars"]] == [
-        f"2026-08-01 00:0{minute}:00" for minute in range(7)
+    first_sequences = [
+        store.append_event(first_task_id, "state", {"progress": 10}),
+        store.append_event(first_task_id, "state", {"progress": 20}),
     ]
-    assert page["resync"]["last_bar_replay_seq"] == 7
-
-    current_page = store.event_page(
-        "user-a", task_id, after_seq=sequences[-1], limit=2
+    second_sequences = [
+        store.append_event(second_task_id, "state", {"progress": 10}),
+        store.append_event(second_task_id, "state", {"progress": 20}),
+    ]
+    first_sequences.append(
+        store.append_event(first_task_id, "state", {"progress": 30})
     )
-    assert current_page["history_truncated"] is False
-    assert current_page["resync"] is None
+
+    first_page = store.event_page("user-a", first_task_id, after_seq=0, limit=10)
+    second_page = store.event_page("user-b", second_task_id, after_seq=0, limit=10)
+
+    assert first_sequences == [1, 2, 3]
+    assert second_sequences == [1, 2]
+    assert [event["seq"] for event in first_page["events"]] == [1, 2, 3]
+    assert [event["seq"] for event in second_page["events"]] == [1, 2]
+    assert first_page["history_truncated"] is False
+    assert first_page["resync"] is None
 
 
 def test_store_reports_global_queue_position_without_leaking_other_user(tmp_path: Path) -> None:

@@ -1453,6 +1453,11 @@ def run_backtest_worker(
                         visual_projection_gate.set_interval_ms(
                             visual_interval_ms(requested_speed)
                         )
+                elif action == "step":
+                    requested_paused = True
+                    engine = task.engine
+                    if engine and hasattr(engine, "step"):
+                        engine.step()
                 elif action == "cancel":
                     cancelled = True
                     requested_paused = False
@@ -1589,10 +1594,39 @@ def run_backtest_worker(
                 reliable=True,
             )
     if "error" in holder:
+        partial_result = {
+            "complete": False,
+            "termination_reason": "failed",
+            "error": holder["error"],
+            "trades": extract_live_trades(task),
+            "orders": extract_live_orders(task),
+            "positions": extract_live_positions(task),
+            "strategy_lines": extract_strategy_lines(task),
+            "replay_audit": replay_audit.to_dict(),
+            "progress": float(task.progress or 0.0),
+            "processed_bars": int(task.processed_bars or 0),
+            "total_bars": int(task.total_bars or 0),
+            "current_datetime": str(task.current_datetime or ""),
+        }
+        if request.get("_task_contract"):
+            from app.result_contract import build_result_v2
+
+            partial_result = build_result_v2(
+                task_id=task_id,
+                request=request,
+                raw_result=partial_result,
+            )
+        final_path = Path(result_path)
+        _atomic_json_write(final_path, convert_numpy_types(partial_result))
         _emit(
             event_queue,
             "failed",
-            {"error": holder["error"]},
+            {
+                "error": holder["error"],
+                "result_path": str(final_path),
+                "result_available": True,
+                "progress": float(task.progress or 0.0),
+            },
             terminal=True,
         )
         return

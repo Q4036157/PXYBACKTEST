@@ -393,7 +393,10 @@ def _fit_torch_sequence(
     loss_fn = nn.MSELoss()
     for parameter in trainable:
         parameter.requires_grad_(True)
-    for _ in range(max(1, min(int(parameters.get("epochs") or 80), 1000))):
+    configured_epochs = parameters.get("epochs")
+    if configured_epochs is None:
+        configured_epochs = parameters.get("max_epochs", 20)
+    for _ in range(max(1, min(int(configured_epochs), 1000))):
         optimizer.zero_grad()
         prediction = forward(values)
         loss = loss_fn(prediction, targets)

@@ -36,7 +36,22 @@ class StoreOnlyManager:
     async def stop(self) -> None:
         return None
 
-    async def submit(self, *, user_id: str, source_node: str, request: dict) -> str:
+    async def submit(
+        self,
+        *,
+        user_id: str,
+        source_node: str,
+        request: dict,
+        idempotency_key: str | None = None,
+    ):
+        if idempotency_key:
+            return self.store.create_task_if_queue_available(
+                user_id=user_id,
+                source_node=source_node,
+                request=request,
+                max_queued=100,
+                idempotency_key=idempotency_key,
+            )
         return self.store.create_task(
             user_id=user_id, source_node=source_node, request=request
         )
@@ -412,6 +427,37 @@ def test_v2_submission_resolves_snapshot_before_queueing(tmp_path: Path) -> None
     )
 
 
+def test_v2_submission_is_idempotent_and_rejects_changed_request(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    manager = StoreOnlyManager(TaskStore(settings.database_path))
+    snapshots = FakeSnapshotClient(_snapshot())
+    app = create_app(
+        settings,
+        manager,
+        snapshots,
+        FakeDaaClient(),  # type: ignore[arg-type]
+    )
+    headers = {**_headers(), "Idempotency-Key": "submit-42"}
+
+    with TestClient(app) as client:
+        first = client.post("/api/v2/tasks", json=_payload(), headers=headers)
+        replay = client.post("/api/v2/tasks", json=_payload(), headers=headers)
+        changed_payload = _payload()
+        changed_payload["parameters"] = {"changed": True}
+        conflict = client.post(
+            "/api/v2/tasks", json=changed_payload, headers=headers
+        )
+
+    assert first.status_code == 202
+    assert replay.status_code == 202
+    assert replay.json()["task_id"] == first.json()["task_id"]
+    assert replay.json()["idempotent_replay"] is True
+    assert conflict.status_code == 409
+    assert len(manager.store.list_tasks("user-a")) == 1
+
+
 def test_v2_unavailable_engine_fails_without_creating_snapshot(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     manager = StoreOnlyManager(TaskStore(settings.database_path))
@@ -727,6 +773,11 @@ def test_capabilities_publish_versioned_recommended_defaults(tmp_path: Path) -> 
     assert profiles["tick-recommended"]["defaults"]["period"]["lookback_days"] == 6
     engines = {item["engine_id"]: item for item in payload["engines"]}
     assert engines["vnpy_cta"]["default_profile_ids"] == ["futures-minute-recommended"]
+    assert engines["vnpy_cta"]["label"] == "CTA 可视化回放"
+    assert engines["vnpy_cta"]["frontend_ready"] is True
+    assert engines["deep_learning"]["category"] == "learning"
+    assert engines["deep_learning"]["frontend_ready"] is False
+    assert "submit_ready" in engines["deep_learning"]["availability"]
 
 
 def test_task_contract_and_result_preserve_default_profile() -> None:

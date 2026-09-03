@@ -1,3 +1,7 @@
+import hashlib
+import io
+import json
+import zipfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -40,6 +44,10 @@ class StoreOnlyManager:
     async def set_speed(self, user_id: str, task_id: str, speed: float) -> bool:
         self.store.get_task(user_id, task_id)
         return False
+
+    async def step(self, user_id: str, task_id: str) -> PlaybackControlResult:
+        task = self.store.get_task(user_id, task_id)
+        return PlaybackControlResult(False, False, str(task["status"]))
 
     async def cancel(self, user_id: str, task_id: str) -> bool:
         self.store.get_task(user_id, task_id)
@@ -127,6 +135,54 @@ def test_task_routes_enforce_user_ownership(tmp_path: Path) -> None:
         )
 
     assert response.status_code == 404
+
+
+def test_task_zip_export_contains_complete_events_and_checksums(tmp_path: Path) -> None:
+    configured = settings(tmp_path)
+    manager = StoreOnlyManager(TaskStore(configured.database_path))
+    request = {
+        "strategy_class": "ExampleStrategy",
+        "vt_symbol": "BTCUSDT_SWAP_OKX.GLOBAL",
+        "interval": "1m",
+        "start_time": "2026-08-01 00:00:00",
+        "end_time": "2026-08-02 00:00:00",
+    }
+    task_id = manager.store.create_task(
+        user_id="user-a", source_node="204", request=request
+    )
+    manager.store.append_events(
+        task_id,
+        [("state", {"progress": index}) for index in range(1, 4)],
+    )
+    app = create_app(configured, manager)  # type: ignore[arg-type]
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/tasks/{task_id}/export.zip",
+            headers={
+                "X-PXY-Service-Token": "test-service-token",
+                "X-PXY-User-Id": "user-a",
+            },
+        )
+
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert set(archive.namelist()) == {
+            "events.ndjson",
+            "manifest.json",
+            "request.json",
+            "task.json",
+        }
+        events = [
+            json.loads(line)
+            for line in archive.read("events.ndjson").decode("utf-8").splitlines()
+        ]
+        assert [event["seq"] for event in events] == [1, 2, 3]
+        manifest = json.loads(archive.read("manifest.json"))
+        for entry in manifest["files"]:
+            content = archive.read(entry["path"])
+            assert entry["size"] == len(content)
+            assert entry["sha256"] == hashlib.sha256(content).hexdigest()
 
 
 def test_pause_response_reports_acceptance_confirmation_and_status(

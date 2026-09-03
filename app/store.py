@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -13,8 +14,7 @@ from .kernel import stable_hash
 
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
-EVENT_RETENTION = 5000
-EVENT_PRUNE_INTERVAL = 500
+RESULT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
 class TaskNotFoundError(LookupError):
@@ -25,12 +25,22 @@ class QueueLimitReachedError(ValueError):
     """用户的待执行任务达到上限。"""
 
 
+class IdempotencyConflictError(ValueError):
+    """同一用户重复使用幂等键提交了不同请求。"""
+
+
+@dataclass(frozen=True)
+class TaskCreationReceipt:
+    task_id: str
+    idempotent_replay: bool
+    idempotency_key: str | None
+
+
 class TaskStore:
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._last_pruned_seq: dict[str, int] = {}
         self._initialize()
 
     @contextmanager
@@ -68,6 +78,7 @@ class TaskStore:
                     ON tasks(status, created_at ASC);
                 CREATE TABLE IF NOT EXISTS task_events (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_seq INTEGER,
                     task_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
                     event_type TEXT NOT NULL,
@@ -75,10 +86,75 @@ class TaskStore:
                     created_at REAL NOT NULL,
                     FOREIGN KEY(task_id) REFERENCES tasks(task_id)
                 );
-                CREATE INDEX IF NOT EXISTS ix_task_events_task_seq
-                    ON task_events(task_id, seq);
+                CREATE TABLE IF NOT EXISTS user_drafts (
+                    user_id TEXT NOT NULL,
+                    draft_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(user_id, draft_id)
+                );
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            if "idempotency_key" not in columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN idempotency_key TEXT")
+            if "request_sha256" not in columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN request_sha256 TEXT")
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_user_idempotency
+                ON tasks(user_id, idempotency_key)
+                WHERE idempotency_key IS NOT NULL
+                """
+            )
+            event_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(task_events)"
+                ).fetchall()
+            }
+            if "task_seq" not in event_columns:
+                connection.execute(
+                    "ALTER TABLE task_events ADD COLUMN task_seq INTEGER"
+                )
+            self._backfill_task_event_sequences(connection)
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_task_events_task_sequence
+                ON task_events(task_id, task_seq)
+                """
+            )
+
+    @staticmethod
+    def _backfill_task_event_sequences(connection: sqlite3.Connection) -> None:
+        """为旧库补齐每任务连续游标。"""
+
+        pending = connection.execute(
+            "SELECT 1 FROM task_events WHERE task_seq IS NULL LIMIT 1"
+        ).fetchone()
+        if pending is None:
+            return
+        connection.execute(
+            """
+            WITH ranked AS (
+                SELECT seq,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY task_id ORDER BY seq ASC
+                       ) AS task_seq
+                FROM task_events
+            )
+            UPDATE task_events
+            SET task_seq = (
+                SELECT ranked.task_seq FROM ranked
+                WHERE ranked.seq = task_events.seq
+            )
+            WHERE task_seq IS NULL
+            """
+        )
 
     def create_task(
         self,
@@ -107,7 +183,8 @@ class TaskStore:
         source_node: str,
         request: dict[str, Any],
         max_queued: int,
-    ) -> str:
+        idempotency_key: str | None = None,
+    ) -> TaskCreationReceipt:
         """在同一 SQLite 事务中检查队列并创建任务。
 
         先 ``COUNT`` 再 ``INSERT`` 会让并发提交绕过每用户队列上限。
@@ -115,10 +192,32 @@ class TaskStore:
         """
         if max_queued < 1:
             raise ValueError("max_queued 必须大于 0")
+        normalized_key = str(idempotency_key or "").strip() or None
+        if normalized_key is not None and len(normalized_key) > 200:
+            raise ValueError("幂等键长度不得超过 200 个字符")
+        request_sha256 = stable_hash(request)
         task_id = str(uuid.uuid4())
         now = time.time()
         with self._lock, self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if normalized_key is not None:
+                existing = connection.execute(
+                    """
+                    SELECT task_id, request_sha256 FROM tasks
+                    WHERE user_id = ? AND idempotency_key = ?
+                    """,
+                    (user_id, normalized_key),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["request_sha256"] or "") != request_sha256:
+                        raise IdempotencyConflictError(
+                            "同一幂等键已用于不同的回测请求"
+                        )
+                    return TaskCreationReceipt(
+                        task_id=str(existing["task_id"]),
+                        idempotent_replay=True,
+                        idempotency_key=normalized_key,
+                    )
             row = connection.execute(
                 "SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND status = 'pending'",
                 (user_id,),
@@ -132,8 +231,14 @@ class TaskStore:
                 source_node=source_node,
                 request=request,
                 now=now,
+                idempotency_key=normalized_key,
+                request_sha256=request_sha256,
             )
-        return task_id
+        return TaskCreationReceipt(
+            task_id=task_id,
+            idempotent_replay=False,
+            idempotency_key=normalized_key,
+        )
 
     @staticmethod
     def _insert_task(
@@ -144,6 +249,8 @@ class TaskStore:
         source_node: str,
         request: dict[str, Any],
         now: float,
+        idempotency_key: str | None = None,
+        request_sha256: str | None = None,
     ) -> None:
         task_contract = request.get("_task_contract") or {}
         execution = task_contract.get("execution") or {}
@@ -162,6 +269,8 @@ class TaskStore:
                 "execution_mode", execution.get("execution_mode", "visual")
             ),
             "result_available": False,
+            "completed_at": None,
+            "expires_at": None,
             "replay": {},
             "live_bars": [],
             "live_trades": [],
@@ -178,8 +287,8 @@ class TaskStore:
             """
             INSERT INTO tasks(
                 task_id, user_id, source_node, status, request_json,
-                state_json, created_at, updated_at
-            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
+                state_json, created_at, updated_at, idempotency_key, request_sha256
+            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -189,16 +298,84 @@ class TaskStore:
                 json.dumps(state, ensure_ascii=False, separators=(",", ":")),
                 now,
                 now,
+                idempotency_key,
+                request_sha256 or stable_hash(request),
             ),
         )
 
     def count_queued_for_user(self, user_id: str) -> int:
         with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND status = 'pending'",
                 (user_id,),
             ).fetchone()
         return int(row["count"] if row else 0)
+
+    def save_draft(
+        self, user_id: str, draft_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        now = time.time()
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT version FROM user_drafts
+                WHERE user_id = ? AND draft_id = ?
+                """,
+                (user_id, draft_id),
+            ).fetchone()
+            version = int(row["version"] if row else 0) + 1
+            connection.execute(
+                """
+                INSERT INTO user_drafts(
+                    user_id, draft_id, version, payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, draft_id) DO UPDATE SET
+                    version = excluded.version,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    user_id,
+                    draft_id,
+                    version,
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    now,
+                ),
+            )
+        return {
+            "draft_id": draft_id,
+            "version": version,
+            "payload": payload,
+            "updated_at": now,
+        }
+
+    def get_draft(self, user_id: str, draft_id: str) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT version, payload_json, updated_at FROM user_drafts
+                WHERE user_id = ? AND draft_id = ?
+                """,
+                (user_id, draft_id),
+            ).fetchone()
+        if row is None:
+            raise TaskNotFoundError(draft_id)
+        return {
+            "draft_id": draft_id,
+            "version": int(row["version"]),
+            "payload": json.loads(row["payload_json"]),
+            "updated_at": float(row["updated_at"]),
+        }
+
+    def delete_draft(self, user_id: str, draft_id: str) -> bool:
+        with self._lock, self._connection() as connection:
+            changed = connection.execute(
+                "DELETE FROM user_drafts WHERE user_id = ? AND draft_id = ?",
+                (user_id, draft_id),
+            )
+        return changed.rowcount == 1
 
     def recover_interrupted_tasks(self) -> int:
         now = time.time()
@@ -261,6 +438,9 @@ class TaskStore:
                 raise TaskNotFoundError(task_id)
             state = json.loads(row["state_json"])
             state["status"] = status
+            if status in TERMINAL_STATUSES and not state.get("expires_at"):
+                state["completed_at"] = now
+                state["expires_at"] = now + RESULT_RETENTION_SECONDS
             if error:
                 state["error"] = error
             connection.execute(
@@ -301,14 +481,25 @@ class TaskStore:
             result_path = ""
             error = ""
             sequences: list[int] = []
+            latest = connection.execute(
+                """
+                SELECT COALESCE(MAX(task_seq), 0) AS latest
+                FROM task_events WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            next_sequence = int(latest["latest"] or 0)
 
             for event_type, payload in events:
-                cursor = connection.execute(
+                next_sequence += 1
+                connection.execute(
                     """
-                    INSERT INTO task_events(task_id, user_id, event_type, payload_json, created_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO task_events(
+                        task_seq, task_id, user_id, event_type, payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        next_sequence,
                         task_id,
                         user_id,
                         event_type,
@@ -316,49 +507,20 @@ class TaskStore:
                         time.time(),
                     ),
                 )
-                seq = int(cursor.lastrowid)
+                seq = next_sequence
                 sequences.append(seq)
                 state = self._apply_event(state, event_type, payload)
                 state["event_seq"] = seq
-                if event_type in {"completed", "cancelled"}:
+                if event_type in {"completed", "cancelled", "failed"}:
                     result_path = str(payload.get("result_path") or "")
-                elif event_type == "failed":
+                if event_type == "failed":
                     error = str(payload.get("error") or "")
-
-            last_seq = sequences[-1]
-            last_pruned_seq = self._last_pruned_seq.get(task_id, 0)
-            if last_seq - last_pruned_seq >= EVENT_PRUNE_INTERVAL:
-                cutoff = connection.execute(
-                    """
-                    SELECT seq FROM task_events
-                    WHERE task_id = ?
-                    ORDER BY seq DESC LIMIT 1 OFFSET ?
-                    """,
-                    (task_id, EVENT_RETENTION - 1),
-                ).fetchone()
-                if cutoff is not None:
-                    cutoff_seq = int(cutoff["seq"])
-                    deleted = connection.execute(
-                        """
-                        SELECT MAX(seq) AS seq FROM task_events
-                        WHERE task_id = ? AND seq < ?
-                        """,
-                        (task_id, cutoff_seq),
-                    ).fetchone()
-                    deleted_through = int(deleted["seq"] or 0) if deleted else 0
-                    if deleted_through:
-                        connection.execute(
-                            "DELETE FROM task_events WHERE task_id = ? AND seq < ?",
-                            (task_id, cutoff_seq),
-                        )
-                        state["events_pruned_through"] = max(
-                            int(state.get("events_pruned_through") or 0),
-                            deleted_through,
-                        )
-                self._last_pruned_seq[task_id] = last_seq
 
             status = str(state.get("status") or "running")
             now = time.time()
+            if status in TERMINAL_STATUSES and not state.get("expires_at"):
+                state["completed_at"] = now
+                state["expires_at"] = now + RESULT_RETENTION_SECONDS
             connection.execute(
                 """
                 UPDATE tasks
@@ -466,6 +628,11 @@ class TaskStore:
         elif event_type == "failed":
             state["status"] = "failed"
             state["error"] = str(payload.get("error") or "backtest worker failed")
+            state["result_available"] = bool(
+                payload.get("result_available") or payload.get("result_path")
+            )
+            if payload.get("progress") is not None:
+                state["progress"] = float(payload["progress"])
         elif event_type == "cancelled":
             state["status"] = "cancelled"
             state["result_available"] = bool(
@@ -513,6 +680,39 @@ class TaskStore:
             raise TaskNotFoundError(task_id)
         return Path(str(row["result_path"] or ""))
 
+    def expire_due_results(self, now: float | None = None) -> list[str]:
+        checked_at = time.time() if now is None else now
+        expired: list[str] = []
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT task_id, state_json FROM tasks
+                WHERE status IN ('completed', 'failed', 'cancelled')
+                """
+            ).fetchall()
+            for row in rows:
+                state = json.loads(row["state_json"])
+                expires_at = float(state.get("expires_at") or 0)
+                if expires_at <= 0 or expires_at > checked_at or state.get("result_expired"):
+                    continue
+                task_id = str(row["task_id"])
+                state["result_available"] = False
+                state["result_expired"] = True
+                state["expired_at"] = checked_at
+                connection.execute(
+                    """
+                    UPDATE tasks SET state_json = ?, result_path = '', updated_at = ?
+                    WHERE task_id = ?
+                    """,
+                    (
+                        json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                        checked_at,
+                        task_id,
+                    ),
+                )
+                expired.append(task_id)
+        return expired
+
     def get_request(self, task_id: str) -> dict[str, Any]:
         with self._lock, self._connection() as connection:
             row = connection.execute(
@@ -556,6 +756,8 @@ class TaskStore:
                     "status": str(row["status"]),
                     "progress": float(state.get("progress") or 0),
                     "result_available": bool(state.get("result_available")),
+                    "completed_at": state.get("completed_at"),
+                    "expires_at": state.get("expires_at"),
                     "execution_mode": str(state.get("execution_mode") or "visual"),
                     "created_at": float(row["created_at"]),
                     "updated_at": float(row["updated_at"]),
@@ -623,7 +825,7 @@ class TaskStore:
                 payload.pop("traceback", None)
             events.append(
                 {
-                    "seq": int(row["seq"]),
+                    "seq": int(row["task_seq"]),
                     "type": event_type,
                     "data": payload,
                     "created_at": float(row["created_at"]),
@@ -657,7 +859,7 @@ class TaskStore:
     def event_page(
         self, user_id: str, task_id: str, after_seq: int, limit: int = 200
     ) -> dict[str, Any]:
-        """原子读取事件窗口；历史已裁剪时返回当前执行快照。"""
+        """原子读取某个任务的完整追加式事件窗口。"""
         with self._lock, self._connection() as connection:
             owned = connection.execute(
                 """
@@ -671,21 +873,19 @@ class TaskStore:
             state = json.loads(owned["state_json"])
             bounds = connection.execute(
                 """
-                SELECT MIN(seq) AS earliest_seq, MAX(seq) AS latest_seq
+                SELECT MIN(task_seq) AS earliest_seq, MAX(task_seq) AS latest_seq
                 FROM task_events WHERE task_id = ? AND user_id = ?
                 """,
                 (task_id, user_id),
             ).fetchone()
             earliest_seq = int(bounds["earliest_seq"] or 0) if bounds else 0
             latest_seq = int(bounds["latest_seq"] or 0) if bounds else 0
-            pruned_through = int(state.get("events_pruned_through") or 0)
-            history_truncated = pruned_through > after_seq
             rows = connection.execute(
                 """
-                SELECT seq, event_type, payload_json, created_at
+                SELECT task_seq, event_type, payload_json, created_at
                 FROM task_events
-                WHERE task_id = ? AND user_id = ? AND seq > ?
-                ORDER BY seq ASC LIMIT ?
+                WHERE task_id = ? AND user_id = ? AND task_seq > ?
+                ORDER BY task_seq ASC LIMIT ?
                 """,
                 (task_id, user_id, after_seq, limit),
             ).fetchall()
@@ -699,10 +899,8 @@ class TaskStore:
             "next_seq": next_seq,
             "earliest_seq": earliest_seq,
             "latest_seq": latest_seq,
-            "history_truncated": history_truncated,
-            "resync": self._replay_resync_snapshot(state)
-            if history_truncated
-            else None,
+            "history_truncated": False,
+            "resync": None,
         }
 
     def events_after(
@@ -717,10 +915,10 @@ class TaskStore:
                 raise TaskNotFoundError(task_id)
             rows = connection.execute(
                 """
-                SELECT seq, event_type, payload_json, created_at
+                SELECT task_seq, event_type, payload_json, created_at
                 FROM task_events
-                WHERE task_id = ? AND user_id = ? AND seq > ?
-                ORDER BY seq ASC LIMIT ?
+                WHERE task_id = ? AND user_id = ? AND task_seq > ?
+                ORDER BY task_seq ASC LIMIT ?
                 """,
                 (task_id, user_id, after_seq, limit),
             ).fetchall()

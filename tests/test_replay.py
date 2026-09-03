@@ -396,6 +396,45 @@ def test_result_replay_controller_applies_pause_resume_speed_and_cancel() -> Non
     assert [state.get("status") for state in states[:2]] == ["paused", "running"]
 
 
+def test_result_replay_controller_steps_exactly_one_event_while_paused() -> None:
+    commands = iter(
+        [
+            [{"action": "pause"}],
+            [{"action": "step"}],
+            [{"action": "cancel"}],
+        ]
+    )
+    states: list[dict] = []
+    controller = ResultReplayController(
+        run_id="run-step",
+        snapshot_id=SNAPSHOT,
+        events=[
+            {
+                "event_type": "account",
+                "event_time": f"2026-08-01T00:00:0{index}Z",
+                "payload": {"value": 1_000_000 + index},
+            }
+            for index in range(1, 4)
+        ],
+        mode="fast",
+        speed=50,
+    )
+
+    outcome = controller.run(
+        read_commands=lambda: next(commands, []),
+        on_state=states.append,
+        sleep=lambda _: None,
+    )
+
+    assert outcome["processed_events"] == 1
+    assert outcome["remaining_events"] == 2
+    assert outcome["termination_reason"] == "cancelled"
+    assert any(
+        state.get("status") == "paused" and state.get("step_pending") == 0
+        for state in states
+    )
+
+
 def test_visual_replay_speed_changes_wall_time_without_changing_event_count() -> None:
     events = [
         {

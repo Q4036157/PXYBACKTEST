@@ -6,6 +6,72 @@ from typing import Any
 
 DEFAULT_PROFILE_CONTRACT = "pxybacktest.default-profile.v1"
 
+_ENGINE_METADATA: dict[str, dict[str, Any]] = {
+    "vnpy_cta": {
+        "label": "CTA 可视化回放",
+        "category": "cta",
+        "maturity": "result_ui_verified",
+        "frontend_ready": True,
+        "result_panels": ["summary", "replay", "orders", "diagnostics"],
+    },
+    "a_share_portfolio": {
+        "label": "A 股组合",
+        "category": "portfolio",
+        "maturity": "run_verified",
+        "frontend_ready": True,
+        "result_panels": ["summary", "portfolio", "replay", "diagnostics"],
+    },
+    "factor_matrix": {
+        "label": "A 股多因子",
+        "category": "factor",
+        "maturity": "run_verified",
+        "frontend_ready": True,
+        "result_panels": ["summary", "factors", "portfolio", "replay"],
+    },
+    "event_sentiment": {
+        "label": "A 股事件舆情",
+        "category": "event",
+        "maturity": "run_verified",
+        "frontend_ready": True,
+        "result_panels": ["summary", "events", "portfolio", "replay"],
+    },
+    "microstructure": {
+        "label": "Tick 微观结构",
+        "category": "microstructure",
+        "maturity": "run_verified",
+        "frontend_ready": True,
+        "result_panels": ["summary", "microstructure", "replay", "orders"],
+    },
+    "ml_factor": {
+        "label": "机器学习因子",
+        "category": "learning",
+        "maturity": "run_verified",
+        "frontend_ready": False,
+        "result_panels": ["summary", "training", "prediction", "portfolio"],
+    },
+    "deep_learning": {
+        "label": "深度学习",
+        "category": "learning",
+        "maturity": "run_verified",
+        "frontend_ready": False,
+        "result_panels": ["summary", "training", "prediction", "portfolio", "replay"],
+    },
+    "lighter_microstructure": {
+        "label": "Lighter 微观结构",
+        "category": "microstructure",
+        "maturity": "run_verified",
+        "frontend_ready": False,
+        "result_panels": ["summary", "microstructure", "replay", "orders"],
+    },
+    "mt5_native": {
+        "label": "MT5 原生",
+        "category": "external_platform",
+        "maturity": "declared",
+        "frontend_ready": False,
+        "result_panels": ["summary", "replay", "orders", "parity"],
+    },
+}
+
 _DEFAULT_PROFILES: tuple[dict[str, Any], ...] = (
     {
         "profile_id": "futures-minute-recommended",
@@ -73,8 +139,20 @@ def profile_ids_for_engine(engine_id: str) -> list[str]:
     ]
 
 
+def engine_catalog_metadata(engine_id: str) -> dict[str, Any]:
+    metadata = deepcopy(_ENGINE_METADATA.get(engine_id, {}))
+    metadata.setdefault("label", engine_id)
+    metadata.setdefault("category", "extension")
+    metadata.setdefault("maturity", "declared")
+    metadata.setdefault("frontend_ready", False)
+    metadata.setdefault("result_panels", ["summary", "diagnostics"])
+    metadata["config_schema_version"] = "pxybacktest.task-result.v2"
+    return metadata
+
+
 __all__ = [
     "DEFAULT_PROFILE_CONTRACT",
     "default_profile_catalog",
+    "engine_catalog_metadata",
     "profile_ids_for_engine",
 ]

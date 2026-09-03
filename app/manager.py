@@ -4,14 +4,17 @@ import asyncio
 import json
 import multiprocessing
 import queue
+import shutil
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from .config import Settings
 from .store import (
+    IdempotencyConflictError,
     TERMINAL_STATUSES,
     QueueLimitReachedError,
+    TaskCreationReceipt,
     TaskStore,
 )
 from .worker_process import run_preloaded_worker
@@ -88,12 +91,14 @@ class TaskManager:
         self._warm_worker: WarmWorkerHandle | None = None
         self._loop_task: asyncio.Task | None = None
         self._stopping = False
+        self._last_expiry_scan = 0.0
 
     async def start(self) -> None:
         if self._loop_task is not None:
             return
         self.settings.ensure_directories()
         await asyncio.to_thread(self.store.recover_interrupted_tasks)
+        await asyncio.to_thread(self.expire_results)
         self._stopping = False
         self._warm_worker = self._spawn_warm_worker()
         self._loop_task = asyncio.create_task(self._loop(), name="pxybacktest-manager")
@@ -125,8 +130,13 @@ class TaskManager:
             self._loop_task = None
 
     async def submit(
-        self, *, user_id: str, source_node: str, request: dict[str, Any]
-    ) -> str:
+        self,
+        *,
+        user_id: str,
+        source_node: str,
+        request: dict[str, Any],
+        idempotency_key: str | None = None,
+    ) -> TaskCreationReceipt:
         try:
             return await asyncio.to_thread(
                 self.store.create_task_if_queue_available,
@@ -134,8 +144,13 @@ class TaskManager:
                 source_node=source_node,
                 request=request,
                 max_queued=self.settings.max_queued_per_user,
+                idempotency_key=idempotency_key,
             )
+        except IdempotencyConflictError:
+            raise
         except QueueLimitReachedError as exc:
+            raise QueueLimitError(str(exc)) from exc
+        except ValueError as exc:
             raise QueueLimitError(str(exc)) from exc
 
     async def pause(self, user_id: str, task_id: str) -> PlaybackControlResult:
@@ -207,6 +222,29 @@ class TaskManager:
             return True
         return await self._wait_for_state(user_id, task_id, speed=speed)
 
+    async def step(self, user_id: str, task_id: str) -> PlaybackControlResult:
+        task = await asyncio.to_thread(self.store.get_task, user_id, task_id)
+        current_status = str(task["status"])
+        if current_status != "paused":
+            return PlaybackControlResult(False, False, current_status)
+        handle = self._workers.get(task_id)
+        if handle is None:
+            return PlaybackControlResult(False, False, current_status)
+        processed_before = max(
+            int(task.get("processed_bars") or 0),
+            int(task.get("processed_events") or 0),
+        )
+        try:
+            handle.command_queue.put_nowait({"action": "step"})
+        except queue.Full:
+            return PlaybackControlResult(False, False, current_status)
+
+        confirmed = await self._wait_for_progress(
+            user_id, task_id, processed_before=processed_before
+        )
+        latest = await asyncio.to_thread(self.store.get_task, user_id, task_id)
+        return PlaybackControlResult(True, confirmed, str(latest["status"]))
+
     async def cancel(self, user_id: str, task_id: str) -> bool:
         task = await asyncio.to_thread(self.store.get_task, user_id, task_id)
         if task["status"] in TERMINAL_STATUSES:
@@ -220,12 +258,15 @@ class TaskManager:
         return True
 
     def result(self, user_id: str, task_id: str) -> dict[str, Any]:
+        self.expire_results()
         task = self.store.get_task(user_id, task_id)
-        if task["status"] not in {"completed", "cancelled"}:
+        if task["status"] not in {"completed", "cancelled", "failed"}:
+            return task
+        if task.get("result_expired"):
             return task
         result_path = self.store.get_result_path(task_id)
         if not result_path.is_file():
-            if task["status"] == "cancelled":
+            if task["status"] in {"cancelled", "failed"}:
                 task["result_available"] = False
                 return task
             self.store.append_event(
@@ -240,10 +281,26 @@ class TaskManager:
 
     async def _loop(self) -> None:
         while not self._stopping:
+            if time.monotonic() - self._last_expiry_scan >= 60:
+                await asyncio.to_thread(self.expire_results)
             await self._drain_worker_events()
             await asyncio.to_thread(self._reap_workers)
             await asyncio.to_thread(self._schedule_workers)
             await asyncio.sleep(0.05)
+
+    def expire_results(self) -> list[str]:
+        self._last_expiry_scan = time.monotonic()
+        expired = self.store.expire_due_results()
+        for task_id in expired:
+            for root in (self.settings.results_dir, self.settings.jobs_dir):
+                target = (root / task_id).resolve()
+                try:
+                    target.relative_to(root.resolve())
+                except ValueError:
+                    continue
+                if target.is_dir():
+                    shutil.rmtree(target)
+        return expired
 
     async def _wait_for_state(
         self,
@@ -264,6 +321,28 @@ class TaskManager:
                 speed is None or abs(float(task.get("speed") or 0) - speed) < 1e-9
             )
             if status_matches and speed_matches:
+                return True
+            await asyncio.sleep(0.025)
+        return False
+
+    async def _wait_for_progress(
+        self,
+        user_id: str,
+        task_id: str,
+        *,
+        processed_before: int,
+        timeout: float = 2.0,
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            task = await asyncio.to_thread(self.store.get_task, user_id, task_id)
+            if task["status"] in TERMINAL_STATUSES:
+                return False
+            processed = max(
+                int(task.get("processed_bars") or 0),
+                int(task.get("processed_events") or 0),
+            )
+            if task["status"] == "paused" and processed > processed_before:
                 return True
             await asyncio.sleep(0.025)
         return False

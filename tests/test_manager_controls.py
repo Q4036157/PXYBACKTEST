@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+from app import store as store_module
 from app.config import Settings
 from app.manager import MAX_WORKER_EVENTS_PER_CYCLE, TaskManager, WorkerHandle
 from app.store import TaskStore
@@ -31,6 +32,16 @@ class AcknowledgingQueue:
         elif action == "speed":
             self.store.append_event(
                 self.task_id, "state", {"speed": float(command["speed"])}
+            )
+        elif action == "step":
+            task = self.store.get_task("user-a", self.task_id)
+            self.store.append_event(
+                self.task_id,
+                "state",
+                {
+                    "status": "paused",
+                    "processed_bars": int(task.get("processed_bars") or 0) + 1,
+                },
             )
 
 
@@ -122,6 +133,36 @@ def test_pause_does_not_change_state_when_command_queue_is_full(tmp_path: Path) 
     assert result.confirmed is False
     assert result.status == "running"
     assert store.get_task("user-a", task_id)["status"] == "running"
+
+
+def test_step_advances_once_and_keeps_task_paused(tmp_path: Path) -> None:
+    manager, store, task_id = build_manager(tmp_path)
+    command_queue = AcknowledgingQueue(store, task_id)
+    manager._workers[task_id] = WorkerHandle(
+        user_id="user-a",
+        process=AliveProcess(),  # type: ignore[arg-type]
+        event_queue=None,
+        command_queue=command_queue,
+    )
+    store.append_event(task_id, "state", {"status": "paused"})
+
+    result = asyncio.run(manager.step("user-a", task_id))
+
+    assert result.accepted is True
+    assert result.confirmed is True
+    assert result.status == "paused"
+    task = store.get_task("user-a", task_id)
+    assert task["processed_bars"] == 1
+
+
+def test_step_requires_paused_task(tmp_path: Path) -> None:
+    manager, _store, task_id = build_manager(tmp_path)
+
+    result = asyncio.run(manager.step("user-a", task_id))
+
+    assert result.accepted is False
+    assert result.confirmed is False
+    assert result.status == "running"
 
 
 def test_pause_and_resume_are_idempotent(tmp_path: Path) -> None:
@@ -222,3 +263,31 @@ def test_worker_event_persistence_does_not_block_asyncio_loop(tmp_path: Path) ->
 
     asyncio.run(run_scenario())
     assert event_queue.qsize() == 50
+
+
+def test_manager_removes_expired_result_and_job_directories(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(store_module.time, "time", lambda: 1_000.0)
+    manager, store, task_id = build_manager(tmp_path)
+    result_dir = manager.settings.results_dir / task_id
+    job_dir = manager.settings.jobs_dir / task_id
+    result_dir.mkdir(parents=True)
+    job_dir.mkdir(parents=True)
+    result_path = result_dir / "result.json"
+    result_path.write_text("{}", encoding="utf-8")
+    (job_dir / "worker.json").write_text("{}", encoding="utf-8")
+    store.append_event(task_id, "completed", {"result_path": str(result_path)})
+    monkeypatch.setattr(
+        store_module.time,
+        "time",
+        lambda: 1_000.0 + store_module.RESULT_RETENTION_SECONDS + 1,
+    )
+
+    assert manager.expire_results() == [task_id]
+
+    assert not result_dir.exists()
+    assert not job_dir.exists()
+    task = manager.result("user-a", task_id)
+    assert task["result_expired"] is True
+    assert "result" not in task

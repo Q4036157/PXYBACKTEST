@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
+import json
+import time
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi.responses import HTMLResponse, Response
 
 from .auth import TrustedIdentity, build_identity_dependency
 from .config import Settings
@@ -18,6 +23,7 @@ from .daa_client import (
 from .default_profiles import (
     DEFAULT_PROFILE_CONTRACT,
     default_profile_catalog,
+    engine_catalog_metadata,
     profile_ids_for_engine,
 )
 from .manager import QueueLimitError, TaskManager
@@ -57,7 +63,12 @@ from .runner_registry import (
     build_runner_registry,
     runner_contract_capabilities,
 )
-from .store import TaskNotFoundError
+from .store import (
+    IdempotencyConflictError,
+    RESULT_RETENTION_SECONDS,
+    TaskCreationReceipt,
+    TaskNotFoundError,
+)
 from .strategy_package import StrategyPackage
 from .tqsdk_submission import TqSdkTaskSubmission
 
@@ -81,6 +92,34 @@ ENGINE_REQUIRED_DATASETS: dict[str, list[str]] = {
     ],
     "mt5_native": [],
 }
+
+
+def _submission_receipt(value: str | TaskCreationReceipt) -> TaskCreationReceipt:
+    if isinstance(value, TaskCreationReceipt):
+        return value
+    return TaskCreationReceipt(
+        task_id=str(value),
+        idempotent_replay=False,
+        idempotency_key=None,
+    )
+
+
+async def _submit_with_idempotency(
+    task_manager: TaskManager,
+    *,
+    user_id: str,
+    source_node: str,
+    request: dict,
+    idempotency_key: str | None,
+) -> TaskCreationReceipt:
+    kwargs = {
+        "user_id": user_id,
+        "source_node": source_node,
+        "request": request,
+    }
+    if idempotency_key is not None:
+        kwargs["idempotency_key"] = idempotency_key
+    return _submission_receipt(await task_manager.submit(**kwargs))
 
 
 def _runner_state(catalog: list[dict], runner_id: str) -> dict:
@@ -341,6 +380,10 @@ def create_app(
         payload = {
             "task_contract": "pxybacktest.task-result.v2",
             "data_contract": "pxydata.backtest-data-snapshot.v1",
+            "result_retention": {
+                "default_days": RESULT_RETENTION_SECONDS // 86_400,
+                "starts_at": "task_terminal",
+            },
             "default_profile_contract": DEFAULT_PROFILE_CONTRACT,
             "default_profiles": default_profile_catalog(),
             "strategy_runtime_contracts": runner_contract_capabilities(),
@@ -563,7 +606,12 @@ def create_app(
         for engine in payload["engines"]:
             engine_id = str(engine.get("id") or "")
             engine["engine_id"] = engine_id
+            engine.update(engine_catalog_metadata(engine_id))
             engine["default_profile_ids"] = profile_ids_for_engine(engine_id)
+            engine["availability"] = {
+                "submit_ready": bool(engine.get("submit_ready")),
+                "reason_codes": list(engine.get("blockers") or []),
+            }
         payload["data_quality"] = {
             "enforced": quality_enforced,
             "available": quality_payload is not None,
@@ -594,6 +642,9 @@ def create_app(
     async def submit_tqsdk_task(
         body: TqSdkTaskSubmission,
         identity: TrustedIdentity = Depends(identity_dependency),
+        idempotency_key: str | None = Header(
+            default=None, alias="Idempotency-Key", max_length=200
+        ),
     ) -> dict:
         """提交天勤原生策略；安全和三维验收未通过时保持关闭。"""
 
@@ -612,16 +663,22 @@ def create_app(
                 ),
             )
         try:
-            task_id = await task_manager.submit(
+            receipt = await _submit_with_idempotency(
+                task_manager,
                 user_id=identity.user_id,
                 source_node=identity.source_node,
                 request=body.to_worker_request(),
+                idempotency_key=idempotency_key,
             )
+        except IdempotencyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except QueueLimitError as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         return {
             "success": True,
-            "task_id": task_id,
+            "task_id": receipt.task_id,
+            "idempotency_key": receipt.idempotency_key,
+            "idempotent_replay": receipt.idempotent_replay,
             "schema_version": 2,
             "contract_version": "pxybacktest.task-result.v2",
             "engine_type": "tqsdk_native",
@@ -689,18 +746,27 @@ def create_app(
     async def submit_task(
         body: SubmitBacktestRequest,
         identity: TrustedIdentity = Depends(identity_dependency),
+        idempotency_key: str | None = Header(
+            default=None, alias="Idempotency-Key", max_length=200
+        ),
     ) -> dict:
         try:
-            task_id = await task_manager.submit(
+            receipt = await _submit_with_idempotency(
+                task_manager,
                 user_id=identity.user_id,
                 source_node=identity.source_node,
                 request=body.model_dump(),
+                idempotency_key=idempotency_key,
             )
+        except IdempotencyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except QueueLimitError as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         return {
             "success": True,
-            "task_id": task_id,
+            "task_id": receipt.task_id,
+            "idempotency_key": receipt.idempotency_key,
+            "idempotent_replay": receipt.idempotent_replay,
             "message": "回测任务已提交到工作站",
             "execution_backend": "workstation",
             "event_stream": "delta-poll",
@@ -710,6 +776,9 @@ def create_app(
     async def submit_task_v2(
         body: SubmitBacktestRequestV2,
         identity: TrustedIdentity = Depends(identity_dependency),
+        idempotency_key: str | None = Header(
+            default=None, alias="Idempotency-Key", max_length=200
+        ),
     ) -> dict:
         try:
             body.validate_contract()
@@ -846,18 +915,24 @@ def create_app(
         resolved = body.with_snapshot(snapshot, parameter_updates=parameter_updates)
         try:
             worker_request = resolved.to_worker_request(snapshot_manifest=snapshot_manifest)
-            task_id = await task_manager.submit(
+            receipt = await _submit_with_idempotency(
+                task_manager,
                 user_id=identity.user_id,
                 source_node=identity.source_node,
                 request=worker_request,
+                idempotency_key=idempotency_key,
             )
+        except IdempotencyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except QueueLimitError as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         return {
             "success": True,
-            "task_id": task_id,
+            "task_id": receipt.task_id,
+            "idempotency_key": receipt.idempotency_key,
+            "idempotent_replay": receipt.idempotent_replay,
             "schema_version": 2,
             "contract_version": "pxybacktest.task-result.v2",
             "engine_type": body.engine_type,
@@ -875,8 +950,46 @@ def create_app(
     async def list_tasks(
         identity: TrustedIdentity = Depends(identity_dependency),
     ) -> dict:
+        await asyncio.to_thread(task_manager.expire_results)
         tasks = await asyncio.to_thread(task_manager.store.list_tasks, identity.user_id)
         return {"success": True, "tasks": tasks, "total": len(tasks)}
+
+    @app.put("/api/v1/drafts/{draft_id}")
+    async def save_draft(
+        draft_id: str,
+        body: dict,
+        identity: TrustedIdentity = Depends(identity_dependency),
+    ) -> dict:
+        draft = await asyncio.to_thread(
+            task_manager.store.save_draft,
+            identity.user_id,
+            draft_id,
+            body,
+        )
+        return {"success": True, **draft}
+
+    @app.get("/api/v1/drafts/{draft_id}")
+    async def get_draft(
+        draft_id: str,
+        identity: TrustedIdentity = Depends(identity_dependency),
+    ) -> dict:
+        try:
+            draft = await asyncio.to_thread(
+                task_manager.store.get_draft, identity.user_id, draft_id
+            )
+        except TaskNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="回测草稿不存在") from exc
+        return {"success": True, **draft}
+
+    @app.delete("/api/v1/drafts/{draft_id}")
+    async def delete_draft(
+        draft_id: str,
+        identity: TrustedIdentity = Depends(identity_dependency),
+    ) -> dict:
+        deleted = await asyncio.to_thread(
+            task_manager.store.delete_draft, identity.user_id, draft_id
+        )
+        return {"success": True, "deleted": deleted}
 
     @app.get("/api/v1/tasks/{task_id}")
     async def get_task(
@@ -914,6 +1027,85 @@ def create_app(
             **page,
             **queue_context,
         }
+
+    @app.get("/api/v1/tasks/{task_id}/export.zip")
+    async def export_task_zip(
+        task_id: str,
+        identity: TrustedIdentity = Depends(identity_dependency),
+    ) -> Response:
+        def build_archive() -> bytes:
+            task = task_manager.result(identity.user_id, task_id)
+            request = task_manager.store.get_request(task_id)
+            events = task_manager.store.events_after(
+                identity.user_id, task_id, after_seq=0, limit=1_000_000
+            )
+            files: dict[str, bytes] = {
+                "task.json": json.dumps(
+                    task, ensure_ascii=False, sort_keys=True, default=str, indent=2
+                ).encode("utf-8"),
+                "request.json": json.dumps(
+                    request, ensure_ascii=False, sort_keys=True, default=str, indent=2
+                ).encode("utf-8"),
+                "events.ndjson": (
+                    "\n".join(
+                        json.dumps(
+                            event,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                            separators=(",", ":"),
+                        )
+                        for event in events
+                    )
+                    + ("\n" if events else "")
+                ).encode("utf-8"),
+            }
+            if isinstance(task.get("result"), dict):
+                files["result.json"] = json.dumps(
+                    task["result"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                    indent=2,
+                ).encode("utf-8")
+            manifest = {
+                "contract_version": "pxybacktest.export.v1",
+                "task_id": task_id,
+                "generated_at": time.time(),
+                "files": [
+                    {
+                        "path": name,
+                        "size": len(content),
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                    }
+                    for name, content in sorted(files.items())
+                ],
+            }
+            files["manifest.json"] = json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+            ).encode("utf-8")
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(
+                buffer, mode="w", compression=zipfile.ZIP_DEFLATED
+            ) as archive:
+                for name, content in files.items():
+                    archive.writestr(name, content)
+            return buffer.getvalue()
+
+        try:
+            content = await asyncio.to_thread(build_archive)
+        except TaskNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="回测任务不存在") from exc
+        return Response(
+            content=content,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="backtest-{task_id}.zip"'
+            },
+        )
 
     @app.post("/api/v1/tasks/{task_id}/pause")
     async def pause_task(
@@ -980,6 +1172,28 @@ def create_app(
         return {
             "success": success,
             "message": f"速度已设置为 {body.speed}x" if success else "任务当前不能调速",
+        }
+
+    @app.post("/api/v1/tasks/{task_id}/step")
+    async def step_task(
+        task_id: str,
+        identity: TrustedIdentity = Depends(identity_dependency),
+    ) -> dict:
+        try:
+            result = await task_manager.step(identity.user_id, task_id)
+        except TaskNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="回测任务不存在") from exc
+        return {
+            "success": result.accepted,
+            "confirmed": result.confirmed,
+            "status": result.status,
+            "message": (
+                "已前进一个回放事件"
+                if result.confirmed
+                else "单步指令已提交，正在等待工作站确认"
+                if result.accepted
+                else "任务必须先暂停才能单步执行"
+            ),
         }
 
     @app.delete("/api/v1/tasks/{task_id}")

@@ -464,8 +464,10 @@ class ReplaySession:
         self.processed_events = 0
         self.last_event: ReplayEvent | None = None
 
-    def step(self, handler: Any | None = None) -> ReplayEvent | None:
-        if self.clock.paused or self.clock.cancelled:
+    def step(
+        self, handler: Any | None = None, *, allow_paused: bool = False
+    ) -> ReplayEvent | None:
+        if (self.clock.paused and not allow_paused) or self.clock.cancelled:
             return None
         event = self.cursor.pop_next(self.clock)
         if event is None:
@@ -738,6 +740,7 @@ class ResultReplayController:
             "account_updates": [],
         }
         self._last_projected_count = -1
+        self._step_budget = 0
 
     def _apply_command(
         self,
@@ -757,6 +760,18 @@ class ResultReplayController:
             self.session.clock.set_speed(float(command.get("speed") or 1.0))
             if on_state is not None:
                 on_state({"speed": self.session.clock.speed})
+        elif action == "step" and not self.session.clock.cancelled:
+            if not self.session.clock.paused:
+                self.session.clock.pause()
+            self._step_budget += 1
+            if on_state is not None:
+                on_state(
+                    {
+                        "status": "paused",
+                        "speed": self.session.clock.speed,
+                        "step_pending": self._step_budget,
+                    }
+                )
         elif action == "cancel":
             self.session.clock.cancel()
 
@@ -871,14 +886,15 @@ class ResultReplayController:
             self._read_commands(read_commands, on_state)
             if self.session.clock.cancelled:
                 break
-            if self.session.clock.paused:
+            stepping = self.session.clock.paused and self._step_budget > 0
+            if self.session.clock.paused and not stepping:
                 sleep(0.01)
                 continue
 
             next_event = self.session.cursor.peek()
             if next_event is None:
                 break
-            remaining_delay = self._visual_delay(next_event)
+            remaining_delay = 0.0 if stepping else self._visual_delay(next_event)
             while remaining_delay > 0:
                 interval = min(0.02, remaining_delay)
                 sleep(interval)
@@ -886,14 +902,26 @@ class ResultReplayController:
                 self._read_commands(read_commands, on_state)
                 if self.session.clock.cancelled or self.session.clock.paused:
                     break
-            if self.session.clock.cancelled or self.session.clock.paused:
+            if self.session.clock.cancelled or (
+                self.session.clock.paused and not stepping
+            ):
                 continue
 
-            event = self.session.step(handler)
+            event = self.session.step(handler, allow_paused=stepping)
             if event is None:
                 continue
             self._record_frame_update(event)
             self._project(on_snapshot)
+            if stepping:
+                self._step_budget = max(0, self._step_budget - 1)
+                if on_state is not None:
+                    on_state(
+                        {
+                            "status": "paused",
+                            "speed": self.session.clock.speed,
+                            "step_pending": self._step_budget,
+                        }
+                    )
 
         if self._last_projected_count != self.session.processed_events:
             self._project(on_snapshot, force=True)

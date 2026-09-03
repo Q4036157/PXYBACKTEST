@@ -93,6 +93,12 @@ class RunnerProbeConfig:
             "PXYBACKTEST_TQSDK_ACCEPTANCE_FILE", ""
         ).strip()
         vnpy_raw = values.get("PXYBACKTEST_VNPY_PYTHON", "").strip()
+        if not vnpy_raw:
+            workstation_vnpy_python = Path(
+                r"D:\x1\x2\PXYLH\venv312\Scripts\python.exe"
+            )
+            if workstation_vnpy_python.is_file():
+                vnpy_raw = str(workstation_vnpy_python)
         return cls(
             project_root=(project_root or Path(__file__).resolve().parents[1]),
             pxylh_root=pxylh_root,

@@ -80,6 +80,12 @@ class Settings:
         pxylh_root = Path(os.getenv("PXYBACKTEST_PXYLH_ROOT", r"D:\x1\x2\PXYLH"))
         daa_root = Path(os.getenv("PXYBACKTEST_DAA_ROOT", r"D:\x1\x2\DAA"))
         daa_python_raw = os.getenv("PXYBACKTEST_DAA_PYTHON", "").strip()
+        if not daa_python_raw:
+            workstation_daa_python = Path(
+                r"D:\x1\x2\DAA\backend\.venv\Scripts\python.exe"
+            )
+            if workstation_daa_python.is_file():
+                daa_python_raw = str(workstation_daa_python)
         pxydata_data_root = Path(
             os.getenv(
                 "PXYBACKTEST_PXYDATA_DATA_ROOT",

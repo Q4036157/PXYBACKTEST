@@ -5,7 +5,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Host.UI.RawUI.WindowTitle = "PXYBACKTEST live logs"
 
-$logDirectory = "D:\x1\pxy-runtime\PXYBACKTEST\logs"
+$logDirectory = "E:\pxy-runtime\PXYBACKTEST\logs"
 $runtimeLog = Join-Path $logDirectory "pxy-backtest.out.log"
 $errorLog = Join-Path $logDirectory "pxy-backtest.err.log"
 $pollAccessPattern = 'GET /api/v1/tasks/.*/events\?.* HTTP/1\.1" 200 OK'

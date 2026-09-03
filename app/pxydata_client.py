@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -56,6 +57,10 @@ class SnapshotClient(Protocol):
 
     async def get_factor_set(
         self, factor_set_id: str, version: int | None = None
+    ) -> dict[str, Any]: ...
+
+    async def get_data_quality(
+        self, required_datasets: list[str]
     ) -> dict[str, Any]: ...
 
 
@@ -183,6 +188,29 @@ class PxyDataSnapshotClient:
             raise SnapshotProviderError("PXYDATA factor_set 版本无效", status_code=502) from exc
         if resolved_version <= 0:
             raise SnapshotProviderError("PXYDATA factor_set 版本无效", status_code=502)
+        return response
+
+    async def get_data_quality(
+        self, required_datasets: list[str]
+    ) -> dict[str, Any]:
+        """读取最近一次全量质量认证，供能力接口执行提交门禁。"""
+        required = ",".join(
+            dict.fromkeys(
+                str(item).strip() for item in required_datasets if str(item).strip()
+            )
+        )
+        query = urllib.parse.urlencode(
+            {"required": required, "live": "false", "max_age_seconds": 86400}
+        )
+        response = await asyncio.to_thread(
+            self._request,
+            "GET",
+            f"/api/pxydaa/data/admin/data-quality?{query}",
+            None,
+        )
+        report = response.get("report")
+        if not isinstance(report, dict):
+            raise SnapshotProviderError("PXYDATA 质量接口缺少认证报告", status_code=502)
         return response
 
     def _request(

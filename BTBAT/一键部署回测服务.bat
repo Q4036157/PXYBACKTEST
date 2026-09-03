@@ -1,4 +1,9 @@
 @echo off
+title %~nx0
+if not defined PXY_FIXED_TAB_TITLE (
+    wt.exe -w -1 new-tab --title "%~nx0" --suppressApplicationTitle cmd.exe /d /c "set PXY_FIXED_TAB_TITLE=1&& call ""%~f0"" %*"
+    exit /b
+)
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 title PXYBACKTEST one-click deploy
@@ -37,10 +42,12 @@ set "SERVICE_TOKEN_FILE=C:\ProgramData\PXY\secrets\pxy-backtest-service-token"
 set "PXYDATA_KEY_FILE=C:\ProgramData\PXY\secrets\pxydata-api-key"
 set "PYTHONPATH=D:\x1\x2\PXYBACKTEST;D:\x1\x2\PXYLH;D:\x1\x2\PXYLH\backend"
 set "PXYBACKTEST_PXYLH_ROOT=D:\x1\x2\PXYLH"
-set "PXYBACKTEST_RUNTIME_ROOT=D:\x1\pxy-runtime\PXYBACKTEST"
+set "PXYBACKTEST_RUNTIME_ROOT=E:\pxy-runtime\PXYBACKTEST"
 set "PXYBACKTEST_SERVICE_TOKEN_FILE=%SERVICE_TOKEN_FILE%"
 set "PXYBACKTEST_PXYDATA_BASE_URL=http://127.0.0.1:3020"
 set "PXYBACKTEST_PXYDATA_API_KEY_FILE=%PXYDATA_KEY_FILE%"
+set "PXYBACKTEST_PXYDATA_DATA_ROOT=E:\pxy-runtime\PXYDATA\data"
+set "PXYBACKTEST_CUSTOM_NODES_ROOT=E:\pxy-runtime\PXYBACKTEST\custom_nodes"
 
 echo ============================================================
 echo   PXYBACKTEST one-click deploy
@@ -126,7 +133,7 @@ if errorlevel 1 goto :failed
 
 echo.
 echo [OK] PXYBACKTEST deployment completed and health check passed.
-echo Logs: D:\x1\pxy-runtime\PXYBACKTEST\logs
+echo Logs: E:\pxy-runtime\PXYBACKTEST\logs
 echo.
 pause
 exit /b 0
@@ -134,7 +141,7 @@ exit /b 0
 :failed
 echo.
 echo Deployment did not complete. Keep this window open and inspect:
-echo   D:\x1\pxy-runtime\PXYBACKTEST\logs
+echo   E:\pxy-runtime\PXYBACKTEST\logs
 echo.
 pause
 exit /b 1

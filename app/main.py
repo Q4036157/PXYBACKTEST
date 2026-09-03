@@ -61,6 +61,95 @@ LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
 MANIFEST_ENGINE_TYPES = {
     *DAA_ENGINE_TYPES, "microstructure", *ML_ENGINE_TYPES, *LIGHTER_ENGINE_TYPES
 }
+ENGINE_REQUIRED_DATASETS: dict[str, list[str]] = {
+    "vnpy_cta": [],
+    "a_share_portfolio": ["kline_daily"],
+    "factor_matrix": ["kline_daily", "factor_matrix_daily"],
+    "event_sentiment": ["kline_daily", "factor_matrix_daily", "events"],
+    "microstructure": ["market_ticks"],
+    "ml_factor": ["factor_matrix_daily"],
+    "deep_learning": ["factor_matrix_daily"],
+    "lighter_microstructure": [
+        "lighter_microstructure_factors",
+        "lighter_order_book_events",
+        "lighter_funding_history",
+    ],
+    "mt5_native": [],
+}
+
+
+def _runner_state(catalog: list[dict], runner_id: str) -> dict:
+    return next(
+        (item for item in catalog if item.get("runner_id") == runner_id),
+        {},
+    )
+
+
+def _apply_engine_readiness(
+    engines: list[dict],
+    *,
+    runner_catalog: list[dict],
+    quality_payload: dict | None,
+    quality_error: str | None,
+    quality_enforced: bool,
+) -> list[dict]:
+    report = (
+        quality_payload.get("report")
+        if isinstance(quality_payload, dict)
+        and isinstance(quality_payload.get("report"), dict)
+        else {}
+    )
+    datasets = report.get("datasets") if isinstance(report.get("datasets"), dict) else {}
+    certification_ready = bool(
+        report.get("certification_available")
+        and report.get("scan_complete")
+        and not report.get("stale")
+    )
+    report_id = report.get("report_id")
+    checked_at = report.get("generated_at_utc")
+
+    for engine in engines:
+        engine_id = str(engine.get("id") or "")
+        required = list(ENGINE_REQUIRED_DATASETS.get(engine_id, []))
+        runtime_available = bool(engine.get("available"))
+        blockers: list[str] = []
+
+        if engine_id in {"vnpy_cta", "mt5_native"}:
+            runner = _runner_state(runner_catalog, engine_id)
+            if runner:
+                runtime_available = bool(runner.get("runtime_detected"))
+                if not runner.get("submit_ready"):
+                    blockers.append(
+                        str(runner.get("reason") or "平台运行器尚未通过提交门禁")
+                    )
+
+        if required and quality_enforced:
+            if quality_error:
+                blockers.append(f"PXYDATA 质量认证不可用: {quality_error}")
+            elif not certification_ready:
+                blockers.append(
+                    str(report.get("reason") or "PXYDATA 全量质量认证缺失或已过期")
+                )
+            for name in required:
+                item = datasets.get(name) if isinstance(datasets, dict) else None
+                if not isinstance(item, dict):
+                    blockers.append(f"缺少数据集质量结果: {name}")
+                    continue
+                grade = str(item.get("quality_grade") or "FAIL").upper()
+                status = str(item.get("status") or "unknown")
+                if grade == "FAIL" or status in {"empty", "blocked"}:
+                    blockers.append(f"数据集 {name} 未通过认证（{status}/{grade}）")
+
+        submit_ready = runtime_available and not blockers
+        engine["runtime_available"] = runtime_available
+        engine["available"] = submit_ready
+        engine["submit_ready"] = submit_ready
+        engine["blockers"] = list(dict.fromkeys(blockers))
+        engine["required_datasets"] = required
+        engine["quality_gate_enforced"] = quality_enforced and bool(required)
+        engine["quality_report_id"] = report_id
+        engine["quality_checked_at"] = checked_at
+    return engines
 
 
 async def _verify_factor_set_binding(
@@ -220,11 +309,33 @@ def create_app(
                 a_share_catalog = await daa_adapter.get_capabilities()
             except DaaCapabilitiesError:
                 a_share_catalog = {}
-        return {
+        runner_catalog = runner_registry.catalog()
+        quality_payload: dict | None = None
+        quality_error: str | None = None
+        quality_reader = getattr(data_snapshots, "get_data_quality", None)
+        quality_enforced = callable(quality_reader)
+        if quality_enforced:
+            if data_snapshots.configured:
+                required = sorted(
+                    {
+                        dataset
+                        for datasets in ENGINE_REQUIRED_DATASETS.values()
+                        for dataset in datasets
+                    }
+                )
+                try:
+                    quality_payload = await asyncio.wait_for(
+                        quality_reader(required), timeout=5.0
+                    )
+                except (SnapshotProviderError, TimeoutError) as exc:
+                    quality_error = str(exc) or type(exc).__name__
+            else:
+                quality_error = "PXYDATA 服务地址或 API Key 未配置"
+        payload = {
             "task_contract": "pxybacktest.task-result.v2",
             "data_contract": "pxydata.backtest-data-snapshot.v1",
             "strategy_runtime_contracts": runner_contract_capabilities(),
-            "runners": runner_registry.catalog(),
+            "runners": runner_catalog,
             "replay": {
                 "contract": "pxybacktest.replay.v1",
                 "execution_stream": "complete_ordered_audited",
@@ -433,6 +544,29 @@ def create_app(
                 {"id": "mt5_native", "available": False},
             ],
         }
+        payload["engines"] = _apply_engine_readiness(
+            payload["engines"],
+            runner_catalog=runner_catalog,
+            quality_payload=quality_payload,
+            quality_error=quality_error,
+            quality_enforced=quality_enforced,
+        )
+        payload["data_quality"] = {
+            "enforced": quality_enforced,
+            "available": quality_payload is not None,
+            "report_id": (
+                (quality_payload.get("report") or {}).get("report_id")
+                if quality_payload
+                else None
+            ),
+            "checked_at": (
+                (quality_payload.get("report") or {}).get("generated_at_utc")
+                if quality_payload
+                else None
+            ),
+            "error": quality_error,
+        }
+        return payload
 
     @app.post("/api/v2/strategy-packages/validate")
     async def validate_strategy_package_route(

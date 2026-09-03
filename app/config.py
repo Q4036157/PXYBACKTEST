@@ -72,14 +72,14 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         runtime_root = Path(
-            os.getenv("PXYBACKTEST_RUNTIME_ROOT", r"D:\x1\pxy-runtime\PXYBACKTEST")
+            os.getenv("PXYBACKTEST_RUNTIME_ROOT", r"E:\pxy-runtime\PXYBACKTEST")
         )
         pxylh_root = Path(os.getenv("PXYBACKTEST_PXYLH_ROOT", r"D:\x1\x2\PXYLH"))
         daa_root = Path(os.getenv("PXYBACKTEST_DAA_ROOT", r"D:\x1\x2\DAA"))
         pxydata_data_root = Path(
             os.getenv(
                 "PXYBACKTEST_PXYDATA_DATA_ROOT",
-                r"D:\x1\pxy-runtime\PXYDATA\data",
+                r"E:\pxy-runtime\PXYDATA\data",
             )
         )
         secret_path_raw = os.getenv("PXYBACKTEST_SERVICE_TOKEN_FILE", "").strip()
@@ -115,7 +115,7 @@ class Settings:
             llm_api_key=llm_api_key,
             custom_nodes_root=Path(os.getenv(
                 "PXYBACKTEST_CUSTOM_NODES_ROOT",
-                r"D:\x1\pxy-runtime\PXYBACKTEST\custom_nodes",
+                r"E:\pxy-runtime\PXYBACKTEST\custom_nodes",
             )),
             max_concurrent_tasks=max(
                 1, int(os.getenv("PXYBACKTEST_MAX_CONCURRENT_TASKS", "1"))

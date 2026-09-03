@@ -447,8 +447,13 @@ def launch_tqsdk_worker(
     memory_mb: int | None = None,
     cpu_cores: int | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    identity_mode: Literal["configured", "current_process"] = "configured",
 ) -> dict[str, Any]:
-    """使用专用 Python 启动子进程，并限制继承环境与输出大小。"""
+    """使用专用 Python 启动子进程，并限制继承环境与输出大小。
+
+    ``current_process`` 只允许内置可信固定向量使用；其安全状态始终不能
+    满足提交门禁。用户策略必须继续使用 ``configured``。
+    """
 
     # 仅父进程需要 ctypes/Win32 沙箱 API。延迟导入可避免已经受限的策略
     # 子进程再次加载 _ctypes.pyd；安全令牌和 Job Object 在此调用之前已建立。
@@ -523,9 +528,19 @@ def launch_tqsdk_worker(
             "TMP": str(sandbox_temp),
         }
     )
-    sandbox_user = os.getenv(_SANDBOX_USER_ENV, "").strip()
-    sandbox_password = _secret_from_environment(
-        "PXYBACKTEST_TQSDK_SANDBOX_PASSWORD", _SANDBOX_PASSWORD_FILE_ENV
+    if identity_mode not in {"configured", "current_process"}:
+        raise ValueError(f"未知天勤执行身份模式: {identity_mode}")
+    sandbox_user = (
+        os.getenv(_SANDBOX_USER_ENV, "").strip()
+        if identity_mode == "configured"
+        else ""
+    )
+    sandbox_password = (
+        _secret_from_environment(
+            "PXYBACKTEST_TQSDK_SANDBOX_PASSWORD", _SANDBOX_PASSWORD_FILE_ENV
+        )
+        if identity_mode == "configured"
+        else ""
     )
     sandbox_identity = (
         SandboxIdentity(username=sandbox_user, password=sandbox_password)

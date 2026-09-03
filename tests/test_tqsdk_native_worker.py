@@ -309,6 +309,38 @@ def test_worker_reports_last_imports_after_native_crash(
     assert len(subprocess.list2cmdline(captured_command)) < 1024
 
 
+def test_trusted_fixed_vector_uses_current_process_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    task_root = tmp_path / "task"
+    task_root.mkdir()
+    request = _request(task_root)
+    monkeypatch.setenv("PXYBACKTEST_TQSDK_USERNAME", "test-user")
+    monkeypatch.setenv("PXYBACKTEST_TQSDK_PASSWORD", "test-password")
+    monkeypatch.setenv("PXYBACKTEST_TQSDK_SANDBOX_USER", "PXYTqSandbox")
+    monkeypatch.setenv("PXYBACKTEST_TQSDK_SANDBOX_PASSWORD", "sandbox-password")
+
+    class NativeCrash:
+        exit_code = 0xC06D007E
+
+    def crash(*args: object, **kwargs: object) -> NativeCrash:
+        assert kwargs["identity"] is None
+        return NativeCrash()
+
+    monkeypatch.setattr(
+        "app.windows_sandbox.launch_sandboxed_process", crash
+    )
+
+    with pytest.raises(TqSdkWorkerError, match="3228369022"):
+        launch_tqsdk_worker(
+            request,
+            python_executable=Path(sys.executable),
+            project_root=Path(__file__).parents[1],
+            timeout_seconds=5,
+            identity_mode="current_process",
+        )
+
+
 def test_tqsdk_worker_redacts_credentials_from_structured_error(
     tmp_path: Path, monkeypatch
 ) -> None:

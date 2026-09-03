@@ -8,7 +8,7 @@ import os
 import tempfile
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -26,6 +26,9 @@ from .tqsdk_native_worker import (
 
 TQSDK_ACCEPTANCE_VECTOR_ID = "tqsdk-native-au2612-1m-v1"
 TQSDK_ACCEPTANCE_GATE_CONTRACT = "pxybacktest.tqsdk-acceptance-gate.v1"
+TQSDK_TRUSTED_ACCEPTANCE_REPORT_CONTRACT = (
+    "pxybacktest.tqsdk-trusted-acceptance-report.v1"
+)
 DEFAULT_SYMBOL = "SHFE.au2612"
 DEFAULT_START_DATE = date(2026, 8, 18)
 DEFAULT_END_DATE = date(2026, 8, 20)
@@ -78,7 +81,12 @@ def _python_path() -> Path:
     return Path(__file__).parents[1] / ".venv" / "Scripts" / "python.exe"
 
 
-def run_tqsdk_acceptance_candidate() -> dict[str, Any]:
+def run_tqsdk_acceptance_candidate(
+    *,
+    execution_lane: Literal[
+        "dedicated_sandbox", "trusted_fixed_vector"
+    ] = "dedicated_sandbox",
+) -> dict[str, Any]:
     """在真实 TqSdk/TqBacktest 上执行固定黄金向量。"""
 
     strategy = acceptance_strategy_path()
@@ -109,6 +117,11 @@ def run_tqsdk_acceptance_candidate() -> dict[str, Any]:
             python_executable=_python_path(),
             project_root=Path(__file__).parents[1],
             timeout_seconds=600,
+            identity_mode=(
+                "current_process"
+                if execution_lane == "trusted_fixed_vector"
+                else "configured"
+            ),
         )
     visual = dict(native.get("visual") or {})
     if not visual.get("available") or int(visual.get("bar_history_count") or 0) < 1:
@@ -122,13 +135,46 @@ def run_tqsdk_acceptance_candidate() -> dict[str, Any]:
         },
         "diagnostics": {
             "runtime_identity": native["runtime_identity"],
-            "sandbox": native["sandbox"],
+            "sandbox": {
+                **native["sandbox"],
+                "execution_lane": execution_lane,
+                "trusted_code_only": execution_lane == "trusted_fixed_vector",
+                # 可信固定向量只能证明功能一致性，不能开放用户策略提交。
+                "submit_ready": False
+                if execution_lane == "trusted_fixed_vector"
+                else bool(native["sandbox"].get("submit_ready")),
+            },
         },
         "deals": native.get("deals") or [],
         "account_curve": native.get("account_curve") or [],
         "final_account": native.get("final_account") or {},
         "execution_snapshot": native.get("execution_snapshot") or {},
         "replay_audit": native.get("replay_audit") or {},
+    }
+
+
+def run_tqsdk_trusted_acceptance() -> dict[str, Any]:
+    """连续运行两次内置可信向量，只生成三维功能验收报告。"""
+
+    first = run_tqsdk_acceptance_candidate(
+        execution_lane="trusted_fixed_vector"
+    )
+    vector = build_tqsdk_acceptance_vector(first)
+    second = run_tqsdk_acceptance_candidate(
+        execution_lane="trusted_fixed_vector"
+    )
+    result = compare_acceptance_vector(vector, second)
+    return {
+        "contract_version": TQSDK_TRUSTED_ACCEPTANCE_REPORT_CONTRACT,
+        "vector_id": vector.vector_id,
+        "execution_lane": "trusted_fixed_vector",
+        "trusted_code_only": True,
+        "all_passed": result.all_passed,
+        "submit_ready": False,
+        "vector": vector.model_dump(mode="json"),
+        "first_actual": first,
+        "second_actual": second,
+        "acceptance": result.model_dump(mode="json"),
     }
 
 
@@ -262,11 +308,13 @@ def write_json(path: Path, payload: Any) -> None:
 
 __all__ = [
     "TQSDK_ACCEPTANCE_GATE_CONTRACT",
+    "TQSDK_TRUSTED_ACCEPTANCE_REPORT_CONTRACT",
     "TQSDK_ACCEPTANCE_VECTOR_ID",
     "TqSdkAcceptanceGate",
     "build_tqsdk_acceptance_gate",
     "build_tqsdk_acceptance_vector",
     "load_tqsdk_acceptance_gate",
     "run_tqsdk_acceptance_candidate",
+    "run_tqsdk_trusted_acceptance",
     "write_json",
 ]

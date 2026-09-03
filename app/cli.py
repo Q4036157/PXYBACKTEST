@@ -176,6 +176,11 @@ def build_parser() -> argparse.ArgumentParser:
     accept_tqsdk.add_argument("--vector", required=True)
     accept_tqsdk.add_argument("--gate-output", required=True)
     accept_tqsdk.add_argument("--actual-output", default=None)
+    trusted_tqsdk = sub.add_parser(
+        "verify-tqsdk-trusted",
+        help="连续执行两次内置天勤固定向量；只验证功能，不生成提交门禁",
+    )
+    trusted_tqsdk.add_argument("--report-output", required=True)
 
     submit = sub.add_parser("submit", help="提交一个 JSON 回测任务")
     submit.add_argument("--request-file", required=True, help="SubmitBacktestRequest(V2) JSON 文件")
@@ -290,6 +295,24 @@ def main(argv: list[str] | None = None, *, output: TextIO | None = None) -> int:
                 out,
             )
             return 0
+        if args.command == "verify-tqsdk-trusted":
+            from .tqsdk_acceptance import (
+                run_tqsdk_trusted_acceptance,
+                write_json,
+            )
+
+            report = run_tqsdk_trusted_acceptance()
+            write_json(Path(args.report_output), report)
+            _write_json(
+                {
+                    "all_passed": report["all_passed"],
+                    "submit_ready": False,
+                    "execution_lane": report["execution_lane"],
+                    "report": str(Path(args.report_output).resolve()),
+                },
+                out,
+            )
+            return 0 if report["all_passed"] else 2
         if args.command == "health":
             # 健康接口不需要服务令牌。
             client = BacktestApiClient(

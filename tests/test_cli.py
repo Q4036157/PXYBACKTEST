@@ -114,3 +114,34 @@ def test_run_saves_terminal_snapshot(tmp_path, monkeypatch):
     ) == 0
     assert json.loads(save_file.read_text(encoding="utf-8"))["status"] == "completed"
     assert ("GET", "/api/v1/tasks/task-2") in calls
+
+
+def test_trusted_tqsdk_cli_writes_report_without_opening_gate(
+    tmp_path, monkeypatch
+):
+    report_file = tmp_path / "trusted-report.json"
+
+    def trusted_report():
+        return {
+            "all_passed": True,
+            "submit_ready": False,
+            "execution_lane": "trusted_fixed_vector",
+        }
+
+    monkeypatch.setattr(
+        "app.tqsdk_acceptance.run_tqsdk_trusted_acceptance", trusted_report
+    )
+    output = io.StringIO()
+
+    code = cli.main(
+        [
+            "verify-tqsdk-trusted",
+            "--report-output",
+            str(report_file),
+        ],
+        output=output,
+    )
+
+    assert code == 0
+    assert json.loads(report_file.read_text(encoding="utf-8"))["submit_ready"] is False
+    assert json.loads(output.getvalue())["submit_ready"] is False

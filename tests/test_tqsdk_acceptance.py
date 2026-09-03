@@ -10,6 +10,7 @@ from app.tqsdk_acceptance import (
     build_tqsdk_acceptance_gate,
     build_tqsdk_acceptance_vector,
     load_tqsdk_acceptance_gate,
+    run_tqsdk_trusted_acceptance,
 )
 
 
@@ -97,3 +98,26 @@ def test_tqsdk_visual_difference_blocks_gate() -> None:
 
     assert result.all_passed is False
     assert result.visual.status == "failed"
+
+
+def test_trusted_acceptance_passes_three_dimensions_but_never_opens_gate(
+    monkeypatch,
+) -> None:
+    actual = _actual()
+    actual["diagnostics"]["sandbox"]["submit_ready"] = False
+    lanes: list[str] = []
+
+    def candidate(*, execution_lane: str = "dedicated_sandbox") -> dict:
+        lanes.append(execution_lane)
+        return json.loads(json.dumps(actual))
+
+    monkeypatch.setattr(
+        "app.tqsdk_acceptance.run_tqsdk_acceptance_candidate", candidate
+    )
+
+    report = run_tqsdk_trusted_acceptance()
+
+    assert lanes == ["trusted_fixed_vector", "trusted_fixed_vector"]
+    assert report["all_passed"] is True
+    assert report["submit_ready"] is False
+    assert report["trusted_code_only"] is True

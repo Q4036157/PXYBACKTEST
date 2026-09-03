@@ -183,6 +183,34 @@ def test_tqsdk_worker_runs_original_script_in_dedicated_process(
     assert len(result["replay_events"]) == 6
 
 
+def test_trusted_current_process_runs_only_as_non_submit_ready(
+    tmp_path: Path, monkeypatch
+) -> None:
+    task_root = tmp_path / "trusted-task"
+    task_root.mkdir()
+    runtime = _fake_tqsdk(tmp_path / "trusted-fake-runtime")
+    monkeypatch.setenv("PXYBACKTEST_TQSDK_USERNAME", "test-user")
+    monkeypatch.setenv("PXYBACKTEST_TQSDK_PASSWORD", "test-password")
+
+    result = launch_tqsdk_worker(
+        _request(task_root),
+        python_executable=Path(sys.executable),
+        project_root=Path(__file__).parents[1],
+        timeout_seconds=5,
+        runtime_pythonpaths=[runtime],
+        identity_mode="trusted_current_process",
+    )
+
+    assert result["runtime_identity"] == "tqsdk-3.10.1-test"
+    assert result["sandbox"]["restricted_token"] is False
+    assert result["sandbox"]["job_object"] is False
+    assert result["sandbox"]["dedicated_identity"] is False
+    assert result["sandbox"]["submit_ready"] is False
+    assert result["sandbox"]["process_creation_api"] == (
+        "subprocess.Popen(trusted_current_process)"
+    )
+
+
 def test_tqsdk_worker_requires_controlled_credentials(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -309,7 +337,7 @@ def test_worker_reports_last_imports_after_native_crash(
     assert len(subprocess.list2cmdline(captured_command)) < 1024
 
 
-def test_trusted_fixed_vector_uses_current_process_identity(
+def test_trusted_fixed_vector_bypasses_restricted_launcher(
     tmp_path: Path, monkeypatch
 ) -> None:
     task_root = tmp_path / "task"
@@ -320,15 +348,23 @@ def test_trusted_fixed_vector_uses_current_process_identity(
     monkeypatch.setenv("PXYBACKTEST_TQSDK_SANDBOX_USER", "PXYTqSandbox")
     monkeypatch.setenv("PXYBACKTEST_TQSDK_SANDBOX_PASSWORD", "sandbox-password")
 
-    class NativeCrash:
+    class TrustedResult:
         exit_code = 0xC06D007E
 
-    def crash(*args: object, **kwargs: object) -> NativeCrash:
-        assert kwargs["identity"] is None
-        return NativeCrash()
+    def restricted_launch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("可信固定向量不能进入受限令牌启动器")
+
+    def trusted_launch(*args: object, **kwargs: object) -> TrustedResult:
+        assert kwargs["cwd"] == task_root
+        return TrustedResult()
 
     monkeypatch.setattr(
-        "app.windows_sandbox.launch_sandboxed_process", crash
+        "app.windows_sandbox.launch_sandboxed_process", restricted_launch
+    )
+    monkeypatch.setattr(
+        tqsdk_native_worker,
+        "_launch_trusted_current_process",
+        trusted_launch,
     )
 
     with pytest.raises(TqSdkWorkerError, match="3228369022"):
@@ -337,7 +373,7 @@ def test_trusted_fixed_vector_uses_current_process_identity(
             python_executable=Path(sys.executable),
             project_root=Path(__file__).parents[1],
             timeout_seconds=5,
-            identity_mode="current_process",
+            identity_mode="trusted_current_process",
         )
 
 

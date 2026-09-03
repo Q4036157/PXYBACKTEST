@@ -118,7 +118,7 @@ def run_tqsdk_acceptance_candidate(
             project_root=Path(__file__).parents[1],
             timeout_seconds=600,
             identity_mode=(
-                "current_process"
+                "trusted_current_process"
                 if execution_lane == "trusted_fixed_vector"
                 else "configured"
             ),

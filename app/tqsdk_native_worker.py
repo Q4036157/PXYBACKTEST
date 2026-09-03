@@ -13,17 +13,22 @@ import json
 import math
 import os
 import runpy
+import subprocess
 import sys
+import time
 import traceback
 from collections.abc import Mapping
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .kernel import stable_hash
 from .tqsdk_replay import build_tqsdk_replay
+
+if TYPE_CHECKING:
+    from .windows_sandbox import SandboxLimits, SandboxProcessResult
 
 
 TQSDK_WORKER_CONTRACT = "pxybacktest.tqsdk-native-worker.v1"
@@ -437,6 +442,70 @@ def _write_result(path: Path, payload: Mapping[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _launch_trusted_current_process(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    environment: Mapping[str, str],
+    limits: SandboxLimits,
+    cancel_check: Callable[[], bool] | None,
+) -> SandboxProcessResult:
+    """仅为内置固定向量启动当前完整身份的独立进程。
+
+    管理员进程经 ``CreateRestrictedToken(..., LUA_TOKEN)`` 再启动 Python 时，
+    已在真实验收中稳定得到 ``STATUS_DLL_INIT_FAILED (0xC0000142)``，而同一
+    解释器在当前完整身份下可以导入 ``ssl/aiohttp/tqsdk``。此通道不接收
+    用户策略，也不返回任何沙箱就绪证明。
+    """
+
+    from .windows_sandbox import (
+        SandboxCancelledError,
+        SandboxProcessResult,
+        SandboxTimeoutError,
+    )
+
+    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        process = subprocess.Popen(
+            list(command),
+            cwd=str(cwd),
+            env=dict(environment),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creation_flags,
+        )
+    except OSError as exc:
+        raise TqSdkWorkerError(f"天勤可信固定向量子进程启动失败: {exc}") from exc
+
+    deadline = time.monotonic() + int(limits.timeout_seconds)
+    try:
+        while process.poll() is None:
+            if cancel_check is not None and cancel_check():
+                process.kill()
+                raise SandboxCancelledError("天勤可信固定向量任务已取消")
+            if time.monotonic() >= deadline:
+                process.kill()
+                raise SandboxTimeoutError("天勤可信固定向量子进程执行超时")
+            time.sleep(0.05)
+        return SandboxProcessResult(
+            exit_code=int(process.returncode or 0),
+            restricted_token=False,
+            job_object=False,
+            dedicated_identity=False,
+            task_directory_acl=False,
+            network_allowlist_enforced=False,
+            network_policy_id=None,
+            network_policy_sha256=None,
+            process_creation_api="subprocess.Popen(trusted_current_process)",
+            limits=limits,
+        )
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+
+
 def launch_tqsdk_worker(
     request: TqSdkWorkerRequest,
     *,
@@ -447,12 +516,15 @@ def launch_tqsdk_worker(
     memory_mb: int | None = None,
     cpu_cores: int | None = None,
     cancel_check: Callable[[], bool] | None = None,
-    identity_mode: Literal["configured", "current_process"] = "configured",
+    identity_mode: Literal[
+        "configured", "trusted_current_process"
+    ] = "configured",
 ) -> dict[str, Any]:
     """使用专用 Python 启动子进程，并限制继承环境与输出大小。
 
-    ``current_process`` 只允许内置可信固定向量使用；其安全状态始终不能
-    满足提交门禁。用户策略必须继续使用 ``configured``。
+    ``trusted_current_process`` 只允许内置可信固定向量使用；它绕过会让
+    管理员 Python 在加载器阶段崩溃的受限令牌，但安全状态始终不能满足
+    提交门禁。用户策略必须继续使用 ``configured``。
     """
 
     # 仅父进程需要 ctypes/Win32 沙箱 API。延迟导入可避免已经受限的策略
@@ -528,7 +600,7 @@ def launch_tqsdk_worker(
             "TMP": str(sandbox_temp),
         }
     )
-    if identity_mode not in {"configured", "current_process"}:
+    if identity_mode not in {"configured", "trusted_current_process"}:
         raise ValueError(f"未知天勤执行身份模式: {identity_mode}")
     sandbox_user = (
         os.getenv(_SANDBOX_USER_ENV, "").strip()
@@ -559,19 +631,29 @@ def launch_tqsdk_worker(
         "--request",
         str(request_path),
     ]
+    limits = SandboxLimits(
+        timeout_seconds=max(1, int(timeout_seconds)),
+        memory_mb=memory_mb or request.memory_mb,
+        cpu_cores=cpu_cores or request.cpu_cores,
+    )
     try:
-        completed = launch_sandboxed_process(
-            command,
-            cwd=request.task_root,
-            environment=child_env,
-            limits=SandboxLimits(
-                timeout_seconds=max(1, int(timeout_seconds)),
-                memory_mb=memory_mb or request.memory_mb,
-                cpu_cores=cpu_cores or request.cpu_cores,
-            ),
-            cancel_check=cancel_check,
-            identity=sandbox_identity,
-        )
+        if identity_mode == "trusted_current_process":
+            completed = _launch_trusted_current_process(
+                command,
+                cwd=request.task_root,
+                environment=child_env,
+                limits=limits,
+                cancel_check=cancel_check,
+            )
+        else:
+            completed = launch_sandboxed_process(
+                command,
+                cwd=request.task_root,
+                environment=child_env,
+                limits=limits,
+                cancel_check=cancel_check,
+                identity=sandbox_identity,
+            )
     except SandboxCancelledError as exc:
         raise TqSdkWorkerError("天勤策略任务已取消") from exc
     except SandboxTimeoutError as exc:

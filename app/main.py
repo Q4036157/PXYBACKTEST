@@ -122,6 +122,8 @@ def _apply_engine_readiness(
                     blockers.append(
                         str(runner.get("reason") or "平台运行器尚未通过提交门禁")
                     )
+        elif not runtime_available:
+            blockers.append("引擎运行时或策略适配器不可用")
 
         if required and quality_enforced:
             if quality_error:

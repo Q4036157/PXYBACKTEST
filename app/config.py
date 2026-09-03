@@ -18,6 +18,7 @@ class Settings:
     service_token: str
     # 工作站实际 DAA 仓库目录；可通过 PXYBACKTEST_DAA_ROOT 覆盖。
     daa_root: Path = Path(r"D:\x1\x2\DAA")
+    daa_python_override: Path | None = None
     pxydata_data_root: Path = Path(r"E:\pxy-runtime\PXYDATA\data")
     pxydata_base_url: str = "http://127.0.0.1:3020"
     pxydata_api_key: str = ""
@@ -50,6 +51,8 @@ class Settings:
 
     @property
     def daa_python(self) -> Path:
+        if self.daa_python_override is not None:
+            return self.daa_python_override
         windows_python = self.daa_backend_root / ".venv" / "Scripts" / "python.exe"
         if windows_python.is_file():
             return windows_python
@@ -76,6 +79,7 @@ class Settings:
         )
         pxylh_root = Path(os.getenv("PXYBACKTEST_PXYLH_ROOT", r"D:\x1\x2\PXYLH"))
         daa_root = Path(os.getenv("PXYBACKTEST_DAA_ROOT", r"D:\x1\x2\DAA"))
+        daa_python_raw = os.getenv("PXYBACKTEST_DAA_PYTHON", "").strip()
         pxydata_data_root = Path(
             os.getenv(
                 "PXYBACKTEST_PXYDATA_DATA_ROOT",
@@ -104,6 +108,7 @@ class Settings:
             pxylh_root=pxylh_root,
             service_token=service_token,
             daa_root=daa_root,
+            daa_python_override=Path(daa_python_raw) if daa_python_raw else None,
             pxydata_data_root=pxydata_data_root,
             pxydata_base_url=os.getenv(
                 "PXYBACKTEST_PXYDATA_BASE_URL", "http://127.0.0.1:3020"

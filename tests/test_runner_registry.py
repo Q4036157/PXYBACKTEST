@@ -168,6 +168,46 @@ def test_vnpy_requires_runtime_and_worker_adapter_before_submission(
     assert result["submit_ready"] is True
 
 
+def test_vnpy_allows_runtime_python_outside_deployed_source_root(
+    tmp_path: Path,
+) -> None:
+    pxylh_release = tmp_path / "deploy" / "PXYLH" / "current"
+    python = tmp_path / "source" / "PXYLH" / "venv312" / "Scripts" / "python.exe"
+    project = tmp_path / "PXYBACKTEST"
+    _touch(python)
+    (pxylh_release / "vnpy").mkdir(parents=True)
+    _touch(
+        pxylh_release
+        / "backend"
+        / "services"
+        / "backtest_service"
+        / "engine_runner.py"
+    )
+    _touch(
+        pxylh_release
+        / "backend"
+        / "services"
+        / "backtest_service"
+        / "models.py"
+    )
+    _touch(project / "app" / "worker_process.py")
+
+    registry = build_runner_registry(
+        RunnerProbeConfig(
+            project_root=project,
+            pxylh_root=pxylh_release,
+            vnpy_python=python,
+            tqsdk_python=None,
+            mt4_terminal=tmp_path / "missing-mt4.exe",
+            mt5_terminal=tmp_path / "missing-mt5.exe",
+        )
+    )
+
+    vnpy = next(item for item in registry.capabilities if item.runner_id == "vnpy_cta")
+    assert vnpy.runtime_detected is True
+    assert vnpy.submit_ready is True
+
+
 def test_detected_native_platform_is_not_reported_as_submit_ready(
     tmp_path: Path,
 ) -> None:

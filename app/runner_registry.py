@@ -77,6 +77,7 @@ class RunnerProbeConfig:
     mt4_terminal: Path
     mt5_terminal: Path
     tqsdk_acceptance_path: Path | None = None
+    vnpy_python: Path | None = None
 
     @classmethod
     def from_environment(
@@ -91,6 +92,7 @@ class RunnerProbeConfig:
         tq_acceptance_raw = values.get(
             "PXYBACKTEST_TQSDK_ACCEPTANCE_FILE", ""
         ).strip()
+        vnpy_raw = values.get("PXYBACKTEST_VNPY_PYTHON", "").strip()
         return cls(
             project_root=(project_root or Path(__file__).resolve().parents[1]),
             pxylh_root=pxylh_root,
@@ -109,6 +111,11 @@ class RunnerProbeConfig:
             ),
             tqsdk_acceptance_path=(
                 Path(tq_acceptance_raw) if tq_acceptance_raw else None
+            ),
+            vnpy_python=(
+                Path(vnpy_raw)
+                if vnpy_raw
+                else pxylh_root / "venv312" / "Scripts" / "python.exe"
             ),
         )
 
@@ -263,7 +270,8 @@ def build_runner_registry(config: RunnerProbeConfig) -> RunnerRegistry:
         config.project_root / "app" / "worker_process.py",
     )
     vnpy_runtime_files = (
-        config.pxylh_root / "venv312" / "Scripts" / "python.exe",
+        config.vnpy_python
+        or config.pxylh_root / "venv312" / "Scripts" / "python.exe",
         config.pxylh_root / "vnpy",
     )
     vnpy_runtime_detected = all(path.exists() for path in vnpy_runtime_files)

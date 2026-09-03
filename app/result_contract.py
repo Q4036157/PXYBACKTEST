@@ -72,6 +72,7 @@ def build_result_v2(
         "strategy": task.get("strategy") or {},
         "data_snapshot": snapshot,
         "run": {
+            "default_profile": task.get("default_profile"),
             "universe": task.get("universe") or {},
             "period": task.get("period") or {},
             "execution": task.get("execution") or {},
@@ -171,6 +172,7 @@ def build_a_share_result_v2(
         "data_snapshot": snapshot,
         "input_snapshot": input_snapshot,
         "run": {
+            "default_profile": task.get("default_profile"),
             "universe": task.get("universe") or {},
             "period": task.get("period") or {},
             "execution": task.get("execution") or {},

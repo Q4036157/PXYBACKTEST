@@ -18,6 +18,7 @@ from app.main import _bind_factor_set_to_manifest, create_app
 from app.models import (
     DataSnapshotRefV2,
     DataSnapshotSelectionV2,
+    OptimizationConfigV2,
     SubmitBacktestRequestV2,
 )
 from app.pxydata_client import PxyDataSnapshotClient, SnapshotProviderError
@@ -694,6 +695,52 @@ def test_v2_model_rejects_invalid_data_choice_and_compares_actual_instants() -> 
         "end": "2026-08-01T16:00:00+00:00",
     }
     assert SubmitBacktestRequestV2.model_validate(payload).period.end.endswith("+00:00")
+
+
+def test_optimization_contract_defaults_to_twenty_trials() -> None:
+    optimization = OptimizationConfigV2.model_validate(
+        {
+            "method": "optuna",
+            "search_space": {"holding_days": {"type": "int", "low": 3, "high": 20}},
+            "objectives": [{"metric": "total_return", "direction": "maximize"}],
+        }
+    )
+
+    assert optimization.n_trials == 20
+
+
+def test_capabilities_publish_versioned_recommended_defaults(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    manager = StoreOnlyManager(TaskStore(settings.database_path))
+    app = create_app(settings, manager)
+
+    with TestClient(app) as client:
+        response = client.get("/api/v2/capabilities", headers=_headers())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["default_profile_contract"] == "pxybacktest.default-profile.v1"
+    profiles = {item["profile_id"]: item for item in payload["default_profiles"]}
+    assert profiles["futures-minute-recommended"]["defaults"]["period"]["lookback_days"] == 153
+    assert profiles["a-share-daily-recommended"]["defaults"]["optimization"]["n_trials"] == 20
+    assert profiles["a-share-daily-recommended"]["defaults"]["learning"]["max_epochs"] == 20
+    assert profiles["tick-recommended"]["defaults"]["period"]["lookback_days"] == 6
+    engines = {item["engine_id"]: item for item in payload["engines"]}
+    assert engines["vnpy_cta"]["default_profile_ids"] == ["futures-minute-recommended"]
+
+
+def test_task_contract_and_result_preserve_default_profile() -> None:
+    payload = _payload()
+    payload["default_profile"] = {
+        "profile_id": "futures-minute-recommended",
+        "profile_version": "1.0.0",
+    }
+    task = SubmitBacktestRequestV2.model_validate(payload)
+    request = {"_task_contract": task.model_dump(mode="json")}
+
+    result = build_result_v2(task_id="task-profile", request=request, raw_result={})
+
+    assert result["run"]["default_profile"] == payload["default_profile"]
 
 
 def test_snapshot_client_filters_provider_only_fields(

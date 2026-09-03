@@ -151,6 +151,7 @@ class TaskStore:
             "task_id": task_id,
             "schema_version": int(task_contract.get("schema_version") or 1),
             "engine_type": task_contract.get("engine_type", "vnpy_cta"),
+            "default_profile": task_contract.get("default_profile"),
             "data_snapshot": task_contract.get("data", {}).get("snapshot"),
             "status": "pending",
             "progress": 0.0,
@@ -543,6 +544,7 @@ class TaskStore:
                     "task_id": str(row["task_id"]),
                     "schema_version": int(task_contract.get("schema_version") or 1),
                     "engine_type": task_contract.get("engine_type", "vnpy_cta"),
+                    "default_profile": task_contract.get("default_profile"),
                     "data_snapshot": task_contract.get("data", {}).get("snapshot"),
                     "strategy_class": request.get("strategy_class")
                     or strategy.get("entrypoint", ""),

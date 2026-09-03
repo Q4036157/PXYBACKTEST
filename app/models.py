@@ -371,7 +371,7 @@ class OptimizationConfigV2(BaseModel):
     method: Literal["optuna", "walk_forward"]
     search_space: dict[str, SearchDimensionV2] = Field(min_length=1, max_length=16)
     objectives: list[OptimizationObjectiveV2] = Field(min_length=1, max_length=3)
-    n_trials: int = Field(default=30, ge=1, le=500)
+    n_trials: int = Field(default=20, ge=1, le=500)
     sampler_seed: int = 42
     train_days: int = Field(default=252, ge=2, le=3650)
     test_days: int = Field(default=63, ge=1, le=730)
@@ -398,11 +398,19 @@ class OptimizationConfigV2(BaseModel):
         return values
 
 
+class DefaultProfileRefV2(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile_id: str = Field(min_length=1, max_length=100)
+    profile_version: str = Field(min_length=1, max_length=50)
+
+
 class SubmitBacktestRequestV2(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal[2] = 2
     engine_type: EngineType
+    default_profile: DefaultProfileRefV2 | None = None
     strategy: StrategyIdentityV2
     universe: UniverseV2
     period: BacktestPeriodV2

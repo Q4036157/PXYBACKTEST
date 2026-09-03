@@ -15,6 +15,11 @@ from .daa_client import (
     DaaCapabilitiesClient,
     DaaCapabilitiesError,
 )
+from .default_profiles import (
+    DEFAULT_PROFILE_CONTRACT,
+    default_profile_catalog,
+    profile_ids_for_engine,
+)
 from .manager import QueueLimitError, TaskManager
 from .microstructure import (
     MICROSTRUCTURE_STRATEGY_HASH,
@@ -336,6 +341,8 @@ def create_app(
         payload = {
             "task_contract": "pxybacktest.task-result.v2",
             "data_contract": "pxydata.backtest-data-snapshot.v1",
+            "default_profile_contract": DEFAULT_PROFILE_CONTRACT,
+            "default_profiles": default_profile_catalog(),
             "strategy_runtime_contracts": runner_contract_capabilities(),
             "runners": runner_catalog,
             "replay": {
@@ -553,6 +560,10 @@ def create_app(
             quality_error=quality_error,
             quality_enforced=quality_enforced,
         )
+        for engine in payload["engines"]:
+            engine_id = str(engine.get("id") or "")
+            engine["engine_id"] = engine_id
+            engine["default_profile_ids"] = profile_ids_for_engine(engine_id)
         payload["data_quality"] = {
             "enforced": quality_enforced,
             "available": quality_payload is not None,

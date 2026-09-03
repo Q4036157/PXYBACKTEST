@@ -217,6 +217,21 @@ def test_visual_gate_interval_can_follow_speed_without_changing_event_order() ->
     assert gate.offer(second, now=0.020) is second
 
 
+def test_visual_gate_forces_each_completed_bar_even_inside_frame_interval() -> None:
+    gate = VisualProjectionGate(interval_ms=33)
+    first_open = {"datetime": "2026-08-01 09:30:00", "close": 100}
+    first_close = {"datetime": "2026-08-01 09:30:00", "close": 102}
+    second_open = {"datetime": "2026-08-01 09:31:00", "close": 103}
+    second_close = {"datetime": "2026-08-01 09:31:00", "close": 104}
+
+    assert gate.offer(first_open, now=0.0) is first_open
+    assert gate.offer(first_close, now=0.01) is None
+    assert gate.offer(first_close, now=0.01, force=True) is first_close
+    assert gate.offer(second_open, now=0.02) is None
+    assert gate.offer(second_close, now=0.02, force=True) is second_close
+    assert gate.flush() is None
+
+
 def test_replay_audit_chain_is_deterministic_and_counts_all_events() -> None:
     def build() -> ReplayAudit:
         audit = ReplayAudit(run_id="run-1", snapshot_id=SNAPSHOT)

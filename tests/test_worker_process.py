@@ -10,6 +10,7 @@ from app.worker_process import (
     _configure_backtest_worker_logging,
     _emit,
     _emit_result_execution_snapshot,
+    _is_completed_visual_bar,
     _parse_request_rate,
     _replay_non_cta_result,
     build_replay_event_snapshot,
@@ -17,6 +18,20 @@ from app.worker_process import (
     run_lighter_worker,
     run_microstructure_worker,
 )
+
+
+def test_completed_visual_bar_detection_only_accepts_final_frame() -> None:
+    class Task:
+        replay_bar_progress = 0.998
+
+    task = Task()
+    assert _is_completed_visual_bar(task) is False
+
+    task.replay_bar_progress = 0.999
+    assert _is_completed_visual_bar(task) is True
+
+    task.replay_bar_progress = 1.0
+    assert _is_completed_visual_bar(task) is True
 
 
 def test_parse_request_rate_preserves_explicit_zero() -> None:

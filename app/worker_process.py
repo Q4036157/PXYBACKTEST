@@ -32,6 +32,15 @@ def _parse_request_rate(request: dict[str, Any], default: float = 0.0004) -> flo
     return float(value)
 
 
+def _is_completed_visual_bar(task: Any) -> bool:
+    """只在当前 K 线完整形成时强制保留最终显示帧。"""
+
+    try:
+        return float(getattr(task, "replay_bar_progress", 0.0) or 0.0) >= 0.999
+    except (TypeError, ValueError):
+        return False
+
+
 def _configure_backtest_worker_logging() -> None:
     """让工作进程输出回测数据链路的 INFO 日志。"""
     logger = logging.getLogger("backtest_service")
@@ -1362,7 +1371,13 @@ def run_backtest_worker(
         replay_audit.record(event_type, payload)
         if visual_projection_gate is None or event_type != "bar":
             return _emit(event_queue, event_type, payload, reliable=True)
-        pending = visual_projection_gate.offer((event_type, dict(payload)))
+        # 普通 Tick 可以按显示帧合并，但每根 K 线的最终状态必须保留。
+        # 否则下一分钟的开盘 Tick 会覆盖上一分钟尚未发出的收盘帧，
+        # 页面会同时出现分钟缺口和大量 OHLC 相等的“横线”。
+        pending = visual_projection_gate.offer(
+            (event_type, dict(payload)),
+            force=_is_completed_visual_bar(task),
+        )
         if pending is None:
             return True
         projected_type, projected_payload = pending

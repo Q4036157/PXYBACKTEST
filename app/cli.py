@@ -171,6 +171,11 @@ def build_parser() -> argparse.ArgumentParser:
     evidence_vnpy.add_argument("--output-dir", required=True)
     evidence_vnpy.add_argument("--reviewer", required=True)
     evidence_vnpy.add_argument(
+        "--workspace-root",
+        default=os.getenv("PXY_WORKSPACE_ROOT", ""),
+        help="用于绑定 Git 仓库矩阵的工作区根目录",
+    )
+    evidence_vnpy.add_argument(
         "--vector",
         default=str(
             Path(__file__).parents[1]
@@ -261,6 +266,9 @@ def main(argv: list[str] | None = None, *, output: TextIO | None = None) -> int:
                     output_dir=Path(args.output_dir),
                     reviewer=args.reviewer,
                     vector_path=Path(args.vector),
+                    workspace_root=(
+                        Path(args.workspace_root) if args.workspace_root else None
+                    ),
                 )
             except (OSError, ValueError) as exc:
                 raise CliError(str(exc)) from exc

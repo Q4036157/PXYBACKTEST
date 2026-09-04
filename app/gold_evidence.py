@@ -43,8 +43,7 @@ def _git_output(repository: Path, *arguments: str) -> bytes:
     return completed.stdout
 
 
-def _repository_matrix(repository_root: Path) -> dict[str, dict[str, Any]]:
-    workspace_root = repository_root.parent
+def _repository_matrix(workspace_root: Path) -> dict[str, dict[str, Any]]:
     matrix: dict[str, dict[str, Any]] = {}
     for name in ("PXYBACKTEST", "PXYLH", "PXYDATA", "DAA", "PXYOPS"):
         repository = workspace_root / name
@@ -67,6 +66,7 @@ def generate_vnpy_gold_evidence(
     output_dir: Path,
     reviewer: str,
     vector_path: Path,
+    workspace_root: Path | None = None,
     actual_factory: Callable[[], dict[str, Any]] = run_vnpy_acceptance_vector,
     repositories: Mapping[str, Mapping[str, Any]] | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -76,6 +76,17 @@ def generate_vnpy_gold_evidence(
     reviewer_name = reviewer.strip()
     if not reviewer_name:
         raise ValueError("复核人（reviewer）不能为空")
+    repository_matrix = (
+        {name: dict(value) for name, value in repositories.items()}
+        if repositories is not None
+        else _repository_matrix(
+            workspace_root.resolve()
+            if workspace_root is not None
+            else Path(__file__).parents[2]
+        )
+    )
+    if not repository_matrix:
+        raise ValueError("GOLD-001 仓库矩阵为空，请显式指定工作区根目录")
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
 
@@ -171,11 +182,6 @@ def generate_vnpy_gold_evidence(
     artifact_sha256 = {
         filename: _file_sha256(output_dir / filename) for filename in artifacts
     }
-    repository_matrix = (
-        {name: dict(value) for name, value in repositories.items()}
-        if repositories is not None
-        else _repository_matrix(Path(__file__).parents[1])
-    )
     manifest = {
         "contract_version": EVIDENCE_CONTRACT_VERSION,
         "acceptance_standard_version": ACCEPTANCE_STANDARD_VERSION,

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
 
 from app.gold_evidence import generate_vnpy_gold_evidence
 from app.kernel import stable_hash
@@ -78,3 +81,18 @@ def test_generate_vnpy_gold_evidence_writes_complete_package(tmp_path):
         "task-result.json",
     }
     assert (output_dir / "SHA256SUMS.txt").read_text(encoding="ascii").count("\n") == 6
+
+
+def test_gold_evidence_rejects_empty_repository_matrix(tmp_path) -> None:
+    with pytest.raises(ValueError, match="仓库矩阵为空"):
+        generate_vnpy_gold_evidence(
+            output_dir=tmp_path / "evidence",
+            reviewer="自动复核",
+            vector_path=Path(__file__).parents[1]
+            / "acceptance"
+            / "vectors"
+            / "vnpy_cta_native_v1.json",
+            repositories={},
+        )
+
+    assert not (tmp_path / "evidence").exists()

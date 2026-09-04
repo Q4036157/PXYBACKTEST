@@ -14,6 +14,7 @@ from .kernel import stable_hash
 
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+QUEUE_STATUSES = {"pending", "waiting_for_data"}
 RESULT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
@@ -184,6 +185,8 @@ class TaskStore:
         request: dict[str, Any],
         max_queued: int,
         idempotency_key: str | None = None,
+        initial_status: str = "pending",
+        idempotency_payload: dict[str, Any] | None = None,
     ) -> TaskCreationReceipt:
         """在同一 SQLite 事务中检查队列并创建任务。
 
@@ -195,7 +198,11 @@ class TaskStore:
         normalized_key = str(idempotency_key or "").strip() or None
         if normalized_key is not None and len(normalized_key) > 200:
             raise ValueError("幂等键长度不得超过 200 个字符")
-        request_sha256 = stable_hash(request)
+        if initial_status not in QUEUE_STATUSES:
+            raise ValueError(f"不支持的初始任务状态: {initial_status}")
+        request_sha256 = stable_hash(
+            request if idempotency_payload is None else idempotency_payload
+        )
         task_id = str(uuid.uuid4())
         now = time.time()
         with self._lock, self._connection() as connection:
@@ -219,7 +226,7 @@ class TaskStore:
                         idempotency_key=normalized_key,
                     )
             row = connection.execute(
-                "SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND status = 'pending'",
+                "SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND status IN ('pending', 'waiting_for_data')",
                 (user_id,),
             ).fetchone()
             if int(row["count"] if row else 0) >= max_queued:
@@ -233,6 +240,7 @@ class TaskStore:
                 now=now,
                 idempotency_key=normalized_key,
                 request_sha256=request_sha256,
+                initial_status=initial_status,
             )
         return TaskCreationReceipt(
             task_id=task_id,
@@ -251,6 +259,7 @@ class TaskStore:
         now: float,
         idempotency_key: str | None = None,
         request_sha256: str | None = None,
+        initial_status: str = "pending",
     ) -> None:
         task_contract = request.get("_task_contract") or {}
         execution = task_contract.get("execution") or {}
@@ -260,7 +269,7 @@ class TaskStore:
             "engine_type": task_contract.get("engine_type", "vnpy_cta"),
             "default_profile": task_contract.get("default_profile"),
             "data_snapshot": task_contract.get("data", {}).get("snapshot"),
-            "status": "pending",
+            "status": initial_status,
             "progress": 0.0,
             "processed_bars": 0,
             "total_bars": 0,
@@ -288,12 +297,13 @@ class TaskStore:
             INSERT INTO tasks(
                 task_id, user_id, source_node, status, request_json,
                 state_json, created_at, updated_at, idempotency_key, request_sha256
-            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
                 user_id,
                 source_node,
+                initial_status,
                 json.dumps(request, ensure_ascii=False, separators=(",", ":")),
                 json.dumps(state, ensure_ascii=False, separators=(",", ":")),
                 now,
@@ -307,7 +317,7 @@ class TaskStore:
         with self._lock, self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND status = 'pending'",
+                "SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND status IN ('pending', 'waiting_for_data')",
                 (user_id,),
             ).fetchone()
         return int(row["count"] if row else 0)
@@ -403,6 +413,96 @@ class TaskStore:
             }
             for row in rows
         ]
+
+    def waiting_tasks(self) -> list[dict[str, Any]]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT task_id, user_id, request_json, state_json FROM tasks WHERE status = 'waiting_for_data' ORDER BY created_at ASC"
+            ).fetchall()
+        return [
+            {
+                "task_id": str(row["task_id"]),
+                "user_id": str(row["user_id"]),
+                "request": json.loads(row["request_json"]),
+                "state": json.loads(row["state_json"]),
+            }
+            for row in rows
+        ]
+
+    def activate_waiting_task(
+        self,
+        task_id: str,
+        *,
+        request: dict[str, Any],
+        data_snapshot: dict[str, Any],
+        data_requirement: dict[str, Any],
+    ) -> bool:
+        """原子保存已解析请求并把同一任务送回待执行队列。"""
+
+        now = time.time()
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT user_id, state_json FROM tasks WHERE task_id = ? AND status = 'waiting_for_data'",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            state = json.loads(row["state_json"])
+            state.update(
+                {
+                    "status": "pending",
+                    "phase": "data_ready",
+                    "data_snapshot": data_snapshot,
+                    "data_requirement": data_requirement,
+                    "data_checkpoint": {
+                        "phase": "worker_not_started",
+                        "snapshot_id": data_snapshot.get("snapshot_id"),
+                        "manifest_sha256": data_snapshot.get("manifest_sha256"),
+                    },
+                }
+            )
+            latest = connection.execute(
+                "SELECT COALESCE(MAX(task_seq), 0) AS latest FROM task_events WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            task_seq = int(latest["latest"] or 0) + 1
+            state["event_seq"] = task_seq
+            event_payload = {
+                "status": "pending",
+                "phase": "data_ready",
+                "data_snapshot": data_snapshot,
+                "data_requirement": data_requirement,
+                "data_checkpoint": state["data_checkpoint"],
+            }
+            connection.execute(
+                """
+                INSERT INTO task_events(
+                    task_seq, task_id, user_id, event_type, payload_json, created_at
+                ) VALUES (?, ?, ?, 'state', ?, ?)
+                """,
+                (
+                    task_seq,
+                    task_id,
+                    str(row["user_id"]),
+                    json.dumps(event_payload, ensure_ascii=False, separators=(",", ":")),
+                    now,
+                ),
+            )
+            changed = connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'pending', request_json = ?, state_json = ?, error = '', updated_at = ?
+                WHERE task_id = ? AND status = 'waiting_for_data'
+                """,
+                (
+                    json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                    now,
+                    task_id,
+                ),
+            )
+        return changed.rowcount == 1
 
     def mark_running(self, task_id: str) -> bool:
         now = time.time()
@@ -746,6 +846,7 @@ class TaskStore:
                     "engine_type": task_contract.get("engine_type", "vnpy_cta"),
                     "default_profile": task_contract.get("default_profile"),
                     "data_snapshot": task_contract.get("data", {}).get("snapshot"),
+                    "data_requirement": state.get("data_requirement"),
                     "strategy_class": request.get("strategy_class")
                     or strategy.get("entrypoint", ""),
                     "vt_symbol": request.get("vt_symbol")

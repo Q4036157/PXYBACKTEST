@@ -54,6 +54,7 @@ from .models import (
 )
 from .workflow import WorkflowSpec, validate_workflow
 from .pxydata_client import (
+    DataRequirementManifestV1,
     PxyDataSnapshotClient,
     SnapshotClient,
     SnapshotProviderError,
@@ -111,6 +112,8 @@ async def _submit_with_idempotency(
     source_node: str,
     request: dict,
     idempotency_key: str | None,
+    initial_status: str = "pending",
+    idempotency_payload: dict | None = None,
 ) -> TaskCreationReceipt:
     kwargs = {
         "user_id": user_id,
@@ -119,7 +122,81 @@ async def _submit_with_idempotency(
     }
     if idempotency_key is not None:
         kwargs["idempotency_key"] = idempotency_key
+    if initial_status != "pending":
+        kwargs["initial_status"] = initial_status
+    if idempotency_payload is not None:
+        kwargs["idempotency_payload"] = idempotency_payload
     return _submission_receipt(await task_manager.submit(**kwargs))
+
+
+def _data_requirement_payload(
+    body: SubmitBacktestRequestV2, task_id: str
+) -> dict[str, object]:
+    assert body.data.selection is not None
+    canonical = body.model_dump(mode="json")
+    request_fingerprint = hashlib.sha256(
+        json.dumps(
+            canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    requirement_hash = hashlib.sha256(
+        f"{task_id}\0{request_fingerprint}".encode("utf-8")
+    ).hexdigest()[:32]
+    start_date, end_date = _snapshot_date_range(body)
+    data_fields = body.parameters.get("data_fields")
+    field_map = data_fields if isinstance(data_fields, dict) else {}
+    market = (
+        "cn_equity"
+        if body.engine_type in DAA_ENGINE_TYPES | {"ml_factor", "deep_learning"}
+        else "lighter"
+        if body.engine_type == "lighter_microstructure"
+        else "global"
+    )
+    pit_datasets = {
+        "financials_pit",
+        "events",
+        "factor_matrix_daily",
+        "ml_features_daily",
+    }
+    datasets = [
+        {
+            "name": name,
+            "fields": sorted(
+                {
+                    str(value).strip()
+                    for value in (
+                        field_map.get(name, [])
+                        if isinstance(field_map.get(name, []), list)
+                        else []
+                    )
+                    if str(value).strip()
+                }
+            ),
+            "symbols": body.universe.symbols,
+            "start": start_date,
+            "end": end_date,
+            "frequency": body.period.interval,
+            "market": market,
+            "pit_required": name in pit_datasets,
+        }
+        for name in body.data.selection.datasets
+    ]
+    return {
+        "requirement_id": f"datareq_v1_{requirement_hash}",
+        "contract_version": "pxydata.data-requirement.v1",
+        "consumer_task_id": task_id,
+        "request_fingerprint": request_fingerprint,
+        "datasets": datasets,
+        "quality_policy": body.data.selection.quality_policy,
+    }
+
+
+def _waiting_worker_request(body: SubmitBacktestRequestV2) -> dict[str, object]:
+    return {
+        "speed": body.execution.speed,
+        "execution_mode": body.execution.execution_mode,
+        "_task_contract": body.model_dump(mode="json"),
+    }
 
 
 def _runner_state(catalog: list[dict], runner_id: str) -> dict:
@@ -319,6 +396,52 @@ def create_app(
     runner_registry = build_runner_registry(
         RunnerProbeConfig.from_environment(pxylh_root=configured.pxylh_root)
     )
+
+    async def resolve_waiting_task(
+        request: dict[str, object], requirement: DataRequirementManifestV1
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        if requirement.snapshot is None:
+            raise SnapshotProviderError("已就绪的数据需求缺少快照", status_code=502)
+        contract = request.get("_task_contract")
+        if not isinstance(contract, dict):
+            raise SnapshotProviderError("等待任务缺少 Task v2 契约", status_code=409)
+        body = SubmitBacktestRequestV2.model_validate(contract)
+        snapshot_manifest: dict | None = None
+        if body.engine_type in MANIFEST_ENGINE_TYPES:
+            snapshot, snapshot_manifest = await data_snapshots.resolve_snapshot(
+                requirement.snapshot
+            )
+        else:
+            snapshot = await data_snapshots.verify_snapshot(requirement.snapshot)
+        factor_set = await _verify_factor_set_binding(data_snapshots, body)
+        factor_updates = _bind_factor_set_to_manifest(
+            body, snapshot_manifest, factor_set
+        )
+        parameter_updates: dict[str, object] = dict(factor_updates)
+        if body.engine_type in {"factor_matrix", "event_sentiment"}:
+            derivation = (
+                snapshot_manifest.get("derivation")
+                if isinstance(snapshot_manifest, dict)
+                else None
+            )
+            input_snapshot_id = (
+                str(derivation.get("input_snapshot_id") or "")
+                if isinstance(derivation, dict)
+                else ""
+            )
+            if not input_snapshot_id.startswith("btsnap_v1_"):
+                raise SnapshotProviderError(
+                    "执行快照缺少因子输入快照身份", status_code=409
+                )
+            parameter_updates["factor_input_snapshot_id"] = input_snapshot_id
+        resolved = body.with_snapshot(snapshot, parameter_updates=parameter_updates)
+        return (
+            resolved.to_worker_request(snapshot_manifest=snapshot_manifest),
+            snapshot.model_dump(mode="json"),
+        )
+
+    if isinstance(task_manager, TaskManager):
+        task_manager.configure_data_waiting(data_snapshots, resolve_waiting_task)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -898,6 +1021,49 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except SnapshotProviderError as exc:
+            if body.data.selection is not None and exc.status_code == 422:
+                submission_payload = body.model_dump(mode="json")
+                try:
+                    receipt = await _submit_with_idempotency(
+                        task_manager,
+                        user_id=identity.user_id,
+                        source_node=identity.source_node,
+                        request=_waiting_worker_request(body),
+                        idempotency_key=idempotency_key,
+                        initial_status="waiting_for_data",
+                        idempotency_payload=submission_payload,
+                    )
+                except IdempotencyConflictError as conflict:
+                    raise HTTPException(status_code=409, detail=str(conflict)) from conflict
+                except QueueLimitError as queue_error:
+                    raise HTTPException(status_code=429, detail=str(queue_error)) from queue_error
+                task = task_manager.store.get_task(identity.user_id, receipt.task_id)
+                requirement = dict(task.get("data_requirement") or {})
+                if task["status"] == "waiting_for_data" and not requirement:
+                    registrar = getattr(task_manager, "register_data_requirement", None)
+                    if registrar is None:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="回测管理器未启用数据补齐协调器",
+                        ) from exc
+                    requirement = await registrar(
+                        receipt.task_id,
+                        _data_requirement_payload(body, receipt.task_id),
+                    )
+                return {
+                    "success": True,
+                    "task_id": receipt.task_id,
+                    "idempotency_key": receipt.idempotency_key,
+                    "idempotent_replay": receipt.idempotent_replay,
+                    "schema_version": 2,
+                    "contract_version": "pxybacktest.task-result.v2",
+                    "engine_type": body.engine_type,
+                    "status": task["status"],
+                    "data_snapshot": task.get("data_snapshot"),
+                    "data_requirement": requirement or task.get("data_requirement"),
+                    "execution_backend": "workstation",
+                    "event_stream": "delta-poll",
+                }
             provider_status = (
                 exc.status_code
                 if 400 <= exc.status_code < 500 or exc.status_code == 503
@@ -921,6 +1087,7 @@ def create_app(
                 source_node=identity.source_node,
                 request=worker_request,
                 idempotency_key=idempotency_key,
+                idempotency_payload=body.model_dump(mode="json"),
             )
         except IdempotencyConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

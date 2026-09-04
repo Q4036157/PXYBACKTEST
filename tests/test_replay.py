@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.replay import (
     EventCursor,
     ExecutionSnapshot,
+    REPLAY_CHECKPOINT_CONTRACT_VERSION,
     ReplayClock,
+    ReplayCheckpoint,
     ReplayAudit,
     ReplayError,
     ReplayEvent,
@@ -392,6 +396,190 @@ def test_replay_session_processes_all_domains_in_order_and_exposes_snapshot() ->
     assert result["replay"]["remaining_events"] == 0
     assert result["sentiment"]
     assert result["factors"]
+
+
+def _checkpoint_feed(
+    *, snapshot_id: str = SNAPSHOT, final_value: int = 1_000_004
+) -> SnapshotDataFeed:
+    return SnapshotDataFeed(
+        snapshot_id=snapshot_id,
+        datasets={
+            "account": [
+                {
+                    "event_type": "account",
+                    "event_time": f"2026-08-01T00:00:0{index}Z",
+                    "payload": {"value": value},
+                }
+                for index, value in enumerate(
+                    [1_000_001, 1_000_002, 1_000_003, final_value], start=1
+                )
+            ],
+            "signals": [
+                {
+                    "event_type": "signal",
+                    "event_time": "2026-08-01T00:00:02.500000Z",
+                    "payload": {"side": "buy"},
+                }
+            ],
+        },
+    )
+
+
+def test_replay_checkpoint_v1_is_json_serializable_and_round_trips() -> None:
+    session = ReplaySession(run_id="run-checkpoint", feed=_checkpoint_feed())
+    session.run(max_events=3)
+    session.clock.set_speed(7.5)
+    session.clock.pause()
+
+    checkpoint = session.checkpoint()
+    payload = json.loads(json.dumps(checkpoint.to_dict()))
+    restored = ReplayCheckpoint.from_dict(payload)
+
+    assert restored == checkpoint
+    assert restored.contract_version == REPLAY_CHECKPOINT_CONTRACT_VERSION
+    assert restored.run_id == "run-checkpoint"
+    assert restored.snapshot_id == SNAPSHOT
+    assert restored.feed_fingerprint == session.feed.fingerprint
+    assert restored.processed_events == 3
+    assert restored.clock == session.clock.current_time
+    assert restored.speed == 7.5
+    assert restored.paused is True
+    assert restored.last_event_id == session.last_event.event_id
+    assert restored.projection_sha256
+    assert restored.audit_chain_sha256 == session.audit.chain_sha256
+    assert restored.audit_event_count == 3
+    assert restored.checkpoint_sha256
+
+
+def test_replay_session_resumes_deterministically_from_checkpoint() -> None:
+    feed = _checkpoint_feed()
+    uninterrupted = ReplaySession(run_id="run-checkpoint", feed=feed)
+    uninterrupted.run()
+
+    handler_events: list[str] = []
+    interrupted = ReplaySession(run_id="run-checkpoint", feed=feed)
+    interrupted.run(
+        lambda event, _: handler_events.append(event.event_id), max_events=3
+    )
+    interrupted.clock.set_speed(12)
+    interrupted.clock.pause()
+    checkpoint = interrupted.checkpoint()
+
+    resumed = ReplaySession.from_checkpoint(
+        feed=feed,
+        checkpoint=json.loads(json.dumps(checkpoint.to_dict())),
+    )
+
+    assert resumed.processed_events == 3
+    assert resumed.clock.current_time == checkpoint.clock
+    assert resumed.clock.speed == 12
+    assert resumed.clock.paused is True
+    assert len(handler_events) == 3
+    resumed.clock.resume()
+    assert resumed.run() == len(feed) - 3
+    assert resumed.snapshot.to_dict(
+        include_history=True
+    ) == uninterrupted.snapshot.to_dict(include_history=True)
+    assert resumed.audit.to_dict() == uninterrupted.audit.to_dict()
+
+
+@pytest.mark.parametrize(
+    ("field", "tampered_value"),
+    [
+        ("run_id", "run-tampered"),
+        ("snapshot_id", "btsnap_v1_" + "b" * 32),
+        ("feed_fingerprint", "0" * 64),
+        ("processed_events", 2),
+        ("clock", "2026-08-01T00:00:01.000000Z"),
+        ("speed", 99.0),
+        ("paused", False),
+        ("last_event_id", "0" * 64),
+        ("projection_sha256", "0" * 64),
+        ("audit_chain_sha256", "0" * 64),
+        ("audit_event_count", 2),
+        ("checkpoint_sha256", "0" * 64),
+    ],
+)
+def test_replay_checkpoint_rejects_tampered_fields(
+    field: str, tampered_value: object
+) -> None:
+    session = ReplaySession(run_id="run-checkpoint", feed=_checkpoint_feed())
+    session.run(max_events=3)
+    session.clock.set_speed(7.5)
+    session.clock.pause()
+    payload = session.checkpoint().to_dict()
+    payload[field] = tampered_value
+
+    with pytest.raises(ReplayError):
+        ReplayCheckpoint.from_dict(payload)
+
+
+def test_replay_checkpoint_rejects_run_snapshot_and_feed_mismatches() -> None:
+    feed = _checkpoint_feed()
+    session = ReplaySession(run_id="run-checkpoint", feed=feed)
+    session.run(max_events=2)
+    checkpoint = session.checkpoint()
+
+    with pytest.raises(ReplayError, match="run_id"):
+        ReplaySession.from_checkpoint(
+            run_id="other-run", feed=feed, checkpoint=checkpoint
+        )
+
+    other_snapshot = "btsnap_v1_" + "b" * 32
+    with pytest.raises(ReplayError, match="snapshot_id"):
+        ReplaySession.from_checkpoint(
+            run_id="run-checkpoint",
+            feed=_checkpoint_feed(snapshot_id=other_snapshot),
+            checkpoint=checkpoint,
+        )
+
+    with pytest.raises(ReplayError, match="fingerprint"):
+        ReplaySession.from_checkpoint(
+            run_id="run-checkpoint",
+            feed=_checkpoint_feed(final_value=9_999_999),
+            checkpoint=checkpoint,
+        )
+
+
+def test_event_type_navigation_is_read_only_and_supports_aliases() -> None:
+    feed = SnapshotDataFeed(
+        snapshot_id=SNAPSHOT,
+        datasets={
+            "events": [
+                {
+                    "event_type": "bar",
+                    "event_time": "2026-08-01T00:00:01Z",
+                    "payload": {"close": 1},
+                },
+                {
+                    "event_type": "factor",
+                    "event_time": "2026-08-01T00:00:02Z",
+                    "payload": {"value": 2},
+                },
+                {
+                    "event_type": "kline",
+                    "event_time": "2026-08-01T00:00:03Z",
+                    "payload": {"close": 3},
+                },
+                {
+                    "event_type": "fill",
+                    "event_time": "2026-08-01T00:00:04Z",
+                    "payload": {"price": 4},
+                },
+            ]
+        },
+    )
+    session = ReplaySession(run_id="run-navigation", feed=feed)
+    assert session.find_previous("market_bar") is None
+    assert session.find_next("bar").payload["close"] == 1
+    session.run(max_events=3)
+    before = session.checkpoint().to_dict()
+
+    assert session.find_previous("kline").payload["close"] == 3
+    assert session.cursor.find_previous("bar").payload["close"] == 3
+    assert session.find_next("fill").payload["price"] == 4
+    assert session.find_next("news") is None
+    assert session.checkpoint().to_dict() == before
 
 
 def test_event_requires_timezone_and_snapshot() -> None:

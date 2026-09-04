@@ -43,6 +43,8 @@ class StoreOnlyManager:
         source_node: str,
         request: dict,
         idempotency_key: str | None = None,
+        initial_status: str = "pending",
+        idempotency_payload: dict | None = None,
     ):
         if idempotency_key:
             return self.store.create_task_if_queue_available(
@@ -51,9 +53,16 @@ class StoreOnlyManager:
                 request=request,
                 max_queued=100,
                 idempotency_key=idempotency_key,
+                initial_status=initial_status,
+                idempotency_payload=idempotency_payload,
             )
-        return self.store.create_task(
-            user_id=user_id, source_node=source_node, request=request
+        return self.store.create_task_if_queue_available(
+            user_id=user_id,
+            source_node=source_node,
+            request=request,
+            max_queued=100,
+            initial_status=initial_status,
+            idempotency_payload=idempotency_payload,
         )
 
 

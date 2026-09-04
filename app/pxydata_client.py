@@ -6,9 +6,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .config import Settings
 from .models import (
@@ -22,6 +22,31 @@ class SnapshotProviderError(RuntimeError):
     def __init__(self, message: str, *, status_code: int = 502):
         super().__init__(message)
         self.status_code = status_code
+
+
+class DataRequirementManifestV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requirement_id: str = Field(pattern=r"^datareq_v1_[0-9a-f]{32}$")
+    contract_version: Literal["pxydata.data-requirement.v1"]
+    consumer_task_id: str
+    request_fingerprint: str
+    datasets: list[dict[str, Any]] = Field(min_length=1)
+    quality_policy: Literal["require_pass", "allow_warn", "allow_unverified"]
+    status: Literal[
+        "pending", "backfilling", "quality_checking", "ready", "failed"
+    ]
+    failure_reason: str = ""
+    snapshot: DataSnapshotRefV2 | None = None
+    created_at: str
+    updated_at: str
+
+    @field_validator("created_at", "updated_at")
+    @classmethod
+    def validate_timestamp(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("数据需求时间不能为空")
+        return value
 
 
 class SnapshotClient(Protocol):
@@ -62,6 +87,14 @@ class SnapshotClient(Protocol):
     async def get_data_quality(
         self, required_datasets: list[str]
     ) -> dict[str, Any]: ...
+
+    async def create_data_requirement(
+        self, payload: dict[str, Any]
+    ) -> DataRequirementManifestV1: ...
+
+    async def get_data_requirement(
+        self, requirement_id: str
+    ) -> DataRequirementManifestV1: ...
 
 
 @dataclass(frozen=True)
@@ -213,6 +246,32 @@ class PxyDataSnapshotClient:
             raise SnapshotProviderError("PXYDATA 质量接口缺少认证报告", status_code=502)
         return response
 
+    async def create_data_requirement(
+        self, payload: dict[str, Any]
+    ) -> DataRequirementManifestV1:
+        response = await asyncio.to_thread(
+            self._request,
+            "POST",
+            "/api/v1/backtest/data-requirements",
+            payload,
+        )
+        return _validate_data_requirement(response, expected=payload)
+
+    async def get_data_requirement(
+        self, requirement_id: str
+    ) -> DataRequirementManifestV1:
+        identifier = str(requirement_id).strip()
+        response = await asyncio.to_thread(
+            self._request,
+            "GET",
+            f"/api/v1/backtest/data-requirements/{identifier}",
+            None,
+        )
+        manifest = _validate_data_requirement(response)
+        if manifest.requirement_id != identifier:
+            raise SnapshotProviderError("PXYDATA 数据需求 ID 不一致", status_code=409)
+        return manifest
+
     def _request(
         self, method: str, path: str, payload: dict[str, Any] | None
     ) -> dict[str, Any]:
@@ -297,3 +356,26 @@ def _validate_snapshot_ref(payload: dict[str, Any]) -> DataSnapshotRefV2:
         raise SnapshotProviderError(
             "PXYDATA 返回了无效的快照契约", status_code=502
         ) from exc
+
+
+def _validate_data_requirement(
+    payload: dict[str, Any], *, expected: dict[str, Any] | None = None
+) -> DataRequirementManifestV1:
+    try:
+        manifest = DataRequirementManifestV1.model_validate(payload)
+    except ValidationError as exc:
+        raise SnapshotProviderError(
+            "PXYDATA 返回了无效的数据需求契约", status_code=502
+        ) from exc
+    if expected is not None:
+        if manifest.consumer_task_id != str(expected.get("consumer_task_id") or ""):
+            raise SnapshotProviderError("PXYDATA 数据需求任务身份不一致", status_code=409)
+        if manifest.request_fingerprint != str(
+            expected.get("request_fingerprint") or ""
+        ):
+            raise SnapshotProviderError("PXYDATA 数据需求指纹不一致", status_code=409)
+    if manifest.status == "ready" and manifest.snapshot is None:
+        raise SnapshotProviderError("已就绪的数据需求缺少快照", status_code=502)
+    if manifest.status != "ready" and manifest.snapshot is not None:
+        raise SnapshotProviderError("未就绪的数据需求不应包含快照", status_code=502)
+    return manifest

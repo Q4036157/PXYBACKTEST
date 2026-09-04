@@ -21,6 +21,7 @@ from .kernel import stable_hash
 
 
 REPLAY_CONTRACT_VERSION = "pxybacktest.replay.v1"
+REPLAY_CHECKPOINT_CONTRACT_VERSION = "pxybacktest.replay-checkpoint.v1"
 FOOTPRINT_CONTRACT_VERSION = "pxybacktest.footprint.v1"
 FOOTPRINT_KLINE_ONLY_REASON = "仅有 K 线，无法生成真实足迹"
 DEFAULT_RENDER_INTERVAL_MS = 33
@@ -402,6 +403,185 @@ class ReplayClock:
             return delta / self._speed
 
 
+@dataclass(frozen=True)
+class ReplayCheckpoint:
+    """可序列化的回放检查点，只覆盖已经生成的 replay feed。"""
+
+    contract_version: str
+    run_id: str
+    snapshot_id: str
+    feed_fingerprint: str
+    processed_events: int
+    clock: str
+    speed: float
+    paused: bool
+    last_event_id: str | None
+    projection_sha256: str
+    audit_chain_sha256: str
+    audit_event_count: int
+    checkpoint_sha256: str
+
+    @staticmethod
+    def _field_names() -> set[str]:
+        return {
+            "contract_version",
+            "run_id",
+            "snapshot_id",
+            "feed_fingerprint",
+            "processed_events",
+            "clock",
+            "speed",
+            "paused",
+            "last_event_id",
+            "projection_sha256",
+            "audit_chain_sha256",
+            "audit_event_count",
+            "checkpoint_sha256",
+        }
+
+    @staticmethod
+    def _validate_sha256(name: str, value: Any) -> str:
+        if not isinstance(value, str) or len(value) != 64 or any(
+            char not in "0123456789abcdef" for char in value
+        ):
+            raise ReplayError(f"检查点 {name} 不是有效 SHA-256")
+        return value
+
+    def _unsigned_payload(self) -> dict[str, Any]:
+        return {
+            "contract_version": self.contract_version,
+            "run_id": self.run_id,
+            "snapshot_id": self.snapshot_id,
+            "feed_fingerprint": self.feed_fingerprint,
+            "processed_events": self.processed_events,
+            "clock": self.clock,
+            "speed": self.speed,
+            "paused": self.paused,
+            "last_event_id": self.last_event_id,
+            "projection_sha256": self.projection_sha256,
+            "audit_chain_sha256": self.audit_chain_sha256,
+            "audit_event_count": self.audit_event_count,
+        }
+
+    def validate(self) -> None:
+        if self.contract_version != REPLAY_CHECKPOINT_CONTRACT_VERSION:
+            raise ReplayError("不支持的回放检查点契约版本")
+        if (
+            not isinstance(self.run_id, str)
+            or not self.run_id
+            or not isinstance(self.snapshot_id, str)
+            or not self.snapshot_id
+        ):
+            raise ReplayError("回放检查点必须绑定 run_id 和 snapshot_id")
+        self._validate_sha256("feed_fingerprint", self.feed_fingerprint)
+        self._validate_sha256("projection_sha256", self.projection_sha256)
+        self._validate_sha256("audit_chain_sha256", self.audit_chain_sha256)
+        self._validate_sha256("checkpoint_sha256", self.checkpoint_sha256)
+        if (
+            isinstance(self.processed_events, bool)
+            or not isinstance(self.processed_events, int)
+            or self.processed_events < 0
+        ):
+            raise ReplayError("检查点 processed_events 必须是非负整数")
+        if (
+            isinstance(self.audit_event_count, bool)
+            or not isinstance(self.audit_event_count, int)
+            or self.audit_event_count < 0
+        ):
+            raise ReplayError("检查点 audit_event_count 必须是非负整数")
+        if self.audit_event_count != self.processed_events:
+            raise ReplayError("检查点事件数与审计事件数不一致")
+        if not isinstance(self.paused, bool):
+            raise ReplayError("检查点 paused 必须是布尔值")
+        if (
+            isinstance(self.speed, bool)
+            or not isinstance(self.speed, (int, float))
+            or not math.isfinite(float(self.speed))
+        ):
+            raise ReplayError("检查点 speed 必须是有限数值")
+        ReplayClock._validate_speed(self.speed)
+        if not isinstance(self.clock, str):
+            raise ReplayError("检查点 clock 类型无效")
+        if canonical_time(self.clock) != self.clock:
+            raise ReplayError("检查点 clock 必须是标准 UTC 时间")
+        if self.processed_events == 0 and self.last_event_id is not None:
+            raise ReplayError("未处理事件的检查点不能包含 last_event_id")
+        if self.processed_events > 0:
+            self._validate_sha256("last_event_id", self.last_event_id)
+        if stable_hash(self._unsigned_payload()) != self.checkpoint_sha256:
+            raise ReplayError("回放检查点校验失败，内容可能已被篡改")
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {**self._unsigned_payload(), "checkpoint_sha256": self.checkpoint_sha256}
+
+    @classmethod
+    def create(cls, **values: Any) -> "ReplayCheckpoint":
+        payload = {
+            "contract_version": REPLAY_CHECKPOINT_CONTRACT_VERSION,
+            **values,
+        }
+        checkpoint = cls(
+            **payload,
+            checkpoint_sha256=stable_hash(payload),
+        )
+        checkpoint.validate()
+        return checkpoint
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ReplayCheckpoint":
+        if set(payload) != cls._field_names():
+            raise ReplayError("回放检查点字段不完整或包含未知字段")
+        processed_events = payload["processed_events"]
+        audit_event_count = payload["audit_event_count"]
+        speed = payload["speed"]
+        if isinstance(processed_events, bool) or not isinstance(
+            processed_events, int
+        ):
+            raise ReplayError("检查点 processed_events 必须是非负整数")
+        if isinstance(audit_event_count, bool) or not isinstance(
+            audit_event_count, int
+        ):
+            raise ReplayError("检查点 audit_event_count 必须是非负整数")
+        if isinstance(speed, bool) or not isinstance(speed, (int, float)):
+            raise ReplayError("检查点 speed 必须是有限数值")
+        if not isinstance(payload["paused"], bool):
+            raise ReplayError("检查点 paused 必须是布尔值")
+        if payload["last_event_id"] is not None and not isinstance(
+            payload["last_event_id"], str
+        ):
+            raise ReplayError("检查点 last_event_id 类型无效")
+        string_fields = (
+            "contract_version",
+            "run_id",
+            "snapshot_id",
+            "feed_fingerprint",
+            "clock",
+            "projection_sha256",
+            "audit_chain_sha256",
+            "checkpoint_sha256",
+        )
+        if any(not isinstance(payload[name], str) for name in string_fields):
+            raise ReplayError("回放检查点字符串字段类型无效")
+        checkpoint = cls(
+            contract_version=payload["contract_version"],
+            run_id=payload["run_id"],
+            snapshot_id=payload["snapshot_id"],
+            feed_fingerprint=payload["feed_fingerprint"],
+            processed_events=processed_events,
+            clock=payload["clock"],
+            speed=float(speed),
+            paused=payload["paused"],
+            last_event_id=payload["last_event_id"],
+            projection_sha256=payload["projection_sha256"],
+            audit_chain_sha256=payload["audit_chain_sha256"],
+            audit_event_count=audit_event_count,
+            checkpoint_sha256=payload["checkpoint_sha256"],
+        )
+        checkpoint.validate()
+        return checkpoint
+
+
 class EventCursor:
     """按可得时间输出事件，保证策略不会看到未来数据。"""
 
@@ -443,6 +623,33 @@ class EventCursor:
             return None
         clock.advance_to(event.ready_time)
         return self.pop_ready(clock.current_time, limit=1)[0]
+
+    @staticmethod
+    def _normalized_event_type(event_type: str) -> str:
+        normalized = str(event_type or "").strip().lower()
+        if not normalized:
+            raise ReplayError("导航事件类型不能为空")
+        return _EVENT_TYPE_ALIASES.get(normalized, normalized)
+
+    def find_previous(self, event_type: str) -> ReplayEvent | None:
+        """从当前游标之前只读查找最近的指定类型事件。"""
+
+        target = self._normalized_event_type(event_type)
+        for index in range(self._index - 1, -1, -1):
+            event = self.feed.events[index]
+            if event.event_type == target:
+                return event
+        return None
+
+    def find_next(self, event_type: str) -> ReplayEvent | None:
+        """从当前游标开始只读查找下一个指定类型事件。"""
+
+        target = self._normalized_event_type(event_type)
+        for index in range(self._index, len(self.feed)):
+            event = self.feed.events[index]
+            if event.event_type == target:
+                return event
+        return None
 
 
 class ReplaySession:
@@ -504,6 +711,92 @@ class ReplaySession:
             "processed_events": self.processed_events,
         }
         return payload
+
+    def find_previous(self, event_type: str) -> ReplayEvent | None:
+        return self.cursor.find_previous(event_type)
+
+    def find_next(self, event_type: str) -> ReplayEvent | None:
+        return self.cursor.find_next(event_type)
+
+    def checkpoint(self) -> ReplayCheckpoint:
+        """保存 feed 内执行状态，不包含外部策略或优化器状态。"""
+
+        if self.clock.cancelled:
+            raise ReplayError("已取消的回放会话不能创建检查点")
+        return ReplayCheckpoint.create(
+            run_id=self.run_id,
+            snapshot_id=self.feed.snapshot_id,
+            feed_fingerprint=self.feed.fingerprint,
+            processed_events=self.processed_events,
+            clock=self.clock.current_time,
+            speed=self.clock.speed,
+            paused=self.clock.paused,
+            last_event_id=(self.last_event.event_id if self.last_event else None),
+            projection_sha256=stable_hash(
+                self.snapshot.to_dict(include_history=True)
+            ),
+            audit_chain_sha256=self.audit.chain_sha256,
+            audit_event_count=self.audit.event_count,
+        )
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        *,
+        feed: SnapshotDataFeed,
+        checkpoint: ReplayCheckpoint | Mapping[str, Any],
+        run_id: str | None = None,
+    ) -> "ReplaySession":
+        """用相同 feed 前缀重建投影；不恢复外部策略或优化器状态。"""
+
+        restored = (
+            checkpoint
+            if isinstance(checkpoint, ReplayCheckpoint)
+            else ReplayCheckpoint.from_dict(checkpoint)
+        )
+        restored.validate()
+        target_run_id = restored.run_id if run_id is None else run_id
+        if restored.run_id != target_run_id:
+            raise ReplayError("检查点 run_id 与恢复目标不一致")
+        if restored.snapshot_id != feed.snapshot_id:
+            raise ReplayError("检查点 snapshot_id 与数据馈送不一致")
+        if restored.feed_fingerprint != feed.fingerprint:
+            raise ReplayError("检查点 feed fingerprint 与数据馈送不一致")
+        if restored.processed_events > len(feed):
+            raise ReplayError("检查点 processed_events 超出数据馈送范围")
+
+        initial_time = (
+            feed.events[0].ready_time
+            if restored.processed_events > 0
+            else restored.clock
+        )
+        session = cls(run_id=target_run_id, feed=feed, start_time=initial_time)
+        for _ in range(restored.processed_events):
+            if session.step() is None:
+                raise ReplayError("无法从数据馈送重建回放检查点")
+
+        projection_sha256 = stable_hash(
+            session.snapshot.to_dict(include_history=True)
+        )
+        last_event_id = session.last_event.event_id if session.last_event else None
+        mismatches = {
+            "clock": session.clock.current_time != restored.clock,
+            "last_event_id": last_event_id != restored.last_event_id,
+            "projection_sha256": projection_sha256 != restored.projection_sha256,
+            "audit_event_count": session.audit.event_count
+            != restored.audit_event_count,
+            "audit_chain_sha256": session.audit.chain_sha256
+            != restored.audit_chain_sha256,
+        }
+        invalid_fields = [name for name, mismatch in mismatches.items() if mismatch]
+        if invalid_fields:
+            raise ReplayError(
+                "回放检查点重建校验失败: " + ", ".join(invalid_fields)
+            )
+        session.clock.set_speed(restored.speed)
+        if restored.paused:
+            session.clock.pause()
+        return session
 
 
 @dataclass
@@ -1235,8 +1528,10 @@ __all__ = [
     "DEFAULT_RENDER_INTERVAL_MS",
     "EventCursor",
     "ExecutionSnapshot",
+    "REPLAY_CHECKPOINT_CONTRACT_VERSION",
     "REPLAY_CONTRACT_VERSION",
     "ReplayClock",
+    "ReplayCheckpoint",
     "ReplayError",
     "ReplayEvent",
     "ResultReplayController",

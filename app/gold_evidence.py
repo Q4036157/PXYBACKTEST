@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import platform
+import re
 import subprocess
 import sys
 import uuid
@@ -21,6 +22,9 @@ EVIDENCE_CONTRACT_VERSION = "pxybacktest.gold-evidence.v1"
 ACCEPTANCE_STANDARD_VERSION = "backtest-platform.acceptance.v1"
 TASK_CONTRACT_VERSION = "pxybacktest.task.v2"
 RESULT_CONTRACT_VERSION = "pxybacktest.task-result.v2"
+DEPLOYED_PROJECTS = ("PXYBACKTEST", "PXYLH")
+GIT_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -61,14 +65,65 @@ def _repository_matrix(workspace_root: Path) -> dict[str, dict[str, Any]]:
     return matrix
 
 
+def _deployment_matrix(deploy_root: Path) -> dict[str, dict[str, Any]]:
+    matrix: dict[str, dict[str, Any]] = {}
+    for name in DEPLOYED_PROJECTS:
+        project_root = (deploy_root / name).resolve()
+        current_path = project_root / "current"
+        if not current_path.exists():
+            raise ValueError(f"{name} 当前部署入口不存在：{current_path}")
+        release_path = current_path.resolve(strict=True)
+        releases_root = (project_root / "releases").resolve()
+        try:
+            release_path.relative_to(releases_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"{name} current 未指向受管 releases 目录：{release_path}"
+            ) from exc
+
+        manifest_path = release_path / ".pxy-release.json"
+        if not manifest_path.is_file():
+            raise ValueError(f"{name} 发布清单不存在：{manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(manifest, dict):
+            raise ValueError(f"{name} 发布清单必须是 JSON 对象")
+        if manifest.get("project") != name:
+            raise ValueError(f"{name} 发布清单项目身份不匹配")
+        commit = str(manifest.get("commit", "")).lower()
+        if not GIT_COMMIT_PATTERN.fullmatch(commit):
+            raise ValueError(f"{name} 发布清单 commit 不是完整 Git SHA")
+        if manifest.get("source") != "git_archive":
+            raise ValueError(f"{name} 发布来源不是固定 Git commit")
+        if manifest.get("working_tree_dirty") is not False:
+            raise ValueError(f"{name} 发布清单包含可变工作区")
+        snapshot_sha256 = str(manifest.get("snapshot_sha256", "")).lower()
+        if not SHA256_PATTERN.fullmatch(snapshot_sha256):
+            raise ValueError(f"{name} 发布快照 SHA-256 无效")
+
+        matrix[name] = {
+            "current_path": str(current_path),
+            "release_path": str(release_path),
+            "release_manifest_path": str(manifest_path),
+            "release_manifest_sha256": _file_sha256(manifest_path),
+            "commit": commit,
+            "source": manifest["source"],
+            "working_tree_dirty": manifest["working_tree_dirty"],
+            "snapshot_sha256": snapshot_sha256,
+            "created_at": manifest.get("created_at"),
+        }
+    return matrix
+
+
 def generate_vnpy_gold_evidence(
     *,
     output_dir: Path,
     reviewer: str,
     vector_path: Path,
     workspace_root: Path | None = None,
+    deploy_root: Path | None = None,
     actual_factory: Callable[[], dict[str, Any]] = run_vnpy_acceptance_vector,
     repositories: Mapping[str, Mapping[str, Any]] | None = None,
+    deployments: Mapping[str, Mapping[str, Any]] | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> dict[str, Any]:
     """运行固定 Oracle，并生成不可覆盖的 GOLD-001 证据目录。"""
@@ -87,6 +142,29 @@ def generate_vnpy_gold_evidence(
     )
     if not repository_matrix:
         raise ValueError("GOLD-001 仓库矩阵为空，请显式指定工作区根目录")
+    deployment_matrix = (
+        {name: dict(value) for name, value in deployments.items()}
+        if deployments is not None
+        else _deployment_matrix(deploy_root.resolve())
+        if deploy_root is not None
+        else {}
+    )
+    if not deployment_matrix:
+        raise ValueError("GOLD-001 部署矩阵为空，请显式指定部署根目录")
+    missing_deployments = set(DEPLOYED_PROJECTS) - deployment_matrix.keys()
+    if missing_deployments:
+        raise ValueError(
+            "GOLD-001 部署矩阵缺少项目：" + ", ".join(sorted(missing_deployments))
+        )
+    repository_commit = str(
+        repository_matrix.get("PXYBACKTEST", {}).get("commit", "")
+    ).lower()
+    deployed_commit = str(deployment_matrix["PXYBACKTEST"].get("commit", "")).lower()
+    if repository_commit != deployed_commit:
+        raise ValueError(
+            "PXYBACKTEST 源码提交与 E 盘运行提交不一致："
+            f"{repository_commit or '<missing>'} != {deployed_commit or '<missing>'}"
+        )
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
 
@@ -194,12 +272,14 @@ def generate_vnpy_gold_evidence(
         "vector_id": vector.vector_id,
         "status": "passed",
         "repository_matrix": repository_matrix,
+        "deployment_matrix": deployment_matrix,
         "data_snapshot": request["data"]["snapshot"],
         "execution_profile": request["execution"],
         "test": {
             "command": (
                 "python -m app.cli evidence-vnpy "
-                "--output-dir <dir> --reviewer <reviewer>"
+                "--output-dir <dir> --reviewer <reviewer> "
+                "--workspace-root <workspace> --deploy-root <deploy>"
             ),
             "exit_code": 0,
             "all_passed": True,

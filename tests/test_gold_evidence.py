@@ -57,6 +57,16 @@ def test_generate_vnpy_gold_evidence_writes_complete_package(tmp_path):
                 "tracked_worktree_dirty": False,
             }
         },
+        deployments={
+            "PXYBACKTEST": {
+                "commit": "c" * 40,
+                "release_path": "E:/pxy-deploy/PXYBACKTEST/releases/test",
+            },
+            "PXYLH": {
+                "commit": "d" * 40,
+                "release_path": "E:/pxy-deploy/PXYLH/releases/test",
+            },
+        },
         now=lambda: instant,
     )
 
@@ -73,6 +83,8 @@ def test_generate_vnpy_gold_evidence_writes_complete_package(tmp_path):
     }
     assert manifest["task_id"] == task_result["task_id"] == summary["task_id"]
     assert manifest["repository_matrix"]["PXYBACKTEST"]["commit"] == "c" * 40
+    assert manifest["deployment_matrix"]["PXYBACKTEST"]["commit"] == "c" * 40
+    assert manifest["deployment_matrix"]["PXYLH"]["commit"] == "d" * 40
     assert set(manifest["artifact_sha256"]) == {
         "request.json",
         "vector.json",
@@ -93,6 +105,45 @@ def test_gold_evidence_rejects_empty_repository_matrix(tmp_path) -> None:
             / "vectors"
             / "vnpy_cta_native_v1.json",
             repositories={},
+            deployments={
+                "PXYBACKTEST": {"commit": "c" * 40},
+                "PXYLH": {"commit": "d" * 40},
+            },
+        )
+
+    assert not (tmp_path / "evidence").exists()
+
+
+def test_gold_evidence_rejects_empty_deployment_matrix(tmp_path) -> None:
+    with pytest.raises(ValueError, match="部署矩阵为空"):
+        generate_vnpy_gold_evidence(
+            output_dir=tmp_path / "evidence",
+            reviewer="自动复核",
+            vector_path=Path(__file__).parents[1]
+            / "acceptance"
+            / "vectors"
+            / "vnpy_cta_native_v1.json",
+            repositories={"PXYBACKTEST": {"commit": "c" * 40}},
+            deployments={},
+        )
+
+    assert not (tmp_path / "evidence").exists()
+
+
+def test_gold_evidence_rejects_source_and_deployment_mismatch(tmp_path) -> None:
+    with pytest.raises(ValueError, match="源码提交与 E 盘运行提交不一致"):
+        generate_vnpy_gold_evidence(
+            output_dir=tmp_path / "evidence",
+            reviewer="自动复核",
+            vector_path=Path(__file__).parents[1]
+            / "acceptance"
+            / "vectors"
+            / "vnpy_cta_native_v1.json",
+            repositories={"PXYBACKTEST": {"commit": "c" * 40}},
+            deployments={
+                "PXYBACKTEST": {"commit": "e" * 40},
+                "PXYLH": {"commit": "d" * 40},
+            },
         )
 
     assert not (tmp_path / "evidence").exists()

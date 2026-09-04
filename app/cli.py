@@ -176,6 +176,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="用于绑定 Git 仓库矩阵的工作区根目录",
     )
     evidence_vnpy.add_argument(
+        "--deploy-root",
+        default=os.getenv("PXY_DEPLOY_ROOT", ""),
+        help="用于绑定 E 盘实际运行 release 的部署根目录",
+    )
+    evidence_vnpy.add_argument(
         "--vector",
         default=str(
             Path(__file__).parents[1]
@@ -269,6 +274,7 @@ def main(argv: list[str] | None = None, *, output: TextIO | None = None) -> int:
                     workspace_root=(
                         Path(args.workspace_root) if args.workspace_root else None
                     ),
+                    deploy_root=(Path(args.deploy_root) if args.deploy_root else None),
                 )
             except (OSError, ValueError) as exc:
                 raise CliError(str(exc)) from exc

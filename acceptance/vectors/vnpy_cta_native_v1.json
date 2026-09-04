@@ -2,17 +2,17 @@
   "contract_version": "pxybacktest.parity-acceptance.v1",
   "vector_id": "vnpy-cta-native-v1",
   "platform": "vnpy",
-  "strategy_source_sha256": "6be5f623e6c84cbf00283a3b6923748d6734c295b0f7728d0c12f44f728d0b42",
-  "data_manifest_sha256": "f4843956d31cdd2d63c99bde2b5dfd067cfe1b1e36f399cf897bf85366bab521",
+  "strategy_source_sha256": "0748b90a5105a31c065fb405e610cde18bb4e34ca9e9953acf7730ae4831208f",
+  "data_manifest_sha256": "5b52da223242be25d48b01547d026ed6597766cc8b1c4fd207c5ad63b8f89ccf",
   "runtime_identity": "vnpy-4.2.0+vnpy_ctastrategy-1.4.0",
   "identity_checks": [
     {
       "path": "strategy.source_hash",
-      "expected": "6be5f623e6c84cbf00283a3b6923748d6734c295b0f7728d0c12f44f728d0b42"
+      "expected": "0748b90a5105a31c065fb405e610cde18bb4e34ca9e9953acf7730ae4831208f"
     },
     {
       "path": "data_snapshot.manifest_sha256",
-      "expected": "f4843956d31cdd2d63c99bde2b5dfd067cfe1b1e36f399cf897bf85366bab521"
+      "expected": "5b52da223242be25d48b01547d026ed6597766cc8b1c4fd207c5ad63b8f89ccf"
     },
     {
       "path": "diagnostics.runtime_identity",
@@ -22,13 +22,42 @@
   "trades": {
     "checks": [
       {
+        "path": "orders",
+        "expected": [
+          {
+            "order_id": "1",
+            "symbol": "TEST.LOCAL",
+            "datetime": "2026-01-05T09:04:00",
+            "type": "limit",
+            "direction": "long",
+            "offset": "open",
+            "price": 112.0,
+            "volume": 1.0,
+            "traded": 1.0,
+            "status": "alltraded"
+          },
+          {
+            "order_id": "2",
+            "symbol": "TEST.LOCAL",
+            "datetime": "2026-01-05T09:06:00",
+            "type": "limit",
+            "direction": "short",
+            "offset": "close",
+            "price": 89.0,
+            "volume": 1.0,
+            "traded": 1.0,
+            "status": "alltraded"
+          }
+        ]
+      },
+      {
         "path": "deals",
         "expected": [
           {
             "trade_id": "1",
             "order_id": "1",
             "symbol": "TEST.LOCAL",
-            "datetime": "2026-01-05T09:01:00",
+            "datetime": "2026-01-05T09:05:00",
             "direction": "long",
             "offset": "open",
             "price": 101.0,
@@ -38,10 +67,10 @@
             "trade_id": "2",
             "order_id": "2",
             "symbol": "TEST.LOCAL",
-            "datetime": "2026-01-05T09:02:00",
+            "datetime": "2026-01-05T09:07:00",
             "direction": "short",
             "offset": "close",
-            "price": 102.0,
+            "price": 97.0,
             "volume": 1.0
           }
         ]
@@ -55,11 +84,11 @@
         "expected": [
           {
             "date": "2026-01-05",
-            "balance": 100005.797,
-            "net_pnl": 5.797000000000001,
-            "commission": 0.203,
+            "balance": 99955.802,
+            "net_pnl": -44.198,
+            "commission": 0.198,
             "slippage": 4.0,
-            "turnover": 2030.0,
+            "turnover": 1980.0,
             "trade_count": 2
           }
         ]
@@ -71,19 +100,19 @@
       {
         "path": "replay_audit",
         "expected": {
-          "event_count": 9,
-          "chain_sha256": "db918ece9c3168723c6c85cd602a859793dac699132175981a3d1852acc9ff4a"
+          "event_count": 13,
+          "chain_sha256": "474a73a2b2842bcfd659cdc8c6c84ccf5bcf6b802381dbb015c961ac6d7bd6af"
         }
       },
       {
         "path": "execution_snapshot.bar_history",
-        "expected_sha256": "f4843956d31cdd2d63c99bde2b5dfd067cfe1b1e36f399cf897bf85366bab521"
+        "expected_sha256": "5b52da223242be25d48b01547d026ed6597766cc8b1c4fd207c5ad63b8f89ccf"
       },
       {
         "path": "execution_snapshot",
         "expected": {
-          "event_seq": 9,
-          "bar_history_count": 6,
+          "event_seq": 13,
+          "bar_history_count": 8,
           "account_curve_count": 1,
           "history_truncated": {
             "bars": false,
@@ -97,6 +126,9 @@
   "metadata": {
     "oracle_type": "pinned_vnpy_native_runtime",
     "data_type": "deterministic_synthetic_bars",
+    "strategy_type": "dual_moving_average_cross",
+    "fast_window": 2,
+    "slow_window": 3,
     "scope": "runtime_regression_only_not_all_vnpy_strategies",
     "verified_command": "python -m app.cli accept-vnpy"
   }

@@ -42,6 +42,7 @@ def run_vnpy_acceptance_vector() -> dict[str, Any]:
     from .acceptance_strategies.vnpy_cta_v1 import VnpyCtaAcceptanceV1
 
     start = datetime(2026, 1, 5, 9, 0)
+    close_prices = [100, 99, 98, 100, 102, 101, 99, 97]
     bars = [
         BarData(
             symbol="TEST",
@@ -50,13 +51,13 @@ def run_vnpy_acceptance_vector() -> dict[str, Any]:
             interval=Interval.MINUTE,
             volume=100 + index,
             turnover=0,
-            open_price=100 + index,
-            high_price=101 + index,
-            low_price=99 + index,
-            close_price=100 + index,
+            open_price=close_price,
+            high_price=close_price + 1,
+            low_price=close_price - 1,
+            close_price=close_price,
             gateway_name="PXYBACKTEST",
         )
-        for index in range(6)
+        for index, close_price in enumerate(close_prices)
     ]
     bar_payloads = [
         {
@@ -91,6 +92,21 @@ def run_vnpy_acceptance_vector() -> dict[str, Any]:
     daily = engine.calculate_result()
     engine.calculate_statistics(output=False)
 
+    orders = [
+        {
+            "order_id": str(order.orderid),
+            "symbol": order.vt_symbol,
+            "datetime": order.datetime.isoformat() if order.datetime else None,
+            "type": order.type.name.lower(),
+            "direction": order.direction.name.lower(),
+            "offset": order.offset.name.lower(),
+            "price": float(order.price),
+            "volume": float(order.volume),
+            "traded": float(order.traded),
+            "status": order.status.name.lower(),
+        }
+        for order in engine.limit_orders.values()
+    ]
     deals = [
         {
             "trade_id": str(trade.tradeid),
@@ -126,6 +142,18 @@ def run_vnpy_acceptance_vector() -> dict[str, Any]:
                 event_type="market_bar",
                 event_time=f"{payload['datetime']}+08:00",
                 payload=payload,
+                snapshot_id=data_manifest_sha256,
+                source="vnpy-native-vector",
+                symbol="TEST.LOCAL",
+                source_seq=index,
+            )
+        )
+    for index, order in enumerate(orders, start=len(events)):
+        events.append(
+            ReplayEvent(
+                event_type="order",
+                event_time=f"{order['datetime']}+08:00",
+                payload=order,
                 snapshot_id=data_manifest_sha256,
                 source="vnpy-native-vector",
                 symbol="TEST.LOCAL",
@@ -169,6 +197,7 @@ def run_vnpy_acceptance_vector() -> dict[str, Any]:
         "strategy": {"source_hash": _strategy_source_sha256()},
         "data_snapshot": {"manifest_sha256": data_manifest_sha256},
         "diagnostics": {"runtime_identity": runtime_identity},
+        "orders": orders,
         "deals": deals,
         "execution_snapshot": replay["execution_snapshot"],
         "replay_audit": replay["replay_audit"],

@@ -165,6 +165,20 @@ def build_parser() -> argparse.ArgumentParser:
             / "vnpy_cta_native_v1.json"
         ),
     )
+    evidence_vnpy = sub.add_parser(
+        "evidence-vnpy", help="运行 GOLD-001 并生成完整、不可覆盖的证据包"
+    )
+    evidence_vnpy.add_argument("--output-dir", required=True)
+    evidence_vnpy.add_argument("--reviewer", required=True)
+    evidence_vnpy.add_argument(
+        "--vector",
+        default=str(
+            Path(__file__).parents[1]
+            / "acceptance"
+            / "vectors"
+            / "vnpy_cta_native_v1.json"
+        ),
+    )
     record_tqsdk = sub.add_parser(
         "record-tqsdk", help="首次真实执行并记录天勤固定 Oracle 向量"
     )
@@ -239,6 +253,19 @@ def main(argv: list[str] | None = None, *, output: TextIO | None = None) -> int:
             )
             _write_json(result.model_dump(mode="json"), out)
             return 0 if result.all_passed else 2
+        if args.command == "evidence-vnpy":
+            from .gold_evidence import generate_vnpy_gold_evidence
+
+            try:
+                evidence = generate_vnpy_gold_evidence(
+                    output_dir=Path(args.output_dir),
+                    reviewer=args.reviewer,
+                    vector_path=Path(args.vector),
+                )
+            except (OSError, ValueError) as exc:
+                raise CliError(str(exc)) from exc
+            _write_json(evidence, out)
+            return 0
         if args.command == "record-tqsdk":
             from .tqsdk_acceptance import (
                 build_tqsdk_acceptance_vector,

@@ -29,7 +29,11 @@ def test_cta_worker_environment_maps_file_identity_without_secret_value() -> Non
             "PXYBACKTEST_PXYDATA_API_KEY_FILE": r"C:\secrets\pxydata-api-key",
             "PXYBACKTEST_PXYDATA_BASE_URL": "http://127.0.0.1:3020/",
             "PXYBACKTEST_PXYDATA_DATA_ROOT": r"E:\pxy-runtime\PXYDATA\data",
+            "PXYBACKTEST_PXYDATA_SERVICE_SECRET_FILE": (
+                r"C:\secrets\pxydata-service-secret"
+            ),
             "PXYBACKTEST_PXYDATA_API_KEY": "must-not-cross-worker-boundary",
+            "PXYBACKTEST_PXYDATA_SERVICE_SECRET": "also-must-not-cross",
         }
     )
 
@@ -37,8 +41,10 @@ def test_cta_worker_environment_maps_file_identity_without_secret_value() -> Non
         "PXYDATA_API_KEY_FILE": r"C:\secrets\pxydata-api-key",
         "PXYDATA_BASE_URL": "http://127.0.0.1:3020/",
         "PXYDATA_DATA_DIR": r"E:\pxy-runtime\PXYDATA\data",
+        "PXYDATA_SERVICE_SECRET_FILE": r"C:\secrets\pxydata-service-secret",
     }
     assert "must-not-cross-worker-boundary" not in mapped.values()
+    assert "also-must-not-cross" not in mapped.values()
 
 
 def test_worker_applies_identity_mapping_before_pxylh_loader_import(

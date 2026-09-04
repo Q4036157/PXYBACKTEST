@@ -103,6 +103,7 @@ class SnapshotClient(Protocol):
 class PxyDataSnapshotClient:
     base_url: str
     api_key: str
+    service_secret: str = ""
     timeout_seconds: float = 30.0
 
     @classmethod
@@ -110,6 +111,7 @@ class PxyDataSnapshotClient:
         return cls(
             base_url=settings.pxydata_base_url.rstrip("/"),
             api_key=settings.pxydata_api_key,
+            service_secret=settings.pxydata_service_secret,
         )
 
     @property
@@ -284,6 +286,8 @@ class PxyDataSnapshotClient:
             "Accept": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
+        if self.service_secret:
+            headers["X-PXYDAA-Service-Secret"] = self.service_secret
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json"

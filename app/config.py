@@ -16,6 +16,7 @@ PXYLH_CTA_WORKER_ENV_MAP = {
     "PXYBACKTEST_PXYDATA_API_KEY_FILE": "PXYDATA_API_KEY_FILE",
     "PXYBACKTEST_PXYDATA_BASE_URL": "PXYDATA_BASE_URL",
     "PXYBACKTEST_PXYDATA_DATA_ROOT": "PXYDATA_DATA_DIR",
+    "PXYBACKTEST_PXYDATA_SERVICE_SECRET_FILE": "PXYDATA_SERVICE_SECRET_FILE",
 }
 
 
@@ -44,6 +45,7 @@ class Settings:
     pxydata_data_root: Path = Path(r"E:\pxy-runtime\PXYDATA\data")
     pxydata_base_url: str = "http://127.0.0.1:3020"
     pxydata_api_key: str = ""
+    pxydata_service_secret: str = ""
     llm_base_url: str = ""
     llm_api_key: str = ""
     custom_nodes_root: Path = Path(r"E:\pxy-runtime\PXYBACKTEST\custom_nodes")
@@ -128,6 +130,18 @@ class Settings:
         pxydata_api_key = os.getenv(
             "PXYBACKTEST_PXYDATA_API_KEY", ""
         ).strip() or _read_secret(pxydata_secret_path)
+        pxydata_service_secret_path_raw = os.getenv(
+            "PXYBACKTEST_PXYDATA_SERVICE_SECRET_FILE",
+            r"C:\ProgramData\PXY\secrets\pxydata-service-secret",
+        ).strip()
+        pxydata_service_secret_path = (
+            Path(pxydata_service_secret_path_raw)
+            if pxydata_service_secret_path_raw
+            else None
+        )
+        pxydata_service_secret = os.getenv(
+            "PXYBACKTEST_PXYDATA_SERVICE_SECRET", ""
+        ).strip() or _read_secret(pxydata_service_secret_path)
         llm_secret_path_raw = os.getenv("PXYBACKTEST_LLM_API_KEY_FILE", "").strip()
         llm_secret_path = Path(llm_secret_path_raw) if llm_secret_path_raw else None
         llm_api_key = os.getenv("PXYBACKTEST_LLM_API_KEY", "").strip() or _read_secret(llm_secret_path)
@@ -144,6 +158,7 @@ class Settings:
             .strip()
             .rstrip("/"),
             pxydata_api_key=pxydata_api_key,
+            pxydata_service_secret=pxydata_service_secret,
             llm_base_url=os.getenv("PXYBACKTEST_LLM_BASE_URL", "").strip().rstrip("/"),
             llm_api_key=llm_api_key,
             custom_nodes_root=Path(os.getenv(

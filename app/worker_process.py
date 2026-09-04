@@ -58,6 +58,33 @@ def _configure_backtest_worker_logging() -> None:
     logger.propagate = False
 
 
+def _configure_pxylh_cta_worker_environment() -> dict[str, Any]:
+    """在隔离 worker 内桥接 PXYBACKTEST 与 PXYLH CTA loader 的配置名。"""
+
+    from .config import pxylh_cta_worker_environment
+
+    mapped = pxylh_cta_worker_environment()
+    for name, value in mapped.items():
+        os.environ[name] = value
+
+    credential_source = "unconfigured"
+    if "PXYDATA_API_KEY_FILE" in mapped:
+        credential_source = "pxybacktest_api_key_file"
+    elif str(os.getenv("PXYDATA_API_KEY_FILE") or "").strip():
+        credential_source = "inherited_api_key_file"
+    elif str(os.getenv("PXYDATA_API_KEY") or "").strip():
+        credential_source = "inherited_direct_api_key"
+
+    return {
+        "loader": "pxylh.services.backtest_service.kline_loader",
+        "execution_source": "vnpy_database_compat_cache",
+        "population_policy": "pxydata_preferred_with_vnpy_ccxt_fallback",
+        "actual_upstream": "not_reported_by_loader",
+        "credential_source": credential_source,
+        "immutable_snapshot_verified": False,
+    }
+
+
 def _stable_hash(value: Any) -> str:
     payload = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -322,6 +349,7 @@ def run_preloaded_worker(
     ready_queue,
 ) -> None:
     _configure_backtest_worker_logging()
+    _configure_pxylh_cta_worker_environment()
     try:
         preload_pxylh_runtime(pxylh_root)
     except BaseException as exc:
@@ -1258,6 +1286,7 @@ def run_backtest_worker(
     daa_root: str | None = None,
 ) -> None:
     startup_started_at = time.perf_counter()
+    data_provenance = _configure_pxylh_cta_worker_environment()
     _emit(event_queue, "state", {"status": "running", "phase": "loading_runtime"})
     backend_root = Path(pxylh_root).resolve() / "backend"
     if not backend_root.is_dir():
@@ -1411,11 +1440,14 @@ def run_backtest_worker(
                     ),
                 },
             )
-            holder["result"] = run_backtest_sync(
+            raw_result = run_backtest_sync(
                 task,
                 None,
                 event_sink=emit_runtime_event,
             )
+            if isinstance(raw_result, dict):
+                raw_result["data_provenance"] = dict(data_provenance)
+            holder["result"] = raw_result
         except BaseException as exc:
             holder["error"] = f"{type(exc).__name__}: {exc}"
             holder["traceback"] = traceback.format_exc()
@@ -1607,6 +1639,7 @@ def run_backtest_worker(
             "processed_bars": int(task.processed_bars or 0),
             "total_bars": int(task.total_bars or 0),
             "current_datetime": str(task.current_datetime or ""),
+            "data_provenance": dict(data_provenance),
         }
         if request.get("_task_contract"):
             from app.result_contract import build_result_v2

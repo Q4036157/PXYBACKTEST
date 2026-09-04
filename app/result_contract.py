@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .kernel import stable_hash
@@ -14,7 +15,7 @@ def _attach_reproducibility(
 ) -> dict[str, Any]:
     """给结果写入稳定的输入、事件和最终结果哈希。"""
     task = dict(request.get("_task_contract") or {})
-    snapshot = dict((task.get("data") or {}).get("snapshot") or {})
+    snapshot = dict(result.get("data_snapshot") or {})
     events = list(raw_result.get("events") or raw_result.get("replay_events") or [])
     replay_audit = raw_result.get("replay_audit")
     event_log_sha256 = (
@@ -41,13 +42,37 @@ def build_result_v2(
     """把现有 vn.py 结果映射成稳定的 v2 结果结构。"""
     task = dict(request.get("_task_contract") or {})
     data = dict(task.get("data") or {})
-    snapshot = dict(data.get("snapshot") or {})
-    warnings = list(snapshot.get("warnings") or [])
+    requested_snapshot = dict(data.get("snapshot") or {})
+    data_provenance = dict(raw_result.get("data_provenance") or {})
+    if not data_provenance:
+        data_provenance = {
+            "loader": "pxylh.services.backtest_service.kline_loader",
+            "execution_source": "vnpy_database_compat_cache",
+            "population_policy": "pxydata_preferred_with_vnpy_ccxt_fallback",
+            "actual_upstream": "not_reported_by_loader",
+            "credential_source": "unknown",
+            "immutable_snapshot_verified": False,
+        }
+    execution_snapshot = dict(raw_result.get("data_snapshot") or {})
+    immutable_snapshot_verified = (
+        data_provenance.get("immutable_snapshot_verified") is True
+        and bool(execution_snapshot.get("snapshot_id"))
+        and re.fullmatch(
+            r"[0-9a-fA-F]{64}",
+            str(execution_snapshot.get("manifest_sha256") or ""),
+        )
+        is not None
+    )
+    if not immutable_snapshot_verified:
+        execution_snapshot = {}
+
+    warnings = list(requested_snapshot.get("warnings") or [])
     warnings.extend(
         [
             "vnpy_cta 首期适配器尚未输出完整订单生命周期。",
             "positions 仅支持实时事件，最终结果暂未物化持仓历史。",
-            "当前 vnpy_cta 数据加载器未按 manifest 固定文件集合，快照仅作为 provenance。",
+            "当前 vnpy_cta 执行读取 VNPY 兼容缓存；上游优先 PXYDATA，并允许 VNPY/CCXT 回退。",
+            "CTA loader 尚不报告实际上游命中分支，未把请求快照声明为执行快照。",
         ]
     )
     trades = list(raw_result.get("trades") or [])
@@ -68,9 +93,8 @@ def build_result_v2(
         "task_id": task_id,
         "complete": bool(raw_result.get("complete", True)),
         "termination_reason": str(raw_result.get("termination_reason") or "completed"),
-        "engine_type": task.get("engine_type"),
+        "engine_type": str(task.get("engine_type") or "vnpy_cta"),
         "strategy": task.get("strategy") or {},
-        "data_snapshot": snapshot,
         "run": {
             "default_profile": task.get("default_profile"),
             "universe": task.get("universe") or {},
@@ -101,7 +125,7 @@ def build_result_v2(
             "total_bars": int(raw_result.get("total_bars") or 0),
             "current_datetime": str(raw_result.get("current_datetime") or ""),
             "trade_count": int(raw_result.get("trades_count") or len(trades)),
-            "quality_accepted": bool(snapshot.get("quality_accepted")),
+            "quality_accepted": bool(execution_snapshot.get("quality_accepted")),
             "random_seed": task.get("random_seed"),
             "adapter": "vnpy_cta.legacy.v1",
             "software_versions": {"result_contract": RESULT_CONTRACT_VERSION},
@@ -109,12 +133,16 @@ def build_result_v2(
             "data_source_policy": "pxydata_preferred_with_runtime_fallback",
             "snapshot_enforcement": "provenance_only",
             "strictly_reproducible": False,
+            "data_provenance": data_provenance,
+            "requested_data_snapshot": requested_snapshot or None,
             "replay_audit": raw_result.get("replay_audit"),
             "warnings": warnings,
         },
         "replay_audit": raw_result.get("replay_audit"),
         "artifacts": [],
     }
+    if execution_snapshot:
+        result["data_snapshot"] = execution_snapshot
     result["report"] = build_report_projection(result)
     return _attach_reproducibility(result, request=request, raw_result=raw_result)
 

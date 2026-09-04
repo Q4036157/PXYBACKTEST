@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,6 +10,27 @@ def _read_secret(path: Path | None) -> str:
     if path is None or not path.is_file():
         return ""
     return path.read_text(encoding="utf-8").strip()
+
+
+PXYLH_CTA_WORKER_ENV_MAP = {
+    "PXYBACKTEST_PXYDATA_API_KEY_FILE": "PXYDATA_API_KEY_FILE",
+    "PXYBACKTEST_PXYDATA_BASE_URL": "PXYDATA_BASE_URL",
+    "PXYBACKTEST_PXYDATA_DATA_ROOT": "PXYDATA_DATA_DIR",
+}
+
+
+def pxylh_cta_worker_environment(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """把 PXYBACKTEST 配置名映射为复用 CTA loader 所需的环境名。"""
+
+    source = os.environ if environ is None else environ
+    mapped: dict[str, str] = {}
+    for source_name, worker_name in PXYLH_CTA_WORKER_ENV_MAP.items():
+        value = str(source.get(source_name) or "").strip()
+        if value:
+            mapped[worker_name] = value
+    return mapped
 
 
 @dataclass(frozen=True)

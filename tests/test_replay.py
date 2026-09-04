@@ -164,6 +164,97 @@ def test_execution_snapshot_has_all_projection_domains() -> None:
     assert payload["event_seq"] == 6
 
 
+def test_execution_snapshot_builds_real_footprint_with_conserved_volume() -> None:
+    snapshot = ExecutionSnapshot(run_id="run-footprint", snapshot_id=SNAPSHOT)
+    rows = [
+        {
+            "event_type": "footprint_coverage",
+            "event_time": "2026-08-01T00:00:00Z",
+            "payload": {
+                "available": True,
+                "complete": True,
+                "source": "lighter_trades",
+                "interval": "1m",
+                "interval_ms": 60_000,
+            },
+        },
+        {
+            "event_type": "trade_print",
+            "event_time": "2026-08-01T00:00:03Z",
+            "symbol": "XAU_SWAP_LIGHTER",
+            "price": 2000.2,
+            "qty": 2,
+            "side": "buy",
+        },
+        {
+            "event_type": "trade_print",
+            "event_time": "2026-08-01T00:00:04Z",
+            "symbol": "XAU_SWAP_LIGHTER",
+            "price": 2000.2,
+            "qty": 0.5,
+            "side": "sell",
+        },
+        {
+            "event_type": "trade_print",
+            "event_time": "2026-08-01T00:00:05Z",
+            "symbol": "XAU_SWAP_LIGHTER",
+            "price": 2000.3,
+            "qty": 1.25,
+            "side": "buy",
+        },
+    ]
+    events = [event_from_row(row, snapshot_id=SNAPSHOT) for row in rows]
+    for index, event in enumerate(events, start=1):
+        snapshot.apply(event, event_seq=index)
+
+    payload = snapshot.to_dict(include_history=True)
+    assert payload["footprint"]["available"] is True
+    assert payload["footprint"]["trade_count"] == 3
+    assert len(payload["footprint_bars"]) == 1
+    data = payload["footprint_bars"][0]["data"]
+    assert data["buyVol"] == pytest.approx(3.25)
+    assert data["sellVol"] == pytest.approx(0.5)
+    assert data["delta"] == pytest.approx(2.75)
+    assert data["tradeCount"] == 3
+    assert sum(item["buyVol"] for item in data["bins"]) == pytest.approx(3.25)
+    assert sum(item["sellVol"] for item in data["bins"]) == pytest.approx(0.5)
+
+
+def test_execution_snapshot_never_exposes_pseudo_tick_footprint() -> None:
+    snapshot = ExecutionSnapshot(run_id="run-pseudo", snapshot_id=SNAPSHOT)
+    coverage = event_from_row(
+        {
+            "event_type": "footprint_coverage",
+            "event_time": "2026-08-01T00:00:00Z",
+            "payload": {
+                "available": True,
+                "complete": True,
+                "source": "bar_pseudo_tick",
+            },
+        },
+        snapshot_id=SNAPSHOT,
+    )
+    trade = event_from_row(
+        {
+            "event_type": "trade_print",
+            "event_time": "2026-08-01T00:00:01Z",
+            "symbol": "XAU",
+            "price": 2000,
+            "qty": 1,
+            "side": "buy",
+        },
+        snapshot_id=SNAPSHOT,
+    )
+    snapshot.apply(coverage)
+    snapshot.apply(trade)
+
+    payload = snapshot.to_dict(include_history=True)
+    assert payload["footprint"]["available"] is False
+    assert payload["footprint"]["reason"] == "仅有 K 线，无法生成真实足迹"
+    assert payload["footprint_bars"] == []
+    assert snapshot.footprint_frame_for(trade) is None
+
+
 def test_feed_infers_pit_events_and_signals_without_collapsing_domains() -> None:
     feed = SnapshotDataFeed(
         snapshot_id=SNAPSHOT,
@@ -355,6 +446,45 @@ def test_result_replay_controller_accepts_daily_events_and_preserves_bar_updates
         for frame in frames
         for bar in frame.get("bar_updates", [])
     ] == ["2026-08-01", "2026-08-02", "2026-08-03"]
+
+
+def test_result_replay_controller_projects_only_latest_changed_footprint_bucket() -> None:
+    frames: list[dict] = []
+    controller = ResultReplayController(
+        run_id="run-footprint-controller",
+        snapshot_id=SNAPSHOT,
+        events=[
+            {
+                "event_type": "footprint_coverage",
+                "event_time": "2026-08-01T00:00:00Z",
+                "payload": {
+                    "available": True,
+                    "complete": True,
+                    "source": "lighter_trades",
+                    "interval": "1m",
+                    "interval_ms": 60_000,
+                },
+            },
+            *[
+                {
+                    "event_type": "trade_print",
+                    "event_time": f"2026-08-01T00:00:0{index}Z",
+                    "symbol": "XAU_SWAP_LIGHTER",
+                    "payload": {"price": 2000 + index / 10, "qty": 1, "side": "buy"},
+                }
+                for index in range(1, 4)
+            ],
+        ],
+        mode="fast",
+        render_interval_ms=10_000,
+    )
+
+    outcome = controller.run(on_snapshot=frames.append)
+
+    updates = [item for frame in frames for item in frame["footprint_updates"]]
+    assert len(updates) == 1
+    assert updates[0]["data"]["tradeCount"] == 3
+    assert outcome["execution_snapshot"]["footprint"]["trade_count"] == 3
 
 
 def test_result_replay_controller_applies_pause_resume_speed_and_cancel() -> None:

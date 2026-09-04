@@ -5,11 +5,11 @@ from __future__ import annotations
 import hashlib
 import math
 import statistics
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .learning import _parse_datetime, _safe_table_rows
+from .learning import LearningBacktestError, _parse_datetime, _safe_table_rows
 
 LIGHTER_STRATEGY_ID = "lighter_flow_v1"
 LIGHTER_STRATEGY_HASH = hashlib.sha256(b"pxybacktest.lighter-flow.v1").hexdigest()
@@ -177,6 +177,19 @@ def run_lighter_backtest(
     factors = load_manifest_rows(data_root=data_root, manifest=manifest, dataset_name="lighter_microstructure_factors", symbols=symbols, start=str(period.get("start") or ""), end=str(period.get("end") or ""))
     events = load_manifest_rows(data_root=data_root, manifest=manifest, dataset_name="lighter_order_book_events", symbols=symbols, start=str(period.get("start") or ""), end=str(period.get("end") or ""))
     funding_rows = load_manifest_rows(data_root=data_root, manifest=manifest, dataset_name="lighter_funding_history", symbols=symbols, start=str(period.get("start") or ""), end=str(period.get("end") or ""))
+    trades = load_manifest_rows(
+        data_root=data_root,
+        manifest=manifest,
+        dataset_name="lighter_trades",
+        symbols=symbols,
+        start=str(period.get("start") or ""),
+        end=str(period.get("end") or ""),
+    )
+    footprint_coverage, footprint_trades = _footprint_coverage(
+        trades,
+        start=str(period.get("start") or ""),
+        end=str(period.get("end") or ""),
+    )
     rebuilt = rebuild_order_book(events, depth=int(parameters.get("book_depth") or 10)) if events else []
     if not factors and rebuilt:
         factors = rebuilt
@@ -240,8 +253,16 @@ def run_lighter_backtest(
     from app.replay import build_replay_audit
 
     snapshot = dict((task.get("data") or {}).get("snapshot") or {})
-    replay_events: list[dict[str, Any]] = []
-    for index, row in enumerate(factors):
+    replay_events: list[dict[str, Any]] = [
+        {
+            "event_type": "footprint_coverage",
+            "event_time": period.get("start"),
+            "payload": footprint_coverage,
+            "symbol": symbols[0] if symbols else None,
+            "source_seq": 0,
+        }
+    ]
+    for index, row in enumerate(factors, start=1):
         replay_events.append(
             {
                 "event_type": "order_book" if any(
@@ -250,6 +271,24 @@ def run_lighter_backtest(
                 "event_time": row.get("event_time"),
                 "available_at": row.get("available_at"),
                 "payload": row,
+                "symbol": row.get("symbol"),
+                "source_seq": index,
+            }
+        )
+    exposed_footprint_trades = (
+        footprint_trades if footprint_coverage["available"] else []
+    )
+    for index, row in enumerate(exposed_footprint_trades, start=len(replay_events)):
+        replay_events.append(
+            {
+                "event_type": "trade_print",
+                "event_time": row.get("event_time"),
+                "available_at": row.get("received_at"),
+                "payload": {
+                    **row,
+                    "volume": row.get("qty"),
+                    "real_trade": True,
+                },
                 "symbol": row.get("symbol"),
                 "source_seq": index,
             }
@@ -284,7 +323,7 @@ def run_lighter_backtest(
         "metrics": {"total_return": balance / capital - 1.0, "final_equity": balance, "net_profit": balance - capital, "n_trades": len(deals), "win_rate": sum(value > 0 for value in returns) / len(returns) if returns else 0.0, "active_buy_qty": active_buy, "active_sell_qty": active_sell, "funding_pnl": sum(float(item.get("funding_pnl") or 0.0) for item in deals)},
         "curves": {"equity": equity},
         "deals": deals,
-        "diagnostics": {"matching_model": "lighter_factor_or_l2_rebuild", "book_depth": int(parameters.get("book_depth") or 10), "data_source_policy": "pxydata_snapshot_only", "snapshot_enforcement": "manifest_bound", "warnings": ["Lighter 回测只生成研究结果，不提交真实订单。"]},
+        "diagnostics": {"matching_model": "lighter_factor_or_l2_rebuild", "book_depth": int(parameters.get("book_depth") or 10), "data_source_policy": "pxydata_snapshot_only", "snapshot_enforcement": "manifest_bound", "footprint_coverage": footprint_coverage, "warnings": ["Lighter 回测只生成研究结果，不提交真实订单。"]},
         "artifacts": [],
         "replay_audit": build_replay_audit(
             run_id=task_id,
@@ -293,6 +332,74 @@ def run_lighter_backtest(
         ),
         "_replay_events": replay_events,
     }
+
+
+def _footprint_coverage(
+    trades: list[dict[str, Any]],
+    *,
+    start: str,
+    end: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """只在请求区间每个 UTC 小时都有真实逐笔时开放足迹。"""
+
+    start_dt = _parse_datetime(start).astimezone(timezone.utc)
+    end_dt = _parse_datetime(end).astimezone(timezone.utc)
+    cursor = start_dt.replace(minute=0, second=0, microsecond=0)
+    end_hour = end_dt.replace(minute=0, second=0, microsecond=0)
+    expected_hours: set[str] = set()
+    while cursor <= end_hour:
+        expected_hours.add(cursor.strftime("%Y-%m-%dT%H:00:00Z"))
+        cursor += timedelta(hours=1)
+
+    valid: list[dict[str, Any]] = []
+    covered_hours: set[str] = set()
+    invalid = 0
+    for row in trades:
+        try:
+            price = float(row.get("price"))
+            qty = float(row.get("qty"))
+            event_time = _parse_datetime(row.get("event_time")).astimezone(timezone.utc)
+        except (TypeError, ValueError, LearningBacktestError):
+            invalid += 1
+            continue
+        side = str(row.get("side") or "unknown").strip().lower()
+        if price <= 0 or qty <= 0 or side not in {"buy", "sell", "unknown"}:
+            invalid += 1
+            continue
+        valid.append(row)
+        covered_hours.add(
+            event_time.replace(minute=0, second=0, microsecond=0).strftime(
+                "%Y-%m-%dT%H:00:00Z"
+            )
+        )
+
+    missing = sorted(expected_hours - covered_hours)
+    complete = bool(valid) and invalid == 0 and not missing
+    if not trades:
+        reason = "仅有 K 线，无法生成真实足迹"
+    elif invalid:
+        reason = f"真实逐笔存在 {invalid} 条无效记录，无法生成完整足迹"
+    elif missing:
+        reason = f"真实逐笔覆盖不完整，缺少 {len(missing)} 个小时，无法生成完整足迹"
+    else:
+        reason = ""
+    return (
+        {
+            "contract": "pxybacktest.footprint.v1",
+            "available": complete,
+            "complete": complete,
+            "source": "lighter_trades" if trades else "none",
+            "interval": "1m",
+            "interval_ms": 60_000,
+            "reason": reason,
+            "expected_hours": len(expected_hours),
+            "covered_hours": len(covered_hours),
+            "missing_hours": missing[:48],
+            "trade_count": len(valid),
+            "invalid_trade_count": invalid,
+        },
+        valid,
+    )
 
 
 def _apply_level(book: dict[float, float], price: Any, size: Any) -> None:

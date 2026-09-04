@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from app.lighter_microstructure import rebuild_order_book, run_lighter_backtest
+from app.lighter_microstructure import (
+    _footprint_coverage,
+    rebuild_order_book,
+    run_lighter_backtest,
+)
 
 
 def test_rebuild_order_book_replays_snapshot_updates_and_depth() -> None:
@@ -40,3 +44,75 @@ def test_lighter_backtest_reports_flow_and_funding() -> None:
     assert "funding_pnl" in result["metrics"]
     assert result["replay_audit"]["event_count"] >= len(rows)
     assert len(result["replay_audit"]["chain_sha256"]) == 64
+
+
+def test_footprint_coverage_requires_every_requested_hour() -> None:
+    trades = [
+        {
+            "symbol": "XAU_SWAP_LIGHTER",
+            "event_time": "2026-09-04T03:00:01Z",
+            "received_at": "2026-09-04T03:00:02Z",
+            "price": 4038.9,
+            "qty": 0.25,
+            "side": "sell",
+        },
+        {
+            "symbol": "XAU_SWAP_LIGHTER",
+            "event_time": "2026-09-04T04:59:59Z",
+            "received_at": "2026-09-04T05:00:00Z",
+            "price": 4039.1,
+            "qty": 0.5,
+            "side": "buy",
+        },
+    ]
+
+    coverage, valid = _footprint_coverage(
+        trades,
+        start="2026-09-04T03:00:00Z",
+        end="2026-09-04T04:59:59Z",
+    )
+
+    assert coverage["available"] is True
+    assert coverage["covered_hours"] == 2
+    assert coverage["trade_count"] == 2
+    assert valid == trades
+
+
+def test_footprint_coverage_reports_missing_hour_and_ignores_bad_row() -> None:
+    coverage, valid = _footprint_coverage(
+        [
+            {
+                "symbol": "XAU_SWAP_LIGHTER",
+                "event_time": "2026-09-04T03:00:01Z",
+                "price": 4038.9,
+                "qty": 0.25,
+                "side": "sell",
+            },
+            {
+                "symbol": "XAU_SWAP_LIGHTER",
+                "event_time": "bad-time",
+                "price": 4039,
+                "qty": 1,
+                "side": "buy",
+            },
+        ],
+        start="2026-09-04T03:00:00Z",
+        end="2026-09-04T04:59:59Z",
+    )
+
+    assert coverage["available"] is False
+    assert coverage["invalid_trade_count"] == 1
+    assert coverage["missing_hours"] == ["2026-09-04T04:00:00Z"]
+    assert len(valid) == 1
+
+
+def test_footprint_coverage_explains_kline_only_data() -> None:
+    coverage, valid = _footprint_coverage(
+        [],
+        start="2026-09-04T03:00:00Z",
+        end="2026-09-04T03:59:59Z",
+    )
+
+    assert coverage["available"] is False
+    assert coverage["reason"] == "仅有 K 线，无法生成真实足迹"
+    assert valid == []

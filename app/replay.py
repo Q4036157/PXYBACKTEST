@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -20,6 +21,8 @@ from .kernel import stable_hash
 
 
 REPLAY_CONTRACT_VERSION = "pxybacktest.replay.v1"
+FOOTPRINT_CONTRACT_VERSION = "pxybacktest.footprint.v1"
+FOOTPRINT_KLINE_ONLY_REASON = "仅有 K 线，无法生成真实足迹"
 DEFAULT_RENDER_INTERVAL_MS = 33
 
 
@@ -62,6 +65,7 @@ def _coerce_time_value(value: Any) -> str:
 
 
 _EVENT_PRIORITIES = {
+    "footprint_coverage": 9,
     "market_tick": 10,
     "market_bar": 10,
     "order_book": 11,
@@ -522,6 +526,20 @@ class ExecutionSnapshot:
     fills: list[dict[str, Any]] = field(default_factory=list)
     positions: dict[str, dict[str, Any]] = field(default_factory=dict)
     account: dict[str, Any] = field(default_factory=dict)
+    footprint: dict[str, Any] = field(
+        default_factory=lambda: {
+            "contract": FOOTPRINT_CONTRACT_VERSION,
+            "available": False,
+            "complete": False,
+            "source": "none",
+            "interval": "1m",
+            "interval_ms": 60_000,
+            "reason": FOOTPRINT_KLINE_ONLY_REASON,
+        }
+    )
+    footprint_bars: dict[str, dict[str, Any]] = field(default_factory=dict)
+    footprint_trade_count: int = 0
+    footprint_invalid_trade_count: int = 0
     queue_lag: int = 0
     bar_history: deque[dict[str, Any]] = field(
         default_factory=lambda: deque(maxlen=50_000)
@@ -561,7 +579,30 @@ class ExecutionSnapshot:
         self.simulated_at = event.ready_time
         payload = dict(event.payload)
         symbol = event.symbol or str(payload.get("symbol") or "")
-        if event.event_type in {"market_tick", "market_bar"} and symbol:
+        if event.event_type == "footprint_coverage":
+            complete = bool(payload.get("complete"))
+            source = str(payload.get("source") or "none")
+            available = bool(payload.get("available")) and complete and source not in {
+                "none",
+                "bar_pseudo_tick",
+                "pseudo_tick",
+            }
+            interval_ms = max(1_000, int(payload.get("interval_ms") or 60_000))
+            self.footprint = {
+                **payload,
+                "contract": FOOTPRINT_CONTRACT_VERSION,
+                "available": available,
+                "complete": complete,
+                "source": source,
+                "interval": str(payload.get("interval") or "1m"),
+                "interval_ms": interval_ms,
+                "reason": (
+                    ""
+                    if available
+                    else str(payload.get("reason") or FOOTPRINT_KLINE_ONLY_REASON)
+                ),
+            }
+        elif event.event_type in {"market_tick", "market_bar"} and symbol:
             self.bars[symbol] = payload
             if event.event_type == "market_bar":
                 self.bar_history.append(payload)
@@ -570,6 +611,7 @@ class ExecutionSnapshot:
             # 逐笔成交不是 K 线：保留原始成交顺序，避免把微观结构数据
             # 错误地覆盖主图 OHLC。前端可以按 symbol/price/volume 绘制成交层。
             self._append_bounded(self.trades, payload)
+            self._apply_footprint_trade(event, payload, symbol)
         elif event.event_type == "order_book" and symbol:
             self.order_books[symbol] = payload
         elif event.event_type == "news":
@@ -610,6 +652,117 @@ class ExecutionSnapshot:
             self.account_curve.append(payload)
             self.account_curve_count += 1
 
+    def _apply_footprint_trade(
+        self,
+        event: ReplayEvent,
+        payload: dict[str, Any],
+        symbol: str,
+    ) -> None:
+        try:
+            price = float(payload.get("price"))
+            qty = float(
+                payload.get("qty")
+                if payload.get("qty") is not None
+                else payload.get("volume")
+            )
+        except (TypeError, ValueError):
+            self.footprint_invalid_trade_count += 1
+            return
+        if (
+            not symbol
+            or price <= 0
+            or qty <= 0
+            or not math.isfinite(price)
+            or not math.isfinite(qty)
+        ):
+            self.footprint_invalid_trade_count += 1
+            return
+        side = str(payload.get("side") or "unknown").strip().lower()
+        if side not in {"buy", "sell", "unknown"}:
+            self.footprint_invalid_trade_count += 1
+            return
+        interval_ms = max(1_000, int(self.footprint.get("interval_ms") or 60_000))
+        event_ms = int(_parse_time(event.event_time).timestamp() * 1000)
+        start_ts = event_ms // interval_ms * interval_ms
+        interval = str(self.footprint.get("interval") or "1m")
+        key = f"{symbol}|{interval}|{start_ts}"
+        frame = self.footprint_bars.get(key)
+        if frame is None:
+            frame = {
+                "type": "L1",
+                "event": "footprint",
+                "symbol": symbol,
+                "platform": "backtest",
+                "data": {
+                    "interval": interval,
+                    "startTs": start_ts,
+                    "endTs": start_ts + interval_ms,
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                    "buyVol": 0.0,
+                    "sellVol": 0.0,
+                    "unknownVol": 0.0,
+                    "delta": 0.0,
+                    "tradeCount": 0,
+                    "bins_by_price": {},
+                },
+            }
+            self._set_bounded(self.footprint_bars, key, frame)
+        data = frame["data"]
+        data["high"] = max(float(data["high"]), price)
+        data["low"] = min(float(data["low"]), price)
+        data["close"] = price
+        volume_key = {
+            "buy": "buyVol",
+            "sell": "sellVol",
+            "unknown": "unknownVol",
+        }[side]
+        data[volume_key] = float(data[volume_key]) + qty
+        data["delta"] = float(data["buyVol"]) - float(data["sellVol"])
+        data["tradeCount"] = int(data["tradeCount"]) + 1
+        bins = data["bins_by_price"]
+        price_key = format(price, ".15g")
+        bin_row = bins.setdefault(
+            price_key,
+            {
+                "price": price,
+                "buyVol": 0.0,
+                "sellVol": 0.0,
+                "unknownVol": 0.0,
+                "tradeCount": 0,
+                "maxTradeQty": 0.0,
+                "delta": 0.0,
+            },
+        )
+        bin_row[volume_key] = float(bin_row[volume_key]) + qty
+        bin_row["tradeCount"] = int(bin_row["tradeCount"]) + 1
+        bin_row["maxTradeQty"] = max(float(bin_row["maxTradeQty"]), qty)
+        bin_row["delta"] = float(bin_row["buyVol"]) - float(bin_row["sellVol"])
+        self.footprint_trade_count += 1
+
+    def footprint_frame_for(self, event: ReplayEvent) -> dict[str, Any] | None:
+        """返回当前逐笔所在足迹桶的公开帧。"""
+
+        if event.event_type != "trade_print" or not self.footprint.get("available"):
+            return None
+        symbol = event.symbol or str(event.payload.get("symbol") or "")
+        interval_ms = max(1_000, int(self.footprint.get("interval_ms") or 60_000))
+        event_ms = int(_parse_time(event.event_time).timestamp() * 1000)
+        start_ts = event_ms // interval_ms * interval_ms
+        key = f"{symbol}|{self.footprint.get('interval') or '1m'}|{start_ts}"
+        frame = self.footprint_bars.get(key)
+        return self._public_footprint_frame(frame) if frame else None
+
+    @staticmethod
+    def _public_footprint_frame(frame: dict[str, Any]) -> dict[str, Any]:
+        result = copy.deepcopy(frame)
+        data = result["data"]
+        bins = data.pop("bins_by_price", {})
+        data["bins"] = sorted(bins.values(), key=lambda item: float(item["price"]))
+        return result
+
     def to_dict(self, *, include_history: bool = False) -> dict[str, Any]:
         result = {
             "contract_version": REPLAY_CONTRACT_VERSION,
@@ -629,6 +782,11 @@ class ExecutionSnapshot:
             "fills": self.fills[-5000:],
             "positions": self.positions,
             "account": self.account,
+            "footprint": {
+                **self.footprint,
+                "trade_count": self.footprint_trade_count,
+                "invalid_trade_count": self.footprint_invalid_trade_count,
+            },
             "queue_lag": self.queue_lag,
             "bar_history_count": self.bar_history_count,
             "factor_history_count": self.factor_history_count,
@@ -649,6 +807,14 @@ class ExecutionSnapshot:
                     "factor_history": list(self.factor_history),
                     "sentiment_timeline": list(self.sentiment_timeline),
                     "account_curve": list(self.account_curve),
+                    "footprint_bars": (
+                        [
+                            self._public_footprint_frame(frame)
+                            for frame in self.footprint_bars.values()
+                        ]
+                        if self.footprint.get("available")
+                        else []
+                    ),
                 }
             )
         return result
@@ -734,6 +900,7 @@ class ResultReplayController:
         self.gate = VisualProjectionGate(interval_ms=render_interval_ms)
         self._pending_updates: dict[str, list[dict[str, Any]]] = {
             "bar_updates": [],
+            "footprint_updates": [],
             "order_book_updates": [],
             "sentiment_updates": [],
             "factor_updates": [],
@@ -796,6 +963,10 @@ class ResultReplayController:
             payload["symbol"] = event.symbol
         if event.event_type == "market_bar":
             self._pending_updates["bar_updates"].append(payload)
+        elif event.event_type == "trade_print":
+            frame = self.session.snapshot.footprint_frame_for(event)
+            if frame is not None:
+                self._replace_latest_footprint_update(frame)
         elif event.event_type == "order_book":
             self._replace_latest_update("order_book_updates", event, payload)
         elif event.event_type in {"news", "sentiment"}:
@@ -828,6 +999,22 @@ class ResultReplayController:
                 values[index] = payload
                 return
         values.append(payload)
+
+    def _replace_latest_footprint_update(self, frame: dict[str, Any]) -> None:
+        data = dict(frame.get("data") or {})
+        key = (str(frame.get("symbol") or ""), int(data.get("startTs") or 0))
+        values = self._pending_updates["footprint_updates"]
+        for index in range(len(values) - 1, -1, -1):
+            current = values[index]
+            current_data = dict(current.get("data") or {})
+            current_key = (
+                str(current.get("symbol") or ""),
+                int(current_data.get("startTs") or 0),
+            )
+            if current_key == key:
+                values[index] = frame
+                return
+        values.append(frame)
 
     def _snapshot_payload(self, *, include_history: bool = False) -> dict[str, Any]:
         snapshot = self.session.execution_snapshot(include_history=include_history)

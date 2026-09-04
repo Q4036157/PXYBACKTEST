@@ -32,6 +32,12 @@ from .microstructure import (
     MICROSTRUCTURE_STRATEGY_ID,
     microstructure_runtime_available,
 )
+from .a_share_emotion_etf import (
+    EMOTION_DATA_CONTRACT,
+    EMOTION_ETF_STRATEGY_HASH,
+    EMOTION_ETF_STRATEGY_ID,
+    runtime_available as emotion_etf_runtime_available,
+)
 from .learning import (
     ML_ENGINE_TYPES,
     ML_STRATEGY_HASH,
@@ -76,11 +82,12 @@ from .tqsdk_submission import TqSdkTaskSubmission
 A_SHARE_WARMUP_CALENDAR_DAYS = 120
 LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
 MANIFEST_ENGINE_TYPES = {
-    *DAA_ENGINE_TYPES, "microstructure", *ML_ENGINE_TYPES, *LIGHTER_ENGINE_TYPES
+    *DAA_ENGINE_TYPES, "a_share_emotion_etf", "microstructure", *ML_ENGINE_TYPES, *LIGHTER_ENGINE_TYPES
 }
 ENGINE_REQUIRED_DATASETS: dict[str, list[str]] = {
     "vnpy_cta": [],
     "a_share_portfolio": ["kline_daily"],
+    "a_share_emotion_etf": ["etf_snapshots", "market_emotion_daily"],
     "factor_matrix": ["kline_daily", "factor_matrix_daily"],
     "event_sentiment": ["kline_daily", "factor_matrix_daily", "events"],
     "microstructure": ["market_ticks"],
@@ -455,6 +462,9 @@ def create_app(
     microstructure_available = (
         configured.pxydata_data_root.is_dir() and microstructure_runtime_available()
     )
+    emotion_etf_available = (
+        configured.pxydata_data_root.is_dir() and emotion_etf_runtime_available()
+    )
     learning_available = (
         configured.pxydata_data_root.is_dir() and learning_runtime_available()
     )
@@ -659,6 +669,29 @@ def create_app(
                         a_share_catalog,
                         "a_share_portfolio",
                     ),
+                },
+                {
+                    "id": "a_share_emotion_etf",
+                    "available": emotion_etf_available,
+                    "intervals": ["1d"],
+                    "snapshot_enforcement": "manifest_bound",
+                    "replay_modes": ["bar"],
+                    "event_domains": ["market_bar", "market_emotion", "signal", "order", "fill", "position", "account"],
+                    "execution_stream": "complete_ordered_audited",
+                    "data_contracts": ["pxydata.etf_snapshots.v1", EMOTION_DATA_CONTRACT],
+                    "strategies": [{
+                        "id": EMOTION_ETF_STRATEGY_ID,
+                        "name": "ETF情绪极值C（冰点买、过热卖）",
+                        "version": "builtin-v1",
+                        "source_hash": EMOTION_ETF_STRATEGY_HASH,
+                        "entrypoint": EMOTION_ETF_STRATEGY_ID,
+                        "parameters": [
+                            {"id": "entry_threshold", "default": 30, "locked": True},
+                            {"id": "exit_threshold", "default": 80, "locked": True},
+                            {"id": "lot_size", "default": 100, "locked": True},
+                            {"id": "min_commission", "default": 5.0},
+                        ],
+                    }],
                 },
                 {
                     "id": "factor_matrix",
@@ -998,6 +1031,7 @@ def create_app(
         engine_strategies = _engine_strategies(a_share_catalog, body.engine_type)
         supported_engine = (
             body.engine_type == "vnpy_cta"
+            or (body.engine_type == "a_share_emotion_etf" and emotion_etf_available)
             or bool(engine_strategies)
             or (body.engine_type == "microstructure" and microstructure_available)
             or (body.engine_type in ML_ENGINE_TYPES and learning_available)
@@ -1050,6 +1084,12 @@ def create_app(
             or body.strategy.source_hash.lower() != MICROSTRUCTURE_STRATEGY_HASH
         ):
             raise HTTPException(status_code=409, detail="microstructure 策略版本不一致")
+        if body.engine_type == "a_share_emotion_etf" and (
+            body.strategy.id != EMOTION_ETF_STRATEGY_ID
+            or body.strategy.entrypoint != EMOTION_ETF_STRATEGY_ID
+            or body.strategy.source_hash.lower() != EMOTION_ETF_STRATEGY_HASH
+        ):
+            raise HTTPException(status_code=409, detail="情绪ETF策略版本不一致")
         if body.engine_type in ML_ENGINE_TYPES and (
             body.strategy.id != "temporal_ml_rank_v1"
             or body.strategy.entrypoint != "temporal_ml_rank_v1"

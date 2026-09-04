@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import multiprocessing
 import queue
 import shutil
@@ -27,6 +28,11 @@ class QueueLimitError(ValueError):
 
 
 MAX_WORKER_EVENTS_PER_CYCLE = 500
+MAX_DATA_REQUIREMENTS_PER_CYCLE = 20
+MAX_CONCURRENT_DATA_REQUIREMENTS = 4
+DATA_REQUIREMENT_POLL_TIMEOUT_SECONDS = 35.0
+DATA_REQUIREMENT_RETRY_MAX_SECONDS = 60.0
+logger = logging.getLogger("backtest_service")
 
 
 def compact_worker_event_batch(
@@ -92,13 +98,18 @@ class TaskManager:
         self._workers: dict[str, WorkerHandle] = {}
         self._warm_worker: WarmWorkerHandle | None = None
         self._loop_task: asyncio.Task | None = None
+        self._data_loop_task: asyncio.Task | None = None
         self._stopping = False
         self._last_expiry_scan = 0.0
         self._last_data_requirement_scan = 0.0
+        self._data_requirement_cursor = 0
         self._data_snapshot_client: Any | None = None
         self._data_ready_resolver: Callable[
             [dict[str, Any], DataRequirementManifestV1],
             Awaitable[tuple[dict[str, Any], dict[str, Any]]],
+        ] | None = None
+        self._data_requirement_builder: Callable[
+            [dict[str, Any], str], dict[str, Any]
         ] | None = None
 
     def configure_data_waiting(
@@ -108,9 +119,13 @@ class TaskManager:
             [dict[str, Any], DataRequirementManifestV1],
             Awaitable[tuple[dict[str, Any], dict[str, Any]]],
         ],
+        requirement_builder: Callable[
+            [dict[str, Any], str], dict[str, Any]
+        ],
     ) -> None:
         self._data_snapshot_client = snapshot_client
         self._data_ready_resolver = resolver
+        self._data_requirement_builder = requirement_builder
 
     async def start(self) -> None:
         if self._loop_task is not None:
@@ -121,6 +136,9 @@ class TaskManager:
         self._stopping = False
         self._warm_worker = self._spawn_warm_worker()
         self._loop_task = asyncio.create_task(self._loop(), name="pxybacktest-manager")
+        self._data_loop_task = asyncio.create_task(
+            self._data_requirement_loop(), name="pxybacktest-data-requirements"
+        )
 
     async def stop(self) -> None:
         self._stopping = True
@@ -147,6 +165,13 @@ class TaskManager:
             except asyncio.CancelledError:
                 pass
             self._loop_task = None
+        if self._data_loop_task is not None:
+            self._data_loop_task.cancel()
+            try:
+                await self._data_loop_task
+            except asyncio.CancelledError:
+                pass
+            self._data_loop_task = None
 
     async def submit(
         self,
@@ -274,9 +299,15 @@ class TaskManager:
             return False
         handle = self._workers.get(task_id)
         if handle is None:
-            await asyncio.to_thread(self.store.set_status, task_id, "cancelled")
-            await asyncio.to_thread(self.store.append_event, task_id, "cancelled", {})
-            return True
+            cancelled = await asyncio.to_thread(
+                self.store.cancel_unstarted_task, task_id
+            )
+            if cancelled:
+                return True
+            # 调度器可能在上面的数据库事务前刚把 pending 任务交给 worker。
+            handle = self._workers.get(task_id)
+            if handle is None:
+                return False
         handle.command_queue.put_nowait({"action": "cancel"})
         return True
 
@@ -306,11 +337,20 @@ class TaskManager:
         while not self._stopping:
             if time.monotonic() - self._last_expiry_scan >= 60:
                 await asyncio.to_thread(self.expire_results)
-            await self._poll_data_requirements()
             await self._drain_worker_events()
             await asyncio.to_thread(self._reap_workers)
             await asyncio.to_thread(self._schedule_workers)
             await asyncio.sleep(0.05)
+
+    async def _data_requirement_loop(self) -> None:
+        while not self._stopping:
+            try:
+                await self._poll_data_requirements()
+            except Exception:
+                # 单次协调器缺陷不能永久终止后台恢复循环。
+                logger.exception("数据需求协调循环发生未处理异常")
+                await asyncio.sleep(1.0)
+            await asyncio.sleep(1.0)
 
     async def register_data_requirement(
         self, task_id: str, payload: dict[str, Any]
@@ -324,14 +364,16 @@ class TaskManager:
             "request_fingerprint": str(payload["request_fingerprint"]),
             "datasets": list(payload["datasets"]),
             "quality_policy": str(payload["quality_policy"]),
+            "snapshot_kind": str(payload.get("snapshot_kind") or "snapshot"),
+            "factor_set_id": payload.get("factor_set_id"),
             "status": "pending",
             "failure_reason": "",
             "snapshot": None,
             "registration_confirmed": False,
             "request": {key: value for key, value in payload.items() if key != "requirement_id"},
         }
-        await asyncio.to_thread(
-            self.store.append_event,
+        persisted = await asyncio.to_thread(
+            self.store.append_waiting_event,
             task_id,
             "state",
             {
@@ -340,63 +382,138 @@ class TaskManager:
                 "data_requirement": stub,
             },
         )
+        if not persisted:
+            return stub
         return await self._refresh_data_requirement(task_id, stub)
 
     async def _poll_data_requirements(self) -> None:
-        if self._data_snapshot_client is None or self._data_ready_resolver is None:
+        if (
+            self._data_snapshot_client is None
+            or self._data_ready_resolver is None
+            or self._data_requirement_builder is None
+        ):
             return
         now = time.monotonic()
         if now - self._last_data_requirement_scan < 1.0:
             return
         self._last_data_requirement_scan = now
         waiting = await asyncio.to_thread(self.store.waiting_tasks)
-        for task in waiting:
-            current = dict(task["state"].get("data_requirement") or {})
-            if not current:
-                continue
-            manifest = await self._refresh_data_requirement(task["task_id"], current)
-            status = str(manifest.get("status") or "pending")
-            if status == "failed":
+        if not waiting:
+            self._data_requirement_cursor = 0
+            return
+        start = self._data_requirement_cursor % len(waiting)
+        ordered = waiting[start:] + waiting[:start]
+        selected = ordered[:MAX_DATA_REQUIREMENTS_PER_CYCLE]
+        self._data_requirement_cursor = (
+            start + len(selected)
+        ) % len(waiting)
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_DATA_REQUIREMENTS)
+
+        async def poll_one(task: dict[str, Any]) -> None:
+            async with semaphore:
+                try:
+                    await asyncio.wait_for(
+                        self._poll_data_requirement(task),
+                        timeout=DATA_REQUIREMENT_POLL_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    latest = await asyncio.to_thread(
+                        self.store.get_task, task["user_id"], task["task_id"]
+                    )
+                    current = dict(latest.get("data_requirement") or {})
+                    await self._record_data_requirement_error(
+                        task["task_id"], current, "PXYDATA 数据需求轮询超时"
+                    )
+                except Exception as exc:
+                    latest = await asyncio.to_thread(
+                        self.store.get_task, task["user_id"], task["task_id"]
+                    )
+                    current = dict(latest.get("data_requirement") or {})
+                    await self._record_data_requirement_error(
+                        task["task_id"],
+                        current,
+                        f"数据需求协调异常: {type(exc).__name__}: {exc}",
+                    )
+
+        await asyncio.gather(*(poll_one(task) for task in selected))
+
+    async def _poll_data_requirement(self, task: dict[str, Any]) -> None:
+        assert self._data_requirement_builder is not None
+        assert self._data_ready_resolver is not None
+        current = dict(task["state"].get("data_requirement") or {})
+        if float(current.get("next_poll_at") or 0) > time.time():
+            return
+        if not current:
+            try:
+                rebuilt = self._data_requirement_builder(task["request"], task["task_id"])
+            except ValueError as exc:
                 await asyncio.to_thread(
-                    self.store.append_event,
+                    self.store.append_waiting_event,
                     task["task_id"],
                     "failed",
-                    {
-                        "error": "数据补齐失败: "
-                        + str(manifest.get("failure_reason") or "未知原因")
-                    },
+                    {"error": f"数据需求恢复失败: {exc}"},
                 )
-                continue
-            if status != "ready":
-                continue
-            try:
-                parsed = DataRequirementManifestV1.model_validate(
-                    {key: value for key, value in manifest.items() if key not in {"request", "registration_confirmed", "last_error"}}
-                )
-                worker_request, data_snapshot = await self._data_ready_resolver(
-                    task["request"], parsed
-                )
-            except (ValueError, SnapshotProviderError) as exc:
-                provider_status = getattr(exc, "status_code", 422)
-                if provider_status in {409, 422}:
-                    await asyncio.to_thread(
-                        self.store.append_event,
-                        task["task_id"],
-                        "failed",
-                        {"error": f"数据快照验收失败: {exc}"},
-                    )
-                else:
-                    await self._record_data_requirement_error(
-                        task["task_id"], manifest, str(exc)
-                    )
-                continue
+                return
+            await self.register_data_requirement(task["task_id"], rebuilt)
+            return
+        manifest = await self._refresh_data_requirement(task["task_id"], current)
+        status = str(manifest.get("status") or "pending")
+        if status == "failed":
             await asyncio.to_thread(
-                self.store.activate_waiting_task,
+                self.store.append_waiting_event,
                 task["task_id"],
-                request=worker_request,
-                data_snapshot=data_snapshot,
-                data_requirement=manifest,
+                "failed",
+                {
+                    "error": "数据补齐失败: "
+                    + str(manifest.get("failure_reason") or "未知原因")
+                },
             )
+            return
+        if status != "ready":
+            return
+        if not await asyncio.to_thread(
+            self.store.is_waiting_task, task["task_id"]
+        ):
+            return
+        try:
+            parsed = DataRequirementManifestV1.model_validate(
+                {
+                    key: value
+                    for key, value in manifest.items()
+                    if key
+                    not in {
+                        "request",
+                        "registration_confirmed",
+                        "last_error",
+                        "retry_count",
+                        "next_poll_at",
+                    }
+                }
+            )
+            worker_request, data_snapshot = await self._data_ready_resolver(
+                task["request"], parsed
+            )
+        except (ValueError, SnapshotProviderError) as exc:
+            provider_status = getattr(exc, "status_code", 422)
+            if provider_status in {409, 422}:
+                await asyncio.to_thread(
+                    self.store.append_waiting_event,
+                    task["task_id"],
+                    "failed",
+                    {"error": f"数据快照验收失败: {exc}"},
+                )
+            else:
+                await self._record_data_requirement_error(
+                    task["task_id"], manifest, str(exc)
+                )
+            return
+        await asyncio.to_thread(
+            self.store.activate_waiting_task,
+            task["task_id"],
+            request=worker_request,
+            data_snapshot=data_snapshot,
+            data_requirement=manifest,
+        )
 
     async def _refresh_data_requirement(
         self, task_id: str, current: dict[str, Any]
@@ -407,23 +524,55 @@ class TaskManager:
         request = dict(current.get("request") or {})
         try:
             if current.get("registration_confirmed"):
-                manifest = await client.get_data_requirement(current["requirement_id"])
+                manifest = await client.get_data_requirement(
+                    current["requirement_id"], expected=request
+                )
             else:
                 manifest = await client.create_data_requirement(request)
         except SnapshotProviderError as exc:
+            if exc.status_code == 404 and current.get("registration_confirmed"):
+                retryable = {
+                    **current,
+                    "registration_confirmed": False,
+                    "last_error": "PXYDATA 未找到已登记需求，准备重新登记",
+                    "retry_count": 0,
+                    "next_poll_at": 0,
+                }
+                await asyncio.to_thread(
+                    self.store.append_waiting_event,
+                    task_id,
+                    "state",
+                    {
+                        "status": "waiting_for_data",
+                        "phase": "registering_data_requirement",
+                        "data_requirement": retryable,
+                    },
+                )
+                return retryable
+            if exc.status_code in {400, 401, 403, 409, 422}:
+                await asyncio.to_thread(
+                    self.store.append_waiting_event,
+                    task_id,
+                    "failed",
+                    {"error": f"数据需求登记失败: {exc}"},
+                )
+                return {**current, "status": "failed", "failure_reason": str(exc)}
             await self._record_data_requirement_error(task_id, current, str(exc))
             return current
         payload = {
             **manifest.model_dump(mode="json"),
             "registration_confirmed": True,
             "request": request,
+            "retry_count": 0,
+            "next_poll_at": 0,
         }
         if (
             current.get("status") != payload["status"]
             or not current.get("registration_confirmed")
+            or bool(current.get("last_error"))
         ):
             await asyncio.to_thread(
-                self.store.append_event,
+                self.store.append_waiting_event,
                 task_id,
                 "state",
                 {
@@ -437,11 +586,19 @@ class TaskManager:
     async def _record_data_requirement_error(
         self, task_id: str, current: dict[str, Any], error: str
     ) -> None:
-        if current.get("last_error") == error:
-            return
-        payload = {**current, "last_error": error[:500]}
+        retry_count = int(current.get("retry_count") or 0) + 1
+        retry_delay = min(
+            DATA_REQUIREMENT_RETRY_MAX_SECONDS,
+            float(2 ** min(retry_count, 6)),
+        )
+        payload = {
+            **current,
+            "last_error": error[:500],
+            "retry_count": retry_count,
+            "next_poll_at": time.time() + retry_delay,
+        }
         await asyncio.to_thread(
-            self.store.append_event,
+            self.store.append_waiting_event,
             task_id,
             "state",
             {

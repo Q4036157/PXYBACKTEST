@@ -342,6 +342,89 @@ def test_store_persists_unified_execution_snapshot_for_resync(tmp_path: Path) ->
     assert task["execution_snapshot"]["bars"]["BTC"]["close"] == 100
 
 
+def test_recover_interrupted_replay_persists_checkpoint_in_worker_request(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(tmp_path / "backtest.sqlite3")
+    task_id = store.create_task(
+        user_id="user-a", source_node="204", request=request_payload()
+    )
+    store.mark_running(task_id)
+    checkpoint = {
+        "contract_version": "pxybacktest.replay-checkpoint.v1",
+        "checkpoint_sha256": "a" * 64,
+    }
+    store.append_event(
+        task_id,
+        "execution_snapshot",
+        {"snapshot": {"replay_checkpoint": checkpoint}},
+    )
+    store.append_event(task_id, "state", {"phase": "replaying_events"})
+
+    assert store.recover_interrupted_tasks() == 1
+
+    task = store.get_task("user-a", task_id)
+    request = store.get_request(task_id)
+    assert task["status"] == "pending"
+    assert task["phase"] == "restoring_replay_checkpoint"
+    assert request["_replay_checkpoint"] == checkpoint
+
+
+def test_recover_interrupted_learning_persists_checkpoint_in_worker_request(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(tmp_path / "backtest.sqlite3")
+    task_id = store.create_task(
+        user_id="user-a", source_node="204", request=request_payload()
+    )
+    store.mark_running(task_id)
+    checkpoint = {
+        "contract_version": "pxybacktest.learning-checkpoint.v1",
+        "checkpoint_sha256": "b" * 64,
+        "fold_index": 1,
+    }
+    metric = {"fold": 1, "epoch": 3, "loss": 0.25}
+    store.append_event(
+        task_id,
+        "learning_checkpoint",
+        {
+            "checkpoint": checkpoint,
+            "checkpoint_summary": {"checkpoint_sha256": "b" * 64},
+        },
+    )
+    store.append_event(
+        task_id,
+        "training_metric",
+        {"metric": metric, "metrics_emitted": 3},
+    )
+
+    assert store.recover_interrupted_tasks() == 1
+
+    task = store.get_task("user-a", task_id)
+    request = store.get_request(task_id)
+    assert task["status"] == "pending"
+    assert task["phase"] == "restoring_learning_checkpoint"
+    assert task["learning_checkpoint"] == checkpoint
+    assert task["latest_training_metric"] == metric
+    assert task["training_metrics_emitted"] == 3
+    assert request["_learning_checkpoint"] == checkpoint
+
+
+def test_cancel_unstarted_task_is_atomic_and_cannot_cancel_terminal_task(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(tmp_path / "backtest.sqlite3")
+    task_id = store.create_task(
+        user_id="user-a", source_node="204", request=request_payload()
+    )
+
+    assert store.cancel_unstarted_task(task_id) is True
+    assert store.cancel_unstarted_task(task_id) is False
+    task = store.get_task("user-a", task_id)
+    assert task["status"] == "cancelled"
+    assert task["event_seq"] == 1
+
+
 def test_store_keeps_complete_append_only_event_history(tmp_path: Path) -> None:
     store = TaskStore(tmp_path / "backtest.sqlite3")
     task_id = store.create_task(

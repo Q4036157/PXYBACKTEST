@@ -1171,6 +1171,7 @@ class ResultReplayController:
         mode: str = "visual",
         speed: float = 1.0,
         render_interval_ms: int = DEFAULT_RENDER_INTERVAL_MS,
+        checkpoint: ReplayCheckpoint | Mapping[str, Any] | None = None,
     ) -> None:
         normalized_mode = str(mode or "visual").strip().lower()
         if normalized_mode not in {"visual", "fast"}:
@@ -1184,12 +1185,23 @@ class ResultReplayController:
         start_time = (
             self.feed.events[0].ready_time if len(self.feed) else "1970-01-01T00:00:00Z"
         )
-        self.session = ReplaySession(
-            run_id=run_id,
-            feed=self.feed,
-            start_time=start_time,
-            speed=speed,
+        self.session = (
+            ReplaySession.from_checkpoint(
+                run_id=run_id,
+                feed=self.feed,
+                checkpoint=checkpoint,
+            )
+            if checkpoint is not None
+            else ReplaySession(
+                run_id=run_id,
+                feed=self.feed,
+                start_time=start_time,
+                speed=speed,
+            )
         )
+        if checkpoint is not None and self.session.clock.paused:
+            # 服务恢复会把中断任务重新放回 pending；沿用速度，但不保留旧进程暂停锁。
+            self.session.clock.resume()
         self.gate = VisualProjectionGate(interval_ms=render_interval_ms)
         self._pending_updates: dict[str, list[dict[str, Any]]] = {
             "bar_updates": [],
@@ -1321,6 +1333,8 @@ class ResultReplayController:
             else "running"
         )
         snapshot["mode"] = self.mode
+        if not self.session.clock.cancelled:
+            snapshot["replay_checkpoint"] = self.session.checkpoint().to_dict()
         return copy.deepcopy(snapshot)
 
     def _project(

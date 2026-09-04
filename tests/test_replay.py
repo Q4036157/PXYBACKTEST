@@ -582,6 +582,35 @@ def test_event_type_navigation_is_read_only_and_supports_aliases() -> None:
     assert session.checkpoint().to_dict() == before
 
 
+def test_result_replay_controller_resumes_from_persisted_checkpoint() -> None:
+    feed = _checkpoint_feed()
+    controller = ResultReplayController(
+        run_id="run-controller-resume",
+        snapshot_id=SNAPSHOT,
+        events=feed.events,
+        mode="fast",
+        speed=8,
+    )
+    controller.session.run(max_events=2)
+    checkpoint = controller.session.checkpoint().to_dict()
+
+    resumed = ResultReplayController(
+        run_id="run-controller-resume",
+        snapshot_id=SNAPSHOT,
+        events=feed.events,
+        mode="fast",
+        speed=1,
+        checkpoint=checkpoint,
+    )
+    outcome = resumed.run(sleep=lambda _: None)
+
+    assert outcome["complete"] is True
+    assert outcome["processed_events"] == len(feed)
+    assert outcome["execution_snapshot"]["replay_checkpoint"][
+        "processed_events"
+    ] == len(feed)
+
+
 def test_event_requires_timezone_and_snapshot() -> None:
     with pytest.raises(ReplayError, match="带时区"):
         ReplayEvent(

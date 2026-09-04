@@ -390,15 +390,50 @@ class TaskStore:
     def recover_interrupted_tasks(self) -> int:
         now = time.time()
         with self._lock, self._connection() as connection:
-            changed = connection.execute(
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
                 """
-                UPDATE tasks
-                SET status = 'pending', error = '', updated_at = ?
+                SELECT task_id, request_json, state_json FROM tasks
                 WHERE status IN ('running', 'paused')
-                """,
-                (now,),
-            )
-        return int(changed.rowcount)
+                """
+            ).fetchall()
+            for row in rows:
+                request = json.loads(row["request_json"])
+                state = json.loads(row["state_json"])
+                execution_snapshot = state.get("execution_snapshot")
+                checkpoint = (
+                    execution_snapshot.get("replay_checkpoint")
+                    if isinstance(execution_snapshot, dict)
+                    else None
+                )
+                if (
+                    state.get("phase") == "replaying_events"
+                    and isinstance(checkpoint, dict)
+                ):
+                    request["_replay_checkpoint"] = checkpoint
+                    state["phase"] = "restoring_replay_checkpoint"
+                learning_checkpoint = state.get("learning_checkpoint")
+                if (
+                    state.get("phase") == "training_model"
+                    and isinstance(learning_checkpoint, dict)
+                ):
+                    request["_learning_checkpoint"] = learning_checkpoint
+                    state["phase"] = "restoring_learning_checkpoint"
+                state["status"] = "pending"
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'pending', request_json = ?, state_json = ?, error = '', updated_at = ?
+                    WHERE task_id = ? AND status IN ('running', 'paused')
+                    """,
+                    (
+                        json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                        now,
+                        str(row["task_id"]),
+                    ),
+                )
+        return len(rows)
 
     def pending_tasks(self) -> list[dict[str, Any]]:
         with self._lock, self._connection() as connection:
@@ -428,6 +463,14 @@ class TaskStore:
             }
             for row in rows
         ]
+
+    def is_waiting_task(self, task_id: str) -> bool:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM tasks WHERE task_id = ? AND status = 'waiting_for_data'",
+                (task_id,),
+            ).fetchone()
+        return row is not None
 
     def activate_waiting_task(
         self,
@@ -561,6 +604,118 @@ class TaskStore:
         self, task_id: str, event_type: str, payload: dict[str, Any]
     ) -> int:
         return self.append_events(task_id, [(event_type, payload)])[0]
+
+    def append_waiting_event(
+        self, task_id: str, event_type: str, payload: dict[str, Any]
+    ) -> bool:
+        """仅当任务仍在等待数据时写事件，避免迟到响应复活终态。"""
+
+        if event_type not in {"state", "failed"}:
+            raise ValueError("等待任务只允许写 state 或 failed 事件")
+        now = time.time()
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT user_id, state_json FROM tasks
+                WHERE task_id = ? AND status = 'waiting_for_data'
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            state = self._apply_event(
+                json.loads(row["state_json"]), event_type, payload
+            )
+
+            latest = connection.execute(
+                "SELECT COALESCE(MAX(task_seq), 0) AS latest FROM task_events WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            task_seq = int(latest["latest"] or 0) + 1
+            state["event_seq"] = task_seq
+            if event_type == "failed" and not state.get("expires_at"):
+                state["completed_at"] = now
+                state["expires_at"] = now + RESULT_RETENTION_SECONDS
+            connection.execute(
+                """
+                INSERT INTO task_events(
+                    task_seq, task_id, user_id, event_type, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_seq,
+                    task_id,
+                    str(row["user_id"]),
+                    event_type,
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    now,
+                ),
+            )
+            status = str(state.get("status") or "waiting_for_data")
+            error = str(payload.get("error") or "") if event_type == "failed" else ""
+            connection.execute(
+                """
+                UPDATE tasks SET status = ?, state_json = ?, error = ?, updated_at = ?
+                WHERE task_id = ? AND status = 'waiting_for_data'
+                """,
+                (
+                    status,
+                    json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                    error,
+                    now,
+                    task_id,
+                ),
+            )
+        return True
+
+    def cancel_unstarted_task(self, task_id: str) -> bool:
+        """原子取消未进入 worker 的任务，避免数据轮询迟到响应覆盖终态。"""
+
+        now = time.time()
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT user_id, state_json FROM tasks
+                WHERE task_id = ? AND status IN ('pending', 'waiting_for_data')
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            state = self._apply_event(
+                json.loads(row["state_json"]), "cancelled", {}
+            )
+            state["completed_at"] = now
+            state["expires_at"] = now + RESULT_RETENTION_SECONDS
+            latest = connection.execute(
+                "SELECT COALESCE(MAX(task_seq), 0) AS latest FROM task_events WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            task_seq = int(latest["latest"] or 0) + 1
+            state["event_seq"] = task_seq
+            connection.execute(
+                """
+                INSERT INTO task_events(
+                    task_seq, task_id, user_id, event_type, payload_json, created_at
+                ) VALUES (?, ?, ?, 'cancelled', '{}', ?)
+                """,
+                (task_seq, task_id, str(row["user_id"]), now),
+            )
+            changed = connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'cancelled', state_json = ?, error = '', updated_at = ?
+                WHERE task_id = ? AND status IN ('pending', 'waiting_for_data')
+                """,
+                (
+                    json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                    now,
+                    task_id,
+                ),
+            )
+        return changed.rowcount == 1
 
     def append_events(
         self,
@@ -697,6 +852,23 @@ class TaskStore:
             if isinstance(trade, dict):
                 state["live_trades"] = TaskStore._merge_trades(
                     list(state.get("live_trades") or []), [trade]
+                )
+        elif event_type == "learning_checkpoint":
+            checkpoint = payload.get("checkpoint")
+            if isinstance(checkpoint, dict):
+                state["learning_checkpoint"] = checkpoint
+                state["learning_checkpoint_summary"] = payload.get(
+                    "checkpoint_summary"
+                )
+                state["phase"] = "training_model"
+        elif event_type == "training_metric":
+            metric = payload.get("metric")
+            if isinstance(metric, dict):
+                state["latest_training_metric"] = metric
+                state["training_metrics_emitted"] = int(
+                    payload.get("metrics_emitted")
+                    or state.get("training_metrics_emitted")
+                    or 0
                 )
         elif event_type.endswith("_snapshot"):
             key = event_type.removesuffix("_snapshot")

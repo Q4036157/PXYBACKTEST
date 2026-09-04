@@ -14,14 +14,25 @@ from app.daa_client import (
     DaaCapabilitiesError,
     _validate_capabilities,
 )
-from app.main import _bind_factor_set_to_manifest, create_app
+from app.main import (
+    _bind_factor_set_to_manifest,
+    _data_requirement_payload,
+    _snapshot_date_range,
+    _validate_waiting_snapshot_manifest,
+    create_app,
+)
 from app.models import (
     DataSnapshotRefV2,
     DataSnapshotSelectionV2,
     OptimizationConfigV2,
     SubmitBacktestRequestV2,
 )
-from app.pxydata_client import PxyDataSnapshotClient, SnapshotProviderError
+from app.pxydata_client import (
+    DataRequirementManifestV1,
+    PxyDataSnapshotClient,
+    SnapshotProviderError,
+    _validate_data_requirement,
+)
 from app.result_contract import build_a_share_result_v2, build_result_v2
 from app.store import TaskStore
 
@@ -35,6 +46,25 @@ class StoreOnlyManager:
 
     async def stop(self) -> None:
         return None
+
+    async def register_data_requirement(self, task_id: str, payload: dict) -> dict:
+        manifest = {
+            **payload,
+            "status": "pending",
+            "failure_reason": "",
+            "snapshot": None,
+            "registration_confirmed": False,
+        }
+        self.store.append_event(
+            task_id,
+            "state",
+            {
+                "status": "waiting_for_data",
+                "phase": "registering_data_requirement",
+                "data_requirement": manifest,
+            },
+        )
+        return manifest
 
     async def submit(
         self,
@@ -942,6 +972,84 @@ def test_v2_preserves_snapshot_provider_unavailable_status(tmp_path: Path) -> No
 
     assert response.status_code == 503
     assert manager.store.list_tasks("user-a") == []
+
+
+def test_v2_missing_selection_creates_waiting_task_and_requirement(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    manager = StoreOnlyManager(TaskStore(settings.database_path))
+    snapshots = FakeSnapshotClient(
+        _snapshot(),
+        create_error=SnapshotProviderError("没有匹配文件", status_code=422),
+    )
+    app = create_app(settings, manager, snapshots)  # type: ignore[arg-type]
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v2/tasks",
+            json=_payload(),
+            headers={**_headers(), "Idempotency-Key": "missing-data-1"},
+        )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["status"] == "waiting_for_data"
+    assert payload["data_snapshot"] is None
+    assert payload["data_requirement"]["contract_version"] == (
+        "pxydata.data-requirement.v1"
+    )
+    task = manager.store.get_task("user-a", payload["task_id"])
+    assert task["status"] == "waiting_for_data"
+    assert task["data_requirement"]["consumer_task_id"] == payload["task_id"]
+
+
+def test_ready_factor_bundle_restores_execution_and_input_snapshot_binding() -> None:
+    body = SubmitBacktestRequestV2.model_validate(_factor_payload())
+    requirement_payload = _data_requirement_payload(body, "factor-waiting-task")
+    snapshot_payload = _factor_snapshot().model_dump(mode="json")
+    snapshot_payload["quality_policy"] = body.data.selection.quality_policy
+    snapshot_payload["quality_accepted"] = True
+    snapshot = DataSnapshotRefV2.model_validate(snapshot_payload)
+    start_date, end_date = _snapshot_date_range(body)
+    requirement = DataRequirementManifestV1.model_validate(
+        {
+            **requirement_payload,
+            "status": "ready",
+            "failure_reason": "",
+            "snapshot": snapshot.model_dump(mode="json"),
+            "created_at": "2026-09-04T08:00:00+00:00",
+            "updated_at": "2026-09-04T08:01:00+00:00",
+        }
+    )
+    manifest = {
+        "selection": {
+            "datasets": ["factor_matrix_daily", "kline_daily"],
+            "start_date": start_date,
+            "end_date": end_date,
+            "symbols": body.universe.symbols,
+            "decision_time": body.data.selection.decision_time,
+            "quality_policy": body.data.selection.quality_policy,
+        },
+        "datasets": [
+            {"name": "factor_matrix_daily"},
+            {"name": "kline_daily"},
+        ],
+        "derivation": {
+            "factor_set_id": body.parameters["factor_set_id"],
+            "input_snapshot_id": "btsnap_v1_" + "c" * 32,
+        },
+    }
+
+    validated = _validate_data_requirement(
+        requirement.model_dump(mode="json"), expected=requirement_payload
+    )
+    _validate_waiting_snapshot_manifest(body, validated, snapshot, manifest)
+
+    drifted = {
+        **manifest,
+        "selection": {**manifest["selection"], "end_date": "2026-08-21"},
+    }
+    with pytest.raises(SnapshotProviderError, match="结束日期"):
+        _validate_waiting_snapshot_manifest(body, validated, snapshot, drifted)
 
 
 def test_result_v2_maps_legacy_vnpy_result_without_inventing_orders() -> None:

@@ -8,14 +8,17 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import json
 import math
 import re
 import statistics
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping
 
 
 LEARNING_DATASET_NAMES = {
@@ -26,10 +29,195 @@ LEARNING_DATASET_NAMES = {
 ML_ENGINE_TYPES = {"ml_factor", "deep_learning"}
 ML_STRATEGY_ID = "temporal_ml_rank_v1"
 ML_STRATEGY_HASH = hashlib.sha256(b"pxybacktest.temporal-ml-rank.v1").hexdigest()
+LEARNING_CHECKPOINT_CONTRACT_VERSION = "pxybacktest.learning-checkpoint.v1"
+LEARNING_CHECKPOINT_ARTIFACT = "learning.training-checkpoint.v1"
+LEARNING_METRICS_ARTIFACT = "learning.training-metrics.v1"
 
 
 class LearningBacktestError(ValueError):
     """学习数据、切分或模型配置不满足回测契约。"""
+
+
+def _json_clone(value: Any) -> Any:
+    try:
+        return json.loads(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise LearningBacktestError("训练检查点包含不可 JSON 序列化的内容") from exc
+
+
+def _content_sha256(value: Any) -> str:
+    try:
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise LearningBacktestError("训练检查点包含不可 JSON 序列化的内容") from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+@dataclass(frozen=True)
+class LearningCheckpoint:
+    """绑定任务输入的 JSON 检查点，不包含外部模型的不可序列化状态。"""
+
+    contract_version: str
+    artifact_logical_name: str
+    task_id: str
+    snapshot_id: str
+    data_snapshot_sha256: str
+    strategy_id: str
+    strategy_source_hash: str
+    model_type: str
+    random_seed: int
+    training_fingerprint: str
+    fold_index: int
+    completed_epochs: int
+    total_folds: int
+    model_state: dict[str, Any] | None
+    completed_daily: list[dict[str, Any]]
+    completed_fold_meta: list[dict[str, Any]]
+    metric_count: int
+    checkpoint_sha256: str
+
+    @classmethod
+    def _field_names(cls) -> set[str]:
+        return set(cls.__dataclass_fields__)
+
+    def _unsigned_payload(self) -> dict[str, Any]:
+        return {
+            "contract_version": self.contract_version,
+            "artifact_logical_name": self.artifact_logical_name,
+            "task_id": self.task_id,
+            "snapshot_id": self.snapshot_id,
+            "data_snapshot_sha256": self.data_snapshot_sha256,
+            "strategy_id": self.strategy_id,
+            "strategy_source_hash": self.strategy_source_hash,
+            "model_type": self.model_type,
+            "random_seed": self.random_seed,
+            "training_fingerprint": self.training_fingerprint,
+            "fold_index": self.fold_index,
+            "completed_epochs": self.completed_epochs,
+            "total_folds": self.total_folds,
+            "model_state": copy.deepcopy(self.model_state),
+            "completed_daily": copy.deepcopy(self.completed_daily),
+            "completed_fold_meta": copy.deepcopy(self.completed_fold_meta),
+            "metric_count": self.metric_count,
+        }
+
+    @staticmethod
+    def _require_sha256(name: str, value: Any) -> None:
+        if not isinstance(value, str) or len(value) != 64 or any(
+            char not in "0123456789abcdef" for char in value
+        ):
+            raise LearningBacktestError(f"训练检查点 {name} 不是有效 SHA-256")
+
+    def validate(self) -> None:
+        if self.contract_version != LEARNING_CHECKPOINT_CONTRACT_VERSION:
+            raise LearningBacktestError("不支持的训练检查点契约版本")
+        if self.artifact_logical_name != LEARNING_CHECKPOINT_ARTIFACT:
+            raise LearningBacktestError("训练检查点 artifact 逻辑名不受支持")
+        string_fields = (
+            self.task_id,
+            self.snapshot_id,
+            self.strategy_id,
+            self.model_type,
+        )
+        if any(not isinstance(value, str) or not value for value in string_fields):
+            raise LearningBacktestError("训练检查点缺少任务、快照、策略或模型绑定")
+        for name, value in (
+            ("data_snapshot_sha256", self.data_snapshot_sha256),
+            ("strategy_source_hash", self.strategy_source_hash),
+            ("training_fingerprint", self.training_fingerprint),
+            ("checkpoint_sha256", self.checkpoint_sha256),
+        ):
+            self._require_sha256(name, value)
+        integer_fields = (
+            self.random_seed,
+            self.fold_index,
+            self.completed_epochs,
+            self.total_folds,
+            self.metric_count,
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in integer_fields):
+            raise LearningBacktestError("训练检查点整数状态类型无效")
+        if (
+            self.fold_index < 0
+            or self.completed_epochs < 0
+            or self.total_folds < 1
+            or self.metric_count < 0
+            or self.fold_index > self.total_folds
+        ):
+            raise LearningBacktestError("训练检查点 fold/epoch 范围无效")
+        if self.fold_index == self.total_folds and (
+            self.completed_epochs != 0 or self.model_state is not None
+        ):
+            raise LearningBacktestError("已完成训练检查点不能包含未完成 fold 状态")
+        if self.completed_epochs > 0 and not isinstance(self.model_state, dict):
+            raise LearningBacktestError("epoch 检查点缺少可序列化模型状态")
+        if self.completed_epochs == 0 and self.model_state is not None:
+            raise LearningBacktestError("fold 边界检查点不能包含模型状态")
+        if self.completed_epochs > 0 and self.model_type not in {
+            "linear_regression",
+            "linear_logit",
+        }:
+            raise LearningBacktestError("外部模型不能写入 epoch 模型状态")
+        if not isinstance(self.completed_daily, list) or not isinstance(
+            self.completed_fold_meta, list
+        ):
+            raise LearningBacktestError("训练检查点累计结果类型无效")
+        _json_clone(self._unsigned_payload())
+        if _content_sha256(self._unsigned_payload()) != self.checkpoint_sha256:
+            raise LearningBacktestError("训练检查点内容哈希校验失败，内容可能已被篡改")
+
+    @classmethod
+    def create(cls, **values: Any) -> "LearningCheckpoint":
+        payload = {
+            "contract_version": LEARNING_CHECKPOINT_CONTRACT_VERSION,
+            "artifact_logical_name": LEARNING_CHECKPOINT_ARTIFACT,
+            **_json_clone(values),
+        }
+        checkpoint = cls(
+            **payload,
+            checkpoint_sha256=_content_sha256(payload),
+        )
+        checkpoint.validate()
+        return checkpoint
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            **self._unsigned_payload(),
+            "checkpoint_sha256": self.checkpoint_sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "LearningCheckpoint":
+        if set(payload) != cls._field_names():
+            raise LearningBacktestError("训练检查点字段不完整或包含未知字段")
+        checkpoint = cls(**_json_clone(dict(payload)))
+        checkpoint.validate()
+        return checkpoint
+
+    def summary(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "contract_version": self.contract_version,
+            "artifact_logical_name": self.artifact_logical_name,
+            "fold_index": self.fold_index,
+            "completed_epochs": self.completed_epochs,
+            "checkpoint_sha256": self.checkpoint_sha256,
+        }
 
 
 @lru_cache(maxsize=1)
@@ -182,8 +370,12 @@ def run_learning_backtest(
     task: dict[str, Any],
     manifest: dict[str, Any],
     data_root: str | Path,
+    checkpoint: LearningCheckpoint | Mapping[str, Any] | None = None,
+    on_training_metric: Callable[[dict[str, Any]], None] | None = None,
+    on_checkpoint: Callable[[dict[str, Any]], None] | None = None,
+    epoch_budget: int | None = None,
 ) -> dict[str, Any]:
-    """执行严格时间序列的横截面预测回测。"""
+    """执行严格时间序列回测，并提供可恢复的训练保存点。"""
     parameters = dict(task.get("parameters") or {})
     feature_columns = [str(item).strip() for item in parameters.get("feature_columns") or [] if str(item).strip()]
     if not feature_columns:
@@ -217,22 +409,241 @@ def run_learning_backtest(
         label_column=label_column,
     )
     folds = _generate_folds(rows, parameters)
+    snapshot = dict((task.get("data") or {}).get("snapshot") or {})
+    snapshot_id = str(snapshot.get("snapshot_id") or "").strip()
+    if not snapshot_id:
+        raise LearningBacktestError("学习训练检查点必须绑定 data.snapshot.snapshot_id")
+    strategy = dict(task.get("strategy") or {})
+    strategy_id = str(strategy.get("id") or "").strip()
+    strategy_source_hash = str(strategy.get("source_hash") or "").strip().lower()
+    if not strategy_id or not strategy_source_hash:
+        raise LearningBacktestError("学习训练检查点必须绑定策略 id 和 source_hash")
+    seed_value = (
+        task.get("random_seed")
+        if task.get("random_seed") is not None
+        else parameters.get("seed")
+    )
+    random_seed = int(42 if seed_value is None else seed_value)
+    fit_parameters = {**parameters, "seed": random_seed}
+    if fit_parameters.get("learning_rate") is None:
+        fit_parameters["learning_rate"] = (
+            0.03
+            if model_type in {"linear_regression", "linear_logit"}
+            else 0.1
+            if model_type == "lightgbm"
+            else 0.005
+        )
+    data_snapshot_sha256 = _content_sha256(
+        {"snapshot": snapshot, "manifest": manifest}
+    )
+    training_fingerprint = _content_sha256(
+        {
+            "task_id": task_id,
+            "snapshot_id": snapshot_id,
+            "data_snapshot_sha256": data_snapshot_sha256,
+            "strategy_id": strategy_id,
+            "strategy_source_hash": strategy_source_hash,
+            "model_type": model_type,
+            "random_seed": random_seed,
+            "feature_columns": feature_columns,
+            "label_column": label_column,
+            "parameters": fit_parameters,
+            "folds": [
+                [train_end.isoformat(), test_start.isoformat(), test_end.isoformat()]
+                for train_end, test_start, test_end in folds
+            ],
+            "rows": rows,
+        }
+    )
+    if epoch_budget is not None:
+        if (
+            isinstance(epoch_budget, bool)
+            or not isinstance(epoch_budget, int)
+            or epoch_budget < 1
+        ):
+            raise LearningBacktestError("epoch_budget 必须是正整数")
+        if model_type not in {"linear_regression", "linear_logit"}:
+            raise LearningBacktestError(
+                "外部 ML/DL 模型仅支持完整 fold 保存点，不能设置 epoch_budget"
+            )
+
+    restored = None
+    if checkpoint is not None:
+        restored = (
+            checkpoint
+            if isinstance(checkpoint, LearningCheckpoint)
+            else LearningCheckpoint.from_dict(checkpoint)
+        )
+        restored.validate()
+        expected_bindings = {
+            "task_id": task_id,
+            "snapshot_id": snapshot_id,
+            "data_snapshot_sha256": data_snapshot_sha256,
+            "strategy_id": strategy_id,
+            "strategy_source_hash": strategy_source_hash,
+            "model_type": model_type,
+            "random_seed": random_seed,
+            "training_fingerprint": training_fingerprint,
+            "total_folds": len(folds),
+        }
+        mismatches = [
+            name
+            for name, expected in expected_bindings.items()
+            if getattr(restored, name) != expected
+        ]
+        if mismatches:
+            raise LearningBacktestError(
+                "训练检查点与当前任务不匹配: " + ", ".join(mismatches)
+            )
+        if restored.completed_epochs and model_type not in {
+            "linear_regression",
+            "linear_logit",
+        }:
+            raise LearningBacktestError("不能恢复外部模型的不可序列化 epoch 状态")
+
     capital = float(dict(task.get("execution") or {}).get("capital") or 1_000_000)
     fee_rate = float(dict(task.get("execution") or {}).get("rate") or 0.0)
     threshold = float(parameters.get("prediction_threshold") or 0.0)
     top_k = int(parameters.get("top_k") or 0)
     if top_k < 0:
         raise LearningBacktestError("top_k 不能为负数")
-    all_daily: list[dict[str, Any]] = []
-    fold_meta: list[dict[str, Any]] = []
+    all_daily: list[dict[str, Any]] = (
+        copy.deepcopy(restored.completed_daily) if restored else []
+    )
+    fold_meta: list[dict[str, Any]] = (
+        copy.deepcopy(restored.completed_fold_meta) if restored else []
+    )
+    start_fold = restored.fold_index if restored else 0
+    metric_count = restored.metric_count if restored else 0
+    latest_metric: dict[str, Any] | None = None
+    latest_checkpoint: LearningCheckpoint | None = restored
+    consumed_epochs = 0
+
+    def make_checkpoint(
+        *,
+        fold_index: int,
+        completed_epochs: int = 0,
+        model_state: dict[str, Any] | None = None,
+    ) -> LearningCheckpoint:
+        return LearningCheckpoint.create(
+            task_id=task_id,
+            snapshot_id=snapshot_id,
+            data_snapshot_sha256=data_snapshot_sha256,
+            strategy_id=strategy_id,
+            strategy_source_hash=strategy_source_hash,
+            model_type=model_type,
+            random_seed=random_seed,
+            training_fingerprint=training_fingerprint,
+            fold_index=fold_index,
+            completed_epochs=completed_epochs,
+            total_folds=len(folds),
+            model_state=model_state,
+            completed_daily=all_daily,
+            completed_fold_meta=fold_meta,
+            metric_count=metric_count,
+        )
+
+    def emit_metric(
+        *,
+        fold_index: int,
+        epoch: int,
+        loss: float | None,
+        learning_rate: float,
+        device: str,
+        savepoint: LearningCheckpoint,
+        checkpoint_scope: str,
+    ) -> dict[str, Any]:
+        metric = {
+            "artifact_logical_name": LEARNING_METRICS_ARTIFACT,
+            "fold": fold_index + 1,
+            "fold_index": fold_index,
+            "fold_count": len(folds),
+            "epoch": epoch,
+            "loss": loss,
+            "learning_rate": learning_rate,
+            "device": device,
+            "checkpoint_scope": checkpoint_scope,
+            "checkpoint_summary": savepoint.summary(),
+        }
+        if on_checkpoint is not None:
+            on_checkpoint(savepoint.to_dict())
+        if on_training_metric is not None:
+            on_training_metric(copy.deepcopy(metric))
+        return metric
+
+    def paused_result(savepoint: LearningCheckpoint) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "contract_version": "pxybacktest.learning-progress.v1",
+            "task_id": task_id,
+            "complete": False,
+            "training": {
+                "status": "checkpointed",
+                "checkpoint_scope": "builtin_linear_epoch",
+                "metrics_emitted": metric_count,
+                "latest_metric": copy.deepcopy(latest_metric),
+                "checkpoint": savepoint.to_dict(),
+                "artifact_logical_names": [
+                    LEARNING_CHECKPOINT_ARTIFACT,
+                    LEARNING_METRICS_ARTIFACT,
+                ],
+            },
+        }
+
     for fold_index, (train_end, test_start, test_end) in enumerate(folds):
+        if fold_index < start_fold:
+            continue
         train_cutoff = train_end - timedelta(days=int(parameters.get("purge_days") or 0))
         test_cutoff = test_start + timedelta(days=int(parameters.get("embargo_days") or 0))
         train = [r for r in rows if _date(r["event_time"]) <= train_cutoff and _date(r["available_at"]) <= train_cutoff]
         test = [r for r in rows if test_cutoff <= _date(r["event_time"]) <= test_end]
         if len(train) < 2 or not test:
             continue
-        model = _fit_model(model_type, train, feature_columns, label_column, parameters)
+        learning_rate = float(fit_parameters["learning_rate"])
+        if model_type in {"linear_regression", "linear_logit"}:
+            total_epochs = _linear_epoch_count(fit_parameters)
+            completed_epochs = (
+                restored.completed_epochs
+                if restored is not None and fold_index == start_fold
+                else 0
+            )
+            if completed_epochs > total_epochs:
+                raise LearningBacktestError("训练检查点 epoch 超出当前模型配置")
+            if completed_epochs:
+                state = _validate_linear_state(
+                    copy.deepcopy(restored.model_state), feature_columns
+                )
+            else:
+                state = _initialize_linear_state(
+                    train, feature_columns, fit_parameters
+                )
+            for epoch_index in range(completed_epochs, total_epochs):
+                loss = _run_linear_epoch(
+                    state, train, feature_columns, label_column
+                )
+                metric_count += 1
+                latest_checkpoint = make_checkpoint(
+                    fold_index=fold_index,
+                    completed_epochs=epoch_index + 1,
+                    model_state=state,
+                )
+                latest_metric = emit_metric(
+                    fold_index=fold_index,
+                    epoch=epoch_index + 1,
+                    loss=loss,
+                    learning_rate=learning_rate,
+                    device="cpu",
+                    savepoint=latest_checkpoint,
+                    checkpoint_scope="builtin_linear_epoch",
+                )
+                consumed_epochs += 1
+                if epoch_budget is not None and consumed_epochs >= epoch_budget:
+                    return paused_result(latest_checkpoint)
+            model = _linear_predictor(state)
+        else:
+            model = _fit_model(
+                model_type, train, feature_columns, label_column, fit_parameters
+            )
         sequence_model = model_type in {"lstm", "transformer", "transformer_seq", "ensemble"}
         predictions = []
         for row in test:
@@ -259,9 +670,39 @@ def run_learning_backtest(
             net = gross - fee_rate * 2.0
             all_daily.append({"date": day, "return": net, "n_selected": len(selected), "symbols": [row["symbol"] for row, _ in selected]})
         fold_meta.append({"index": fold_index, "train_end": train_end.isoformat(), "test_start": test_start.isoformat(), "test_end": test_end.isoformat(), "train_rows": len(train), "test_rows": len(test)})
+        if model_type in {"linear_regression", "linear_logit"}:
+            latest_checkpoint = make_checkpoint(fold_index=fold_index + 1)
+            if on_checkpoint is not None:
+                on_checkpoint(latest_checkpoint.to_dict())
+        else:
+            metric_count += 1
+            latest_checkpoint = make_checkpoint(fold_index=fold_index + 1)
+            latest_metric = emit_metric(
+                fold_index=fold_index,
+                epoch=_configured_external_epochs(model_type, fit_parameters),
+                loss=_training_loss(
+                    model,
+                    train,
+                    feature_columns,
+                    label_column,
+                    sequence_model=sequence_model,
+                    seq_len=int(fit_parameters.get("seq_len") or 1),
+                ),
+                learning_rate=float(fit_parameters["learning_rate"]),
+                device="cpu",
+                savepoint=latest_checkpoint,
+                checkpoint_scope="completed_fold_only",
+            )
 
     if not all_daily:
         raise LearningBacktestError("学习回测没有有效的训练/测试折")
+    final_checkpoint = make_checkpoint(fold_index=len(folds))
+    if on_checkpoint is not None and (
+        latest_checkpoint is None
+        or latest_checkpoint.checkpoint_sha256 != final_checkpoint.checkpoint_sha256
+    ):
+        on_checkpoint(final_checkpoint.to_dict())
+    latest_checkpoint = final_checkpoint
     all_daily.sort(key=lambda item: item["date"])
     equity = capital
     peak = capital
@@ -277,7 +718,6 @@ def run_learning_backtest(
     volatility = statistics.pstdev(returns) if len(returns) > 1 else 0.0
     from app.replay import build_replay_audit
 
-    snapshot = dict((task.get("data") or {}).get("snapshot") or {})
     replay_events: list[dict[str, Any]] = [
         {
             "event_type": "factor",
@@ -314,11 +754,21 @@ def run_learning_backtest(
         "engine_type": str(task.get("engine_type") or "ml_factor"),
         "strategy": task.get("strategy") or {},
         "data_snapshot": snapshot,
-        "run": {"universe": universe, "period": period, "execution": task.get("execution") or {}, "parameters": parameters, "random_seed": task.get("random_seed")},
+        "run": {"universe": universe, "period": period, "execution": task.get("execution") or {}, "parameters": parameters, "random_seed": random_seed},
         "metrics": {"total_return": equity / capital - 1.0, "final_equity": equity, "net_profit": equity - capital, "max_drawdown": min(drawdowns, default=0.0), "sharpe": (statistics.fmean(returns) / volatility * math.sqrt(252) if volatility > 0 else 0.0), "hit_rate": sum(value > 0 for value in returns) / len(returns), "n_trades": sum(int(point.get("n_selected") or 0) for point in all_daily), "n_days": len(all_daily)},
         "curves": {"equity": equity_curve, "drawdown": [{"date": p["date"], "value": drawdowns[i]} for i, p in enumerate(all_daily)]},
         "deals": [],
-        "diagnostics": {"adapter": f"pxybacktest.{model_type}.v1", "data_source_policy": "pxydata_snapshot_only", "snapshot_enforcement": "manifest_bound", "strictly_reproducible": model_type in {"linear_regression", "linear_logit"}, "feature_columns": feature_columns, "label_column": label_column, "model_type": model_type, "task_type": task_type, "seq_len": int(parameters.get("seq_len") or 1), "purge_days": int(parameters.get("purge_days") or 0), "embargo_days": int(parameters.get("embargo_days") or 0), "folds": fold_meta, "warnings": ["学习回测只生成研究信号，不提交真实订单。"]},
+        "diagnostics": {"adapter": f"pxybacktest.{model_type}.v1", "data_source_policy": "pxydata_snapshot_only", "snapshot_enforcement": "manifest_bound", "strictly_reproducible": model_type in {"linear_regression", "linear_logit"}, "feature_columns": feature_columns, "label_column": label_column, "model_type": model_type, "task_type": task_type, "seq_len": int(parameters.get("seq_len") or 1), "purge_days": int(parameters.get("purge_days") or 0), "embargo_days": int(parameters.get("embargo_days") or 0), "folds": fold_meta, "training_checkpoint_scope": ("builtin_linear_epoch" if model_type in {"linear_regression", "linear_logit"} else "completed_fold_only"), "warnings": ["学习回测只生成研究信号，不提交真实订单。", "训练检查点不包含不可序列化的外部模型或优化器状态。"]},
+        "training": {
+            "complete": True,
+            "metrics_emitted": metric_count,
+            "latest_metric": copy.deepcopy(latest_metric),
+            "checkpoint_summary": latest_checkpoint.summary(),
+            "artifact_logical_names": [
+                LEARNING_CHECKPOINT_ARTIFACT,
+                LEARNING_METRICS_ARTIFACT,
+            ],
+        },
         "artifacts": [],
         "replay_audit": build_replay_audit(
             run_id=task_id,
@@ -329,13 +779,168 @@ def run_learning_backtest(
     }
 
 
+def _linear_epoch_count(parameters: dict[str, Any]) -> int:
+    return max(1, min(int(parameters.get("epochs") or 300), 5000))
+
+
+def _initialize_linear_state(
+    rows: list[dict[str, Any]],
+    columns: list[str],
+    parameters: dict[str, Any],
+) -> dict[str, Any]:
+    means = [
+        statistics.fmean(_features(row, columns)[index] for row in rows)
+        for index in range(len(columns))
+    ]
+    scales = [
+        statistics.pstdev(_features(row, columns)[index] for row in rows) or 1.0
+        for index in range(len(columns))
+    ]
+    learning_rate = float(parameters.get("learning_rate") or 0.03)
+    if not math.isfinite(learning_rate) or learning_rate <= 0:
+        raise LearningBacktestError("learning_rate 必须是有限正数")
+    return {
+        "contract_version": "pxybacktest.linear-training-state.v1",
+        "means": means,
+        "scales": scales,
+        "weights": [0.0] * (len(columns) + 1),
+        "learning_rate": learning_rate,
+    }
+
+
+def _validate_linear_state(
+    state: dict[str, Any] | None, columns: list[str]
+) -> dict[str, Any]:
+    if not isinstance(state, dict) or set(state) != {
+        "contract_version",
+        "means",
+        "scales",
+        "weights",
+        "learning_rate",
+    }:
+        raise LearningBacktestError("线性模型 epoch 检查点状态无效")
+    if state["contract_version"] != "pxybacktest.linear-training-state.v1":
+        raise LearningBacktestError("不支持的线性模型训练状态版本")
+    expected_lengths = {
+        "means": len(columns),
+        "scales": len(columns),
+        "weights": len(columns) + 1,
+    }
+    for name, expected in expected_lengths.items():
+        values = state.get(name)
+        if not isinstance(values, list) or len(values) != expected:
+            raise LearningBacktestError(f"线性模型检查点 {name} 维度不一致")
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in values
+        ):
+            raise LearningBacktestError(f"线性模型检查点 {name} 包含无效数值")
+        state[name] = [float(value) for value in values]
+    learning_rate = state.get("learning_rate")
+    if (
+        isinstance(learning_rate, bool)
+        or not isinstance(learning_rate, (int, float))
+        or not math.isfinite(float(learning_rate))
+        or float(learning_rate) <= 0
+    ):
+        raise LearningBacktestError("线性模型检查点 learning_rate 无效")
+    state["learning_rate"] = float(learning_rate)
+    return state
+
+
+def _run_linear_epoch(
+    state: dict[str, Any],
+    rows: list[dict[str, Any]],
+    columns: list[str],
+    label: str,
+) -> float:
+    means = state["means"]
+    scales = state["scales"]
+    weights = state["weights"]
+    gradients = [0.0] * len(weights)
+    squared_errors: list[float] = []
+    for row in rows:
+        vector = [1.0] + [
+            (value - means[index]) / scales[index]
+            for index, value in enumerate(_features(row, columns))
+        ]
+        error = sum(
+            weight * value for weight, value in zip(weights, vector)
+        ) - float(row[label])
+        squared_errors.append(error * error)
+        for index, value in enumerate(vector):
+            gradients[index] += error * value / len(rows)
+    state["weights"] = [
+        weight - state["learning_rate"] * gradient
+        for weight, gradient in zip(weights, gradients)
+    ]
+    return statistics.fmean(squared_errors)
+
+
+def _linear_predictor(state: dict[str, Any]):
+    means = list(state["means"])
+    scales = list(state["scales"])
+    weights = list(state["weights"])
+
+    def predict(values: list[float]) -> float:
+        vector = [1.0] + [
+            (value - means[index]) / scales[index]
+            for index, value in enumerate(values)
+        ]
+        return sum(
+            weight * value for weight, value in zip(weights, vector)
+        )
+
+    return predict
+
+
+def _configured_external_epochs(
+    model_type: str, parameters: dict[str, Any]
+) -> int:
+    if model_type == "lightgbm":
+        return max(1, int(parameters.get("n_estimators") or 100))
+    configured = parameters.get("epochs")
+    if configured is None:
+        configured = parameters.get("max_epochs", 20)
+    return max(1, min(int(configured), 1000))
+
+
+def _training_loss(
+    model: Callable[[Any], float],
+    training_rows: list[dict[str, Any]],
+    columns: list[str],
+    label: str,
+    *,
+    sequence_model: bool,
+    seq_len: int,
+) -> float:
+    errors: list[float] = []
+    for row in training_rows:
+        if sequence_model:
+            history = _history_for_row(training_rows, row, seq_len)
+            features: Any = [_features(item, columns) for item in history]
+        else:
+            features = _features(row, columns)
+        error = float(model(features)) - float(row[label])
+        errors.append(error * error)
+    return statistics.fmean(errors)
+
+
 def _fit_model(model_type: str, rows: list[dict[str, Any]], columns: list[str], label: str, parameters: dict[str, Any]):
     if model_type == "lightgbm":
         try:
             import lightgbm as lgb
         except ImportError as exc:
             raise LearningBacktestError("lightgbm 未安装") from exc
-        model = lgb.LGBMRegressor(random_state=int(parameters.get("seed") or 42), n_estimators=int(parameters.get("n_estimators") or 100), verbosity=-1)
+        seed = parameters.get("seed")
+        model = lgb.LGBMRegressor(
+            random_state=int(42 if seed is None else seed),
+            n_estimators=int(parameters.get("n_estimators") or 100),
+            learning_rate=float(parameters.get("learning_rate") or 0.1),
+            verbosity=-1,
+        )
         model.fit([_features(row, columns) for row in rows], [float(row[label]) for row in rows])
         return lambda values: float(model.predict([values])[0])
     if model_type in {"lstm", "transformer", "transformer_seq"}:
@@ -359,7 +964,8 @@ def _fit_torch_sequence(
         from torch import nn
     except ImportError as exc:
         raise LearningBacktestError("torch 未安装；请安装 PXYBACKTEST 的 ml extra") from exc
-    seed = int(parameters.get("seed") or 42)
+    seed_value = parameters.get("seed")
+    seed = int(42 if seed_value is None else seed_value)
     torch.manual_seed(seed)
     seq_len = max(1, int(parameters.get("seq_len") or 1))
     sequences, target_values = _training_sequences(rows, columns, label, seq_len)
@@ -459,23 +1065,10 @@ def _history_for_row(rows, row, seq_len):
 
 
 def _fit_linear_regression(rows: list[dict[str, Any]], columns: list[str], label: str, parameters: dict[str, Any]):
-    means = [statistics.fmean(_features(row, columns)[i] for row in rows) for i in range(len(columns))]
-    scales = [statistics.pstdev(_features(row, columns)[i] for row in rows) or 1.0 for i in range(len(columns))]
-    weights = [0.0] * (len(columns) + 1)
-    lr = float(parameters.get("learning_rate") or 0.03)
-    epochs = int(parameters.get("epochs") or 300)
-    for _ in range(max(1, min(epochs, 5000))):
-        gradients = [0.0] * len(weights)
-        for row in rows:
-            vector = [1.0] + [(value - means[i]) / scales[i] for i, value in enumerate(_features(row, columns))]
-            error = sum(weight * value for weight, value in zip(weights, vector)) - float(row[label])
-            for i, value in enumerate(vector):
-                gradients[i] += error * value / len(rows)
-        weights = [weight - lr * gradient for weight, gradient in zip(weights, gradients)]
-    def predict(values: list[float]) -> float:
-        vector = [1.0] + [(value - means[i]) / scales[i] for i, value in enumerate(values)]
-        return sum(weight * value for weight, value in zip(weights, vector))
-    return predict
+    state = _initialize_linear_state(rows, columns, parameters)
+    for _ in range(_linear_epoch_count(parameters)):
+        _run_linear_epoch(state, rows, columns, label)
+    return _linear_predictor(state)
 
 
 def _features(row: dict[str, Any], columns: list[str]) -> list[float]:

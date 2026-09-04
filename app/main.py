@@ -188,6 +188,16 @@ def _data_requirement_payload(
         "request_fingerprint": request_fingerprint,
         "datasets": datasets,
         "quality_policy": body.data.selection.quality_policy,
+        "snapshot_kind": (
+            "factor_bundle"
+            if body.engine_type in {"factor_matrix", "event_sentiment"}
+            else "snapshot"
+        ),
+        "factor_set_id": (
+            str(body.parameters.get("factor_set_id") or "")
+            if body.engine_type in {"factor_matrix", "event_sentiment"}
+            else None
+        ),
     }
 
 
@@ -197,6 +207,64 @@ def _waiting_worker_request(body: SubmitBacktestRequestV2) -> dict[str, object]:
         "execution_mode": body.execution.execution_mode,
         "_task_contract": body.model_dump(mode="json"),
     }
+
+
+def _validate_waiting_snapshot_manifest(
+    body: SubmitBacktestRequestV2,
+    requirement: DataRequirementManifestV1,
+    snapshot: DataSnapshotRefV2,
+    manifest: dict,
+) -> None:
+    if body.data.selection is None:
+        raise SnapshotProviderError("等待任务缺少原始数据选择", status_code=409)
+    selection = manifest.get("selection")
+    if not isinstance(selection, dict):
+        raise SnapshotProviderError("就绪快照缺少选择条件", status_code=409)
+    start_date, end_date = _snapshot_date_range(body)
+    if str(selection.get("start_date") or "") != start_date:
+        raise SnapshotProviderError("就绪快照开始日期与需求不一致", status_code=409)
+    if str(selection.get("end_date") or "") != end_date:
+        raise SnapshotProviderError("就绪快照结束日期与需求不一致", status_code=409)
+    expected_symbols = {symbol.upper() for symbol in body.universe.symbols}
+    actual_symbols = {
+        str(symbol).upper() for symbol in selection.get("symbols") or []
+    }
+    if actual_symbols != expected_symbols:
+        raise SnapshotProviderError("就绪快照标的范围与需求不一致", status_code=409)
+    if str(selection.get("decision_time") or "") != body.data.selection.decision_time:
+        raise SnapshotProviderError("就绪快照决策时点与需求不一致", status_code=409)
+    expected_datasets = (
+        {"kline_daily", "factor_matrix_daily"}
+        if requirement.snapshot_kind == "factor_bundle"
+        else set(body.data.selection.datasets)
+    )
+    actual_datasets = {
+        str(item.get("name") or "")
+        for item in manifest.get("datasets") or []
+        if isinstance(item, dict)
+    }
+    if actual_datasets != expected_datasets:
+        raise SnapshotProviderError("就绪快照数据集与需求不一致", status_code=409)
+    if snapshot.quality_policy != body.data.selection.quality_policy:
+        raise SnapshotProviderError("就绪快照质量策略与需求不一致", status_code=409)
+    if requirement.snapshot_kind == "factor_bundle":
+        derivation = manifest.get("derivation")
+        if not isinstance(derivation, dict):
+            raise SnapshotProviderError("因子执行快照缺少派生身份", status_code=409)
+        if str(derivation.get("factor_set_id") or "") != str(
+            requirement.factor_set_id or ""
+        ):
+            raise SnapshotProviderError("因子执行快照集合与需求不一致", status_code=409)
+        if not str(derivation.get("input_snapshot_id") or "").startswith(
+            "btsnap_v1_"
+        ):
+            raise SnapshotProviderError("因子执行快照缺少输入快照身份", status_code=409)
+    if requirement.request_fingerprint != str(
+        _data_requirement_payload(body, requirement.consumer_task_id)[
+            "request_fingerprint"
+        ]
+    ):
+        raise SnapshotProviderError("就绪快照原始请求指纹不一致", status_code=409)
 
 
 def _runner_state(catalog: list[dict], runner_id: str) -> dict:
@@ -406,13 +474,15 @@ def create_app(
         if not isinstance(contract, dict):
             raise SnapshotProviderError("等待任务缺少 Task v2 契约", status_code=409)
         body = SubmitBacktestRequestV2.model_validate(contract)
-        snapshot_manifest: dict | None = None
-        if body.engine_type in MANIFEST_ENGINE_TYPES:
-            snapshot, snapshot_manifest = await data_snapshots.resolve_snapshot(
-                requirement.snapshot
-            )
-        else:
-            snapshot = await data_snapshots.verify_snapshot(requirement.snapshot)
+        snapshot, full_manifest = await data_snapshots.resolve_snapshot(
+            requirement.snapshot
+        )
+        _validate_waiting_snapshot_manifest(
+            body, requirement, snapshot, full_manifest
+        )
+        snapshot_manifest = (
+            full_manifest if body.engine_type in MANIFEST_ENGINE_TYPES else None
+        )
         factor_set = await _verify_factor_set_binding(data_snapshots, body)
         factor_updates = _bind_factor_set_to_manifest(
             body, snapshot_manifest, factor_set
@@ -441,7 +511,19 @@ def create_app(
         )
 
     if isinstance(task_manager, TaskManager):
-        task_manager.configure_data_waiting(data_snapshots, resolve_waiting_task)
+        def rebuild_data_requirement(
+            request: dict[str, object], task_id: str
+        ) -> dict[str, object]:
+            contract = request.get("_task_contract")
+            if not isinstance(contract, dict):
+                raise ValueError("等待任务缺少 Task v2 契约")
+            return _data_requirement_payload(
+                SubmitBacktestRequestV2.model_validate(contract), task_id
+            )
+
+        task_manager.configure_data_waiting(
+            data_snapshots, resolve_waiting_task, rebuild_data_requirement
+        )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):

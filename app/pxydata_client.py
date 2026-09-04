@@ -33,6 +33,8 @@ class DataRequirementManifestV1(BaseModel):
     request_fingerprint: str
     datasets: list[dict[str, Any]] = Field(min_length=1)
     quality_policy: Literal["require_pass", "allow_warn", "allow_unverified"]
+    snapshot_kind: Literal["snapshot", "factor_bundle"] = "snapshot"
+    factor_set_id: str | None = None
     status: Literal[
         "pending", "backfilling", "quality_checking", "ready", "failed"
     ]
@@ -93,7 +95,7 @@ class SnapshotClient(Protocol):
     ) -> DataRequirementManifestV1: ...
 
     async def get_data_requirement(
-        self, requirement_id: str
+        self, requirement_id: str, *, expected: dict[str, Any] | None = None
     ) -> DataRequirementManifestV1: ...
 
 
@@ -258,7 +260,7 @@ class PxyDataSnapshotClient:
         return _validate_data_requirement(response, expected=payload)
 
     async def get_data_requirement(
-        self, requirement_id: str
+        self, requirement_id: str, *, expected: dict[str, Any] | None = None
     ) -> DataRequirementManifestV1:
         identifier = str(requirement_id).strip()
         response = await asyncio.to_thread(
@@ -267,7 +269,7 @@ class PxyDataSnapshotClient:
             f"/api/v1/backtest/data-requirements/{identifier}",
             None,
         )
-        manifest = _validate_data_requirement(response)
+        manifest = _validate_data_requirement(response, expected=expected)
         if manifest.requirement_id != identifier:
             raise SnapshotProviderError("PXYDATA 数据需求 ID 不一致", status_code=409)
         return manifest
@@ -374,6 +376,46 @@ def _validate_data_requirement(
             expected.get("request_fingerprint") or ""
         ):
             raise SnapshotProviderError("PXYDATA 数据需求指纹不一致", status_code=409)
+        if manifest.quality_policy != str(expected.get("quality_policy") or ""):
+            raise SnapshotProviderError("PXYDATA 数据需求质量策略不一致", status_code=409)
+        if manifest.snapshot_kind != str(expected.get("snapshot_kind") or "snapshot"):
+            raise SnapshotProviderError("PXYDATA 数据需求快照类型不一致", status_code=409)
+        if (manifest.factor_set_id or None) != (expected.get("factor_set_id") or None):
+            raise SnapshotProviderError("PXYDATA 数据需求因子集合不一致", status_code=409)
+        expected_datasets = expected.get("datasets")
+        def normalize_datasets(items: list[Any]) -> list[dict[str, Any]]:
+            normalized = [
+                {
+                    **item,
+                    "fields": sorted(set(item.get("fields") or [])),
+                    "symbols": sorted(set(item.get("symbols") or [])),
+                }
+                for item in items
+                if isinstance(item, dict)
+            ]
+            return sorted(normalized, key=lambda item: str(item.get("name") or ""))
+
+        if (
+            not isinstance(expected_datasets, list)
+            or normalize_datasets(manifest.datasets)
+            != normalize_datasets(expected_datasets)
+        ):
+            raise SnapshotProviderError("PXYDATA 数据需求明细不一致", status_code=409)
+        if manifest.snapshot is not None:
+            requested_names = (
+                {"kline_daily", "factor_matrix_daily"}
+                if manifest.snapshot_kind == "factor_bundle"
+                else {
+                    str(item.get("name") or "")
+                    for item in expected_datasets
+                    if isinstance(item, dict)
+                }
+            )
+            snapshot_names = {item.name for item in manifest.snapshot.datasets}
+            if snapshot_names != requested_names:
+                raise SnapshotProviderError(
+                    "PXYDATA 就绪快照数据集与需求不一致", status_code=409
+                )
     if manifest.status == "ready" and manifest.snapshot is None:
         raise SnapshotProviderError("已就绪的数据需求缺少快照", status_code=502)
     if manifest.status != "ready" and manifest.snapshot is not None:

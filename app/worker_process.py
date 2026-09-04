@@ -23,6 +23,10 @@ RELIABLE_EVENT_TIMEOUT_SECONDS = 5.0
 logger = logging.getLogger("backtest_service")
 
 
+class _LearningWorkerCancelled(RuntimeError):
+    pass
+
+
 def _parse_request_rate(request: dict[str, Any], default: float = 0.0004) -> float:
     """解析手续费率，保留调用方显式传入的 0。"""
 
@@ -789,6 +793,92 @@ def run_learning_worker(
         )
         from app.learning import run_learning_backtest
 
+        restored_checkpoint = (
+            request.get("_learning_checkpoint")
+            if isinstance(request.get("_learning_checkpoint"), dict)
+            else None
+        )
+        metrics_emitted = int(
+            (restored_checkpoint or {}).get("metric_count") or 0
+        )
+
+        def handle_training_commands() -> None:
+            nonlocal cancelled
+            cancelled = cancelled or _drain_worker_commands(
+                command_queue, deferred_commands
+            )
+            paused = False
+            replay_commands: list[dict[str, Any]] = []
+            for command in deferred_commands:
+                action = str(command.get("action") or "").strip().lower()
+                if action == "cancel":
+                    cancelled = True
+                elif action == "pause":
+                    paused = True
+                elif action == "resume":
+                    paused = False
+                else:
+                    replay_commands.append(command)
+            deferred_commands[:] = replay_commands
+            if cancelled:
+                raise _LearningWorkerCancelled
+            if not paused:
+                return
+            _emit(
+                event_queue,
+                "state",
+                {"status": "paused", "phase": "training_model"},
+                reliable=True,
+            )
+            while True:
+                try:
+                    command = command_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                action = str(command.get("action") or "").strip().lower()
+                if action == "cancel":
+                    cancelled = True
+                    raise _LearningWorkerCancelled
+                if action == "resume":
+                    _emit(
+                        event_queue,
+                        "state",
+                        {"status": "running", "phase": "training_model"},
+                        reliable=True,
+                    )
+                    return
+                if action != "pause" and isinstance(command, dict):
+                    deferred_commands.append(command)
+
+        def emit_learning_checkpoint(checkpoint: dict[str, Any]) -> None:
+            summary = {
+                key: checkpoint.get(key)
+                for key in (
+                    "contract_version",
+                    "artifact_logical_name",
+                    "fold_index",
+                    "completed_epochs",
+                    "checkpoint_sha256",
+                )
+            }
+            _emit(
+                event_queue,
+                "learning_checkpoint",
+                {"checkpoint": checkpoint, "checkpoint_summary": summary},
+                reliable=True,
+            )
+            handle_training_commands()
+
+        def emit_training_metric(metric: dict[str, Any]) -> None:
+            nonlocal metrics_emitted
+            metrics_emitted += 1
+            _emit(
+                event_queue,
+                "training_metric",
+                {"metric": metric, "metrics_emitted": metrics_emitted},
+                reliable=True,
+            )
+
         if cancel_requested():
             _emit(event_queue, "cancelled", {}, terminal=True)
             return
@@ -797,7 +887,11 @@ def run_learning_worker(
             task=task,
             manifest=manifest,
             data_root=pxydata_root,
+            checkpoint=restored_checkpoint,
+            on_training_metric=emit_training_metric,
+            on_checkpoint=emit_learning_checkpoint,
         )
+        handle_training_commands()
         outcome = _replay_non_cta_result(
             event_queue,
             command_queue,
@@ -827,6 +921,8 @@ def run_learning_worker(
             {"result_path": str(result_path), "progress": 100.0},
             terminal=True,
         )
+    except _LearningWorkerCancelled:
+        _emit(event_queue, "cancelled", {}, terminal=True)
     except Exception as exc:
         if cancelled:
             _emit(event_queue, "cancelled", {}, terminal=True)
@@ -1172,6 +1268,11 @@ def _replay_non_cta_result(
         events=replay_events,
         mode=mode,
         speed=speed,
+        checkpoint=(
+            request.get("_replay_checkpoint")
+            if isinstance(request.get("_replay_checkpoint"), dict)
+            else None
+        ),
     )
     outcome = controller.run(
         read_commands=read_commands,

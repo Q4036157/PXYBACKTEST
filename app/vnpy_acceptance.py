@@ -24,7 +24,8 @@ def _scalar(value: Any) -> Any:
 
 def _strategy_source_sha256() -> str:
     path = Path(__file__).parent / "acceptance_strategies" / "vnpy_cta_v1.py"
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    source = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(source).hexdigest()
 
 
 def run_vnpy_acceptance_vector() -> dict[str, Any]:

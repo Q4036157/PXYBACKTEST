@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,28 @@ def test_pinned_vnpy_vector_passes_trade_account_and_visual_dimensions() -> None
     evidence = result.to_strategy_evidence()
     assert evidence["vector_id"] == "vnpy-cta-native-v1"
     assert len(evidence["trades"]["evidence_sha256"]) == 64
+
+
+def test_vnpy_strategy_identity_is_independent_of_checkout_line_endings(
+    tmp_path,
+) -> None:
+    from app import vnpy_acceptance
+
+    source = (
+        Path(vnpy_acceptance.__file__).parent
+        / "acceptance_strategies"
+        / "vnpy_cta_v1.py"
+    )
+    lf_source = source.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    expected = hashlib.sha256(lf_source).hexdigest()
+    assert expected == "0748b90a5105a31c065fb405e610cde18bb4e34ca9e9953acf7730ae4831208f"
+
+    crlf_source = tmp_path / "vnpy_cta_v1.py"
+    crlf_source.write_bytes(lf_source.replace(b"\n", b"\r\n"))
+    normalized = (
+        crlf_source.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    )
+    assert hashlib.sha256(normalized).hexdigest() == expected
 
 
 def test_trade_difference_does_not_get_hidden_by_matching_account() -> None:

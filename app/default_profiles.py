@@ -21,6 +21,13 @@ _ENGINE_METADATA: dict[str, dict[str, Any]] = {
         "frontend_ready": True,
         "result_panels": ["summary", "portfolio", "replay", "diagnostics"],
     },
+    "a_share_emotion_etf": {
+        "label": "ETF 情绪极值",
+        "category": "portfolio",
+        "maturity": "run_verified",
+        "frontend_ready": True,
+        "result_panels": ["summary", "portfolio", "replay", "orders", "diagnostics"],
+    },
     "factor_matrix": {
         "label": "A 股多因子",
         "category": "factor",
@@ -94,6 +101,7 @@ _DEFAULT_PROFILES: tuple[dict[str, Any], ...] = (
         "timeframe": "daily",
         "engine_ids": [
             "a_share_portfolio",
+            "a_share_emotion_etf",
             "factor_matrix",
             "event_sentiment",
             "ml_factor",

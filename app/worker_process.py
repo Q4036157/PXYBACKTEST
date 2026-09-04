@@ -18,6 +18,7 @@ A_SHARE_ADAPTER_CONTRACT = "pxybacktest.engine-adapter.a-share.v1"
 DAA_ENGINE_TYPES = {"a_share_portfolio", "factor_matrix", "event_sentiment"}
 ML_ENGINE_TYPES = {"ml_factor", "deep_learning"}
 LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
+EMOTION_ETF_ENGINE_TYPES = {"a_share_emotion_etf"}
 TQSDK_ENGINE_TYPES = {"tqsdk_native"}
 RELIABLE_EVENT_TIMEOUT_SECONDS = 5.0
 logger = logging.getLogger("backtest_service")
@@ -381,6 +382,16 @@ def run_preloaded_worker(
             command_queue,
         )
         return
+    if engine_type in EMOTION_ETF_ENGINE_TYPES:
+        run_emotion_etf_worker(
+            task_id,
+            request,
+            pxydata_root,
+            result_path,
+            event_queue,
+            command_queue,
+        )
+        return
     if engine_type == "microstructure":
         run_microstructure_worker(
             task_id,
@@ -668,6 +679,65 @@ def run_tqsdk_queue_worker(
             {"error": f"天勤原生回测失败: {type(exc).__name__}: {exc}"},
             terminal=True,
         )
+
+
+def run_emotion_etf_worker(
+    task_id: str,
+    request: dict[str, Any],
+    pxydata_root: str,
+    result_path: str,
+    event_queue,
+    command_queue,
+) -> None:
+    """执行PXYDATA快照绑定的ETF情绪极值回测。"""
+    cancelled = False
+    deferred_commands: list[dict[str, Any]] = []
+    try:
+        def cancel_requested() -> bool:
+            nonlocal cancelled
+            cancelled = cancelled or _drain_worker_commands(command_queue, deferred_commands)
+            return cancelled
+
+        if cancel_requested():
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
+        task = request.get("_task_contract")
+        manifest = request.get("_snapshot_manifest")
+        if not isinstance(task, dict) or not isinstance(manifest, dict):
+            raise ValueError("情绪ETF worker缺少任务契约或完整快照清单")
+        _emit(event_queue, "state", {"status": "running", "phase": "verifying_emotion_snapshot", "progress": 5.0})
+        from app.a_share_emotion_etf import run_emotion_etf_backtest
+
+        result = run_emotion_etf_backtest(
+            task_id=task_id,
+            task=task,
+            manifest=manifest,
+            data_root=pxydata_root,
+        )
+        outcome = _replay_non_cta_result(
+            event_queue,
+            command_queue,
+            task_id=task_id,
+            request=request,
+            result=result,
+            engine_type="a_share_emotion_etf",
+            deferred_commands=deferred_commands,
+        )
+        _atomic_json_write(Path(result_path), result)
+        if not outcome["complete"]:
+            _emit(
+                event_queue,
+                "cancelled",
+                {"result_path": str(result_path), "result_available": True, "partial": True, "processed_events": outcome["processed_events"]},
+                terminal=True,
+            )
+            return
+        _emit(event_queue, "completed", {"result_path": str(result_path), "progress": 100.0}, terminal=True)
+    except Exception as exc:
+        if cancelled:
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
+        _emit(event_queue, "failed", {"error": f"情绪ETF回测失败: {type(exc).__name__}: {exc}"}, terminal=True)
 
 
 def run_microstructure_worker(

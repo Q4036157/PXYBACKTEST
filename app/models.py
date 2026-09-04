@@ -78,6 +78,7 @@ class TaskEvent(BaseModel):
 EngineType = Literal[
     "vnpy_cta",
     "a_share_portfolio",
+    "a_share_emotion_etf",
     "factor_matrix",
     "event_sentiment",
     "microstructure",
@@ -431,6 +432,8 @@ class SubmitBacktestRequestV2(BaseModel):
             raise ValueError("vnpy_cta currently requires exactly one symbol")
         if self.engine_type == "a_share_portfolio":
             self._validate_a_share_contract()
+        elif self.engine_type == "a_share_emotion_etf":
+            self._validate_emotion_etf_contract()
         elif self.engine_type in {"factor_matrix", "event_sentiment"}:
             self._validate_factor_contract()
         elif self.engine_type == "microstructure":
@@ -537,6 +540,44 @@ class SubmitBacktestRequestV2(BaseModel):
             value = self.parameters.get(field_name)
             if value is not None and int(value) < 1:
                 raise ValueError(f"A 股回测 parameters.{field_name} 必须大于 0")
+
+    def _validate_emotion_etf_contract(self) -> None:
+        if len(self.universe.symbols) != 1:
+            raise ValueError("情绪ETF回测要求恰好一个标的")
+        symbol = self.universe.symbols[0].strip().upper()
+        if re.fullmatch(r"\d{6}\.(SZ|SH)", symbol) is None:
+            raise ValueError("情绪ETF标的代码格式应为六位代码加交易所后缀")
+        if self.period.interval != "1d" or self.execution.mode != "BAR":
+            raise ValueError("情绪ETF回测采用1d与BAR模式")
+        if self.execution.leverage not in (None, 1.0):
+            raise ValueError("情绪ETF回测采用无杠杆口径")
+        if self.execution.entry_fill != "next_bar_open" or self.execution.exit_fill != "next_bar_open":
+            raise ValueError("情绪ETF信号统一在下一交易日开盘成交")
+        if not self.execution.t_plus_one:
+            raise ValueError("情绪ETF任务必须启用T+1")
+        if self.execution.stamp_tax_bps != 0:
+            raise ValueError("ETF任务印花税应为0")
+        if self.strategy.id != "etf_emotion_extreme_c_v1" or self.strategy.entrypoint != self.strategy.id:
+            raise ValueError("情绪ETF任务策略标识应为etf_emotion_extreme_c_v1")
+        if re.fullmatch(r"[0-9a-fA-F]{64}", self.strategy.source_hash) is None:
+            raise ValueError("情绪ETF策略要求完整SHA256源码指纹")
+        datasets = (
+            self.data.selection.datasets
+            if self.data.selection is not None
+            else [item.name for item in self.data.snapshot.datasets]  # type: ignore[union-attr]
+        )
+        missing = {"etf_snapshots", "market_emotion_daily"} - set(datasets)
+        if missing:
+            raise ValueError(f"情绪ETF数据快照缺少: {', '.join(sorted(missing))}")
+        entry = float(self.parameters.get("entry_threshold", 30))
+        exit_ = float(self.parameters.get("exit_threshold", 80))
+        if entry != 30 or exit_ != 80:
+            raise ValueError("策略C固定使用冰点<30买入、过热>=80卖出")
+        lot_size = int(self.parameters.get("lot_size", 100))
+        if lot_size != 100:
+            raise ValueError("A股ETF回测固定每手100份")
+        if float(self.parameters.get("min_commission", 5)) < 0:
+            raise ValueError("最低佣金应大于等于0")
 
     def _validate_factor_contract(self) -> None:
         if self.period.interval != "1d":
@@ -697,6 +738,14 @@ class SubmitBacktestRequestV2(BaseModel):
         if self.engine_type in LIGHTER_ENGINE_TYPES:
             if snapshot_manifest is None:
                 raise ValueError("lighter_microstructure 缺少内部快照清单")
+            return {
+                "speed": self.execution.speed,
+                "_task_contract": self.model_dump(mode="json"),
+                "_snapshot_manifest": snapshot_manifest,
+            }
+        if self.engine_type == "a_share_emotion_etf":
+            if snapshot_manifest is None:
+                raise ValueError("情绪ETF任务缺少内部快照清单")
             return {
                 "speed": self.execution.speed,
                 "_task_contract": self.model_dump(mode="json"),

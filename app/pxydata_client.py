@@ -253,13 +253,17 @@ class PxyDataSnapshotClient:
     async def create_data_requirement(
         self, payload: dict[str, Any]
     ) -> DataRequirementManifestV1:
+        wire_payload = {key: value for key, value in payload.items() if key != "requirement_id"}
         response = await asyncio.to_thread(
             self._request,
             "POST",
             "/api/v1/backtest/data-requirements",
-            payload,
+            wire_payload,
         )
-        return _validate_data_requirement(response, expected=payload)
+        manifest = _validate_data_requirement(response, expected=payload)
+        if "requirement_id" in payload and manifest.requirement_id != payload["requirement_id"]:
+            raise SnapshotProviderError("PXYDATA 数据需求 ID 不一致", status_code=409)
+        return manifest
 
     async def get_data_requirement(
         self, requirement_id: str, *, expected: dict[str, Any] | None = None

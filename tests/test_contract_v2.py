@@ -819,8 +819,11 @@ def test_capabilities_publish_versioned_recommended_defaults(tmp_path: Path) -> 
     assert engines["vnpy_cta"]["label"] == "CTA 可视化回放"
     assert engines["vnpy_cta"]["frontend_ready"] is True
     assert engines["deep_learning"]["category"] == "learning"
-    assert engines["deep_learning"]["frontend_ready"] is False
+    assert engines["deep_learning"]["frontend_ready"] is True
     assert "submit_ready" in engines["deep_learning"]["availability"]
+    assert engines["ml_factor"]["frontend_ready"] is True
+    assert engines["lighter_microstructure"]["frontend_ready"] is True
+    assert engines["mt5_native"]["frontend_ready"] is True
 
 
 def test_task_contract_and_result_preserve_default_profile() -> None:

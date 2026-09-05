@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import subprocess
 from pathlib import Path
 
@@ -9,6 +11,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.config import Settings
+from app.a_share_emotion_etf import EMOTION_ETF_STRATEGY_HASH, EMOTION_ETF_STRATEGY_ID
 from app.daa_client import (
     DaaAdapterClient,
     DaaCapabilitiesError,
@@ -1000,6 +1003,74 @@ def test_v2_missing_selection_creates_waiting_task_and_requirement(tmp_path: Pat
     task = manager.store.get_task("user-a", payload["task_id"])
     assert task["status"] == "waiting_for_data"
     assert task["data_requirement"]["consumer_task_id"] == payload["task_id"]
+
+
+@pytest.mark.parametrize("symbol", ["159819.SZ", "510300.SH"])
+@pytest.mark.parametrize("quality_policy", ["require_pass", "allow_unverified"])
+def test_emotion_etf_data_requirement_identity(
+    symbol: str, quality_policy: str
+) -> None:
+    payload = _a_share_payload()
+    payload.update({
+        "engine_type": "a_share_emotion_etf",
+        "strategy": {
+            "id": EMOTION_ETF_STRATEGY_ID,
+            "version": "builtin-v1",
+            "source_hash": EMOTION_ETF_STRATEGY_HASH,
+            "entrypoint": EMOTION_ETF_STRATEGY_ID,
+        },
+        "universe": {"symbols": [symbol]},
+        "parameters": {},
+    })
+    payload["execution"].update({"t_plus_one": True, "stamp_tax_bps": 0})
+    payload["data"]["selection"].update({
+        "datasets": ["etf_snapshots", "market_emotion_daily"],
+        "quality_policy": quality_policy,
+    })
+    body = SubmitBacktestRequestV2.model_validate(payload)
+    original = body.model_dump(mode="json")
+    task_id = "etf-request-identity"
+
+    requirement = _data_requirement_payload(body, task_id)
+
+    common = {
+        "fields": [], "start": "2026-08-01", "end": "2026-08-02",
+        "frequency": "1d", "market": "cn_equity",
+    }
+    assert requirement["datasets"] == [
+        {**common, "name": "etf_snapshots", "symbols": [symbol], "pit_required": False},
+        {**common, "name": "market_emotion_daily", "symbols": [], "pit_required": True},
+    ]
+    assert requirement["quality_policy"] == quality_policy
+    assert requirement["snapshot_kind"] == "snapshot"
+    fingerprint = hashlib.sha256(
+        json.dumps(original, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    requirement_hash = hashlib.sha256(f"{task_id}\0{fingerprint}".encode("utf-8")).hexdigest()[:32]
+    assert requirement["request_fingerprint"] == fingerprint
+    assert requirement["requirement_id"] == f"datareq_v1_{requirement_hash}"
+    assert body.model_dump(mode="json") == original
+    assert _data_requirement_payload(body, task_id) == requirement
+
+
+@pytest.mark.parametrize(
+    "payload_factory, market, pit_datasets",
+    [
+        (_payload, "global", set()),
+        (_a_share_payload, "cn_equity", set()),
+        (_factor_payload, "cn_equity", {"events"}),
+    ],
+)
+def test_data_requirement_preserves_other_engine_identity(
+    payload_factory, market: str, pit_datasets: set[str]
+) -> None:
+    body = SubmitBacktestRequestV2.model_validate(payload_factory())
+    requirement = _data_requirement_payload(body, "existing-engine")
+    for dataset in requirement["datasets"]:
+        assert dataset["market"] == market
+        assert dataset["symbols"] == body.universe.symbols
+        assert dataset["pit_required"] == (dataset["name"] in pit_datasets)
+    assert requirement["quality_policy"] == body.data.selection.quality_policy
 
 
 def test_ready_factor_bundle_restores_execution_and_input_snapshot_binding() -> None:

@@ -154,7 +154,7 @@ def _data_requirement_payload(
     field_map = data_fields if isinstance(data_fields, dict) else {}
     market = (
         "cn_equity"
-        if body.engine_type in DAA_ENGINE_TYPES | {"ml_factor", "deep_learning"}
+        if body.engine_type in DAA_ENGINE_TYPES | {"a_share_emotion_etf", "ml_factor", "deep_learning"}
         else "lighter"
         if body.engine_type == "lighter_microstructure"
         else "global"
@@ -164,6 +164,7 @@ def _data_requirement_payload(
         "events",
         "factor_matrix_daily",
         "ml_features_daily",
+        "market_emotion_daily",
     }
     datasets = [
         {
@@ -179,7 +180,7 @@ def _data_requirement_payload(
                     if str(value).strip()
                 }
             ),
-            "symbols": body.universe.symbols,
+            "symbols": [] if name == "market_emotion_daily" else body.universe.symbols,
             "start": start_date,
             "end": end_date,
             "frequency": body.period.interval,

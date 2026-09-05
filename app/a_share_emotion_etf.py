@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import math
-from datetime import datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .metrics import compute_metrics, drawdown_curve
 
@@ -15,6 +16,7 @@ EMOTION_ETF_STRATEGY_HASH = hashlib.sha256(
     b"pxybacktest.etf-emotion-extreme-c.v1|entry<30|exit>=80|next-open|t+1|lot100"
 ).hexdigest()
 EMOTION_DATA_CONTRACT = "pxydata.market_emotion_daily.v1"
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class EmotionEtfBacktestError(ValueError):
@@ -80,6 +82,8 @@ def _day(value: Any) -> str:
 
 
 def _number(value: Any, field: str) -> float:
+    if isinstance(value, bool):
+        raise EmotionEtfBacktestError(f"{field}不是有效数字")
     try:
         result = float(value)
     except (TypeError, ValueError) as exc:
@@ -87,6 +91,28 @@ def _number(value: Any, field: str) -> float:
     if not math.isfinite(result):
         raise EmotionEtfBacktestError(f"{field}不是有限数字")
     return result
+
+
+def _trade_day(row: dict[str, Any]) -> str:
+    value = row.get("date") or row.get("trade_date") or row.get("data_date")
+    try:
+        return date.fromisoformat(str(value or "")).isoformat()
+    except ValueError as exc:
+        raise EmotionEtfBacktestError("正式日线缺少有效交易日期") from exc
+
+
+def _session_time(day: str, hour: int, minute: int = 0) -> datetime:
+    return datetime.combine(date.fromisoformat(day), time(hour, minute), SHANGHAI)
+
+
+def _available_time(value: Any) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("missing timezone")
+        return parsed.astimezone(SHANGHAI)
+    except (ValueError, OverflowError) as exc:
+        raise EmotionEtfBacktestError("market_emotion_daily.available_at必须是完整带时区时间") from exc
 
 
 def replay_emotion_etf(
@@ -108,35 +134,63 @@ def replay_emotion_etf(
     for row in kline_rows:
         if str(row.get("symbol") or "").strip().upper() != wanted:
             continue
-        day = _day(row.get("date") or row.get("trade_date") or row.get("snapshot_date") or row.get("data_date"))
-        close_value = row.get("close") if row.get("close") is not None else row.get("last_price")
-        try:
-            valid_price = float(row.get("open")) > 0 and float(close_value) > 0
-        except (TypeError, ValueError):
-            valid_price = False
-        if day and valid_price:
-            bars[day] = {**row, "close": close_value}
+        day = _trade_day(row)
+        normalized = {"date": day, "symbol": wanted}
+        for field in ("open", "close"):
+            value = _number(row.get(field), field)
+            if value <= 0:
+                raise EmotionEtfBacktestError(f"正式日线{field}必须为有限正数")
+            normalized[field] = value
+        for field in ("high", "low", "volume", "amount"):
+            if row.get(field) is not None:
+                normalized[field] = _number(row[field], field)
+        if day in bars and bars[day] != normalized:
+            raise EmotionEtfBacktestError(f"正式日线{day}重复记录不一致")
+        bars[day] = normalized
     emotions: dict[str, dict[str, Any]] = {}
     for row in emotion_rows:
-        day = _day(row.get("trade_date") or row.get("date"))
-        if not day or str(row.get("method") or "pxydata_breadth_v1") != "pxydata_breadth_v1":
+        if str(row.get("method") or "pxydata_breadth_v1") != "pxydata_breadth_v1":
             continue
         if row.get("trade_date_ok") is not True or row.get("coverage_ok") is not True:
             continue
-        available_at = str(row.get("available_at") or "")
-        if available_at and _day(available_at) > day:
-            raise EmotionEtfBacktestError("market_emotion_daily存在未来可用时间")
-        emotions[day] = row
+        day = _trade_day(row)
+        available_at = _available_time(row.get("available_at"))
+        if available_at < _session_time(day, 0):
+            raise EmotionEtfBacktestError("market_emotion_daily可用时间早于所属交易日")
+        normalized_emotion = {
+            "available_at": available_at,
+            "emotion_score": _number(row.get("emotion_score"), "emotion_score"),
+            "emotion_label": str(row.get("emotion_label") or ""),
+        }
+        if day in emotions and emotions[day] != normalized_emotion:
+            raise EmotionEtfBacktestError(f"market_emotion_daily{day}重复记录不一致")
+        emotions[day] = normalized_emotion
     dates = sorted(bars)
     if len(dates) < 2:
         raise EmotionEtfBacktestError("ETF日线交易日少于2天")
     overlap_days = sorted(set(bars) & set(emotions))
     if not overlap_days:
         raise EmotionEtfBacktestError("ETF日线与市场情绪没有重叠交易日")
+    missing_emotion_dates = sorted(set(bars) - set(emotions))
+
+    next_dates = dict(zip(dates, dates[1:]))
+    timeline: list[tuple[datetime, int, str]] = []
+    for day in dates:
+        timeline.extend([(_session_time(day, 9, 30), 0, day), (_session_time(day, 15), 2, day)])
+        emotion = emotions.get(day)
+        if emotion is None:
+            continue
+        available_at = emotion["available_at"]
+        next_day = next_dates.get(day)
+        if next_day and available_at >= _session_time(next_day, 9, 30):
+            raise EmotionEtfBacktestError(f"{day}情绪在目标next-open前不可用，禁止倒填成交")
+        if available_at.date().isoformat() <= dates[-1]:
+            timeline.append((available_at, 1, day))
+    timeline.sort()
 
     cash = float(capital)
     quantity = 0
-    pending: tuple[str, str, float, str] | None = None
+    pending: tuple[str, str, float, str, str] | None = None
     buy_fill: dict[str, Any] | None = None
     orders: list[dict[str, Any]] = []
     deals: list[dict[str, Any]] = []
@@ -145,16 +199,66 @@ def replay_emotion_etf(
     benchmark_curve: list[dict[str, Any]] = []
     first_close = _number(bars[dates[0]].get("close"), "close")
     slip = float(slippage_bps) / 10_000.0
+    visible_scores: dict[str, float] = {}
+    events: list[dict[str, Any]] = []
 
-    for index, day in enumerate(dates):
+    def record(event_type: str, instant: datetime, payload: dict[str, Any]) -> None:
+        timestamp = instant.isoformat()
+        events.append({
+            "event_type": event_type, "event_time": timestamp, "available_at": timestamp,
+            "symbol": wanted if event_type != "sentiment" else None,
+            "payload": dict(payload), "source": "adapter", "source_seq": len(events),
+            # 同刻使用执行顺序，避免类型优先级把后续信号移到成交之前。
+            "priority": 100,
+        })
+
+    # 只在实际可用时产生信号；收盘价格仅进入15:00估值阶段。
+    for instant, phase, day in timeline:
         bar = bars[day]
-        open_price = _number(bar.get("open"), "open")
-        close_price = _number(bar.get("close"), "close")
-        if open_price <= 0 or close_price <= 0:
-            raise EmotionEtfBacktestError("ETF价格必须大于0")
+        if phase == 1:
+            emotion = emotions[day]
+            score = emotion["emotion_score"]
+            visible_scores[day] = score
+            record("sentiment", instant, {
+                "trade_date": day, "available_at": instant.isoformat(),
+                "emotion_score": score, "emotion_label": emotion["emotion_label"],
+                "score": score, "title": f"市场情绪 {emotion['emotion_label']}",
+                "method": "pxydata_breadth_v1", "contract": EMOTION_DATA_CONTRACT,
+            })
+            next_day = next_dates.get(day)
+            if next_day and pending is None:
+                side = "BUY" if quantity == 0 and score < entry_threshold else (
+                    "SELL" if quantity > 0 and score >= exit_threshold else None
+                )
+                if side:
+                    signal_time = instant.isoformat()
+                    pending = (next_day, side, score, day, signal_time)
+                    signals.append({
+                        "signal_date": day, "signal_time": signal_time,
+                        "available_at": signal_time, "fill_date": next_day,
+                        "fill_time": _session_time(next_day, 9, 30).isoformat(),
+                        "side": side, "score": score, "label": emotion["emotion_label"],
+                    })
+                    record("signal", instant, signals[-1])
+            continue
+        if phase == 2:
+            close_price = bar["close"]
+            equity = cash + quantity * close_price
+            record("market_bar", instant, {**bar, "datetime": instant.isoformat()})
+            equity_curve.append({
+                "date": day, "event_time": instant.isoformat(), "value": equity,
+                "cash": cash, "position": quantity, "close": close_price,
+                "emotion_score": visible_scores.get(day),
+            })
+            benchmark_curve.append({"date": day, "value": capital * close_price / first_close})
+            record("account", instant, equity_curve[-1])
+            continue
 
+        order_count = len(orders)
         if pending is not None and pending[0] == day:
-            _, side, signal_score, signal_day = pending
+            _, side, signal_score, signal_day, signal_time = pending
+            open_price = bar["open"]
+            fill_time = instant.isoformat()
             if side == "BUY" and quantity == 0:
                 fill_price = open_price * (1.0 + slip)
                 affordable = max(cash - min_commission, 0.0) / (
@@ -168,6 +272,7 @@ def replay_emotion_etf(
                     quantity = fill_quantity
                     buy_fill = {
                         "fill_date": day,
+                        "fill_time": fill_time,
                         "price": fill_price,
                         "quantity": fill_quantity,
                         "commission": commission,
@@ -176,6 +281,7 @@ def replay_emotion_etf(
                     orders.append({
                         "order_id": f"{wanted}-{day}-BUY",
                         "symbol": wanted, "side": "BUY", "signal_date": signal_day,
+                        "signal_time": signal_time, "fill_time": fill_time,
                         "fill_date": day, "price": fill_price, "quantity": fill_quantity,
                         "commission": commission, "status": "FILLED",
                     })
@@ -191,6 +297,7 @@ def replay_emotion_etf(
                 orders.append({
                     "order_id": f"{wanted}-{day}-SELL",
                     "symbol": wanted, "side": "SELL", "signal_date": signal_day, "fill_date": day,
+                    "signal_time": signal_time, "fill_time": fill_time,
                     "price": fill_price, "quantity": quantity,
                     "commission": commission, "status": "FILLED",
                 })
@@ -198,6 +305,8 @@ def replay_emotion_etf(
                     "symbol": wanted,
                     "entry_date": buy_fill["fill_date"],
                     "exit_date": day,
+                    "entry_time": buy_fill["fill_time"],
+                    "exit_time": fill_time,
                     "quantity": quantity,
                     "entry_price": buy_fill["price"],
                     "exit_price": fill_price,
@@ -212,21 +321,19 @@ def replay_emotion_etf(
                 buy_fill = None
             pending = None
 
-        emotion = emotions.get(day)
-        score = _number(emotion.get("emotion_score"), "emotion_score") if emotion else None
-        label = str(emotion.get("emotion_label") or "") if emotion else ""
-        next_day = dates[index + 1] if index + 1 < len(dates) else None
-        if emotion is not None and next_day and pending is None:
-            if quantity == 0 and score is not None and score < entry_threshold:
-                pending = (next_day, "BUY", score, day)
-                signals.append({"signal_date": day, "fill_date": next_day, "side": "BUY", "score": score, "label": label})
-            elif quantity > 0 and score is not None and score >= exit_threshold:
-                pending = (next_day, "SELL", score, day)
-                signals.append({"signal_date": day, "fill_date": next_day, "side": "SELL", "score": score, "label": label})
-
-        equity = cash + quantity * close_price
-        equity_curve.append({"date": day, "value": equity, "cash": cash, "position": quantity, "close": close_price, "emotion_score": score})
-        benchmark_curve.append({"date": day, "value": capital * close_price / first_close})
+        if len(orders) > order_count:
+            order = orders[-1]
+            record("order", instant, order)
+            record("fill", instant, {**order, "fill_id": f"{order['order_id']}-fill"})
+            record("position", instant, {
+                "symbol": wanted, "quantity": quantity, "cost": buy_fill,
+                "event_time": instant.isoformat(),
+            })
+        record("account", instant, {
+            "date": day, "event_time": instant.isoformat(), "cash": cash,
+            "position": quantity, "mark_price": bar["open"],
+            "value": cash + quantity * bar["open"], "valuation": "open",
+        })
 
     metrics = compute_metrics(equity_curve, deals=deals, benchmark=benchmark_curve)
     drawdowns = drawdown_curve(equity_curve)
@@ -250,9 +357,13 @@ def replay_emotion_etf(
         "deals": deals,
         "signals": signals,
         "position": {"symbol": wanted, "quantity": quantity, "cost": buy_fill},
+        "_replay_events": events,
         "diagnostics": {
             "data_start": dates[0], "data_end": dates[-1], "data_count": len(dates),
             "emotion_days": len(emotions), "emotion_overlap_days": len(overlap_days), "kline_days": len(bars),
+            "missing_emotion_days": len(missing_emotion_dates),
+            "missing_emotion_dates": missing_emotion_dates,
+            "emotion_coverage_complete": not missing_emotion_dates,
             "entry_threshold": entry_threshold, "exit_threshold": exit_threshold,
             "fill_policy": "next_bar_open", "t_plus_one": True,
             "lot_size": lot_size, "min_commission": min_commission,
@@ -274,10 +385,21 @@ def run_emotion_etf_backtest(
     period = dict(task.get("period") or {})
     execution = dict(task.get("execution") or {})
     parameters = dict(task.get("parameters") or {})
-    kline_rows, k_files, k_size = _manifest_rows(data_root=data_root, manifest=manifest, dataset_name="etf_snapshots")
+    data = dict(task.get("data") or {})
+    selection = dict(data.get("selection") or {})
+    snapshot = dict(data.get("snapshot") or {})
+    requested = set(selection.get("datasets") or [item["name"] for item in snapshot.get("datasets") or []])
+    manifest_names = {item.get("name") for item in manifest.get("datasets") or []}
+    if "etf_snapshots" in requested or "etf_snapshots" in manifest_names:
+        raise EmotionEtfBacktestError("unsupported: etf_snapshots不是正式日线，请新建kline_etf_daily任务；禁止混用价格源")
+    if "kline_daily" in requested or "kline_daily" in manifest_names:
+        raise EmotionEtfBacktestError("禁止混用股票kline_daily与ETF价格源")
+    if "kline_etf_daily" not in manifest_names:
+        raise EmotionEtfBacktestError("执行快照缺少正式日线kline_etf_daily")
+    kline_rows, k_files, k_size = _manifest_rows(data_root=data_root, manifest=manifest, dataset_name="kline_etf_daily")
     emotion_rows, e_files, e_size = _manifest_rows(data_root=data_root, manifest=manifest, dataset_name="market_emotion_daily")
     start, end = _day(period.get("start")), _day(period.get("end"))
-    kline_rows = [row for row in kline_rows if start <= _day(row.get("date") or row.get("trade_date") or row.get("snapshot_date") or row.get("data_date")) <= end]
+    kline_rows = [row for row in kline_rows if str(row.get("symbol") or "").strip().upper() == symbols[0].strip().upper() and start <= _trade_day(row) <= end]
     emotion_rows = [row for row in emotion_rows if start <= _day(row.get("trade_date") or row.get("date")) <= end]
     raw = replay_emotion_etf(
         kline_rows, emotion_rows, symbol=symbols[0],
@@ -289,21 +411,17 @@ def run_emotion_etf_backtest(
         lot_size=int(parameters.get("lot_size", 100)),
         min_commission=float(parameters.get("min_commission", 5)),
     )
-    from .replay import build_replay_audit
-    snapshot = dict((task.get("data") or {}).get("snapshot") or {})
-    events = [
-        {"event_type": "signal", "event_time": item["signal_date"], "symbol": symbols[0], "payload": item, "source_seq": i}
-        for i, item in enumerate(raw["signals"])
-    ]
-    events.extend(
-        {"event_type": "order", "event_time": item["fill_date"], "symbol": symbols[0], "payload": item, "source_seq": len(events) + i}
-        for i, item in enumerate(raw["orders"])
-    )
-    events.extend(
-        {"event_type": "account", "event_time": item["date"], "payload": item, "source_seq": len(events) + i}
-        for i, item in enumerate(raw["equity_curve"])
-    )
+    from .replay import ReplayAudit
+    events = raw["_replay_events"]
+    audit = ReplayAudit(run_id=task_id, snapshot_id=str(snapshot.get("snapshot_id") or task_id))
+    for event in events:
+        audit.record(event["event_type"], event["payload"])
     warnings: list[str] = []
+    if raw["diagnostics"]["missing_emotion_days"]:
+        warnings.append(
+            f"市场情绪缺失或质量不通过{raw['diagnostics']['missing_emotion_days']}个ETF交易日；"
+            "缺失日不生成新信号，已有待成交不受影响。"
+        )
     if len(raw["deals"]) < 10:
         warnings.append("完整交易轮次少于10，结论属于小样本。")
     if abs(float(raw["metrics"]["max_drawdown"])) > 0.15:
@@ -318,7 +436,11 @@ def run_emotion_etf_backtest(
         "run": {"universe": universe, "period": period, "execution": execution, "parameters": parameters},
         "metrics": raw["metrics"],
         "curves": {"equity": raw["equity_curve"], "drawdown": raw["drawdown_curve"], "benchmark": raw["benchmark_curve"]},
-        "market": {"signals": raw["signals"]},
+        "market": {
+            "signals": raw["signals"],
+            "bars": [event["payload"] for event in events if event["event_type"] == "market_bar"],
+            "sentiment": [event["payload"] for event in events if event["event_type"] == "sentiment"],
+        },
         "orders": raw["orders"],
         "deals": raw["deals"],
         "positions": [raw["position"]] if raw["position"]["quantity"] else [],
@@ -329,10 +451,14 @@ def run_emotion_etf_backtest(
             "snapshot_enforcement": "manifest_bound",
             "data_source_policy": "pxydata_snapshot_only",
             "emotion_contract": EMOTION_DATA_CONTRACT,
+            "price_dataset": "kline_etf_daily",
+            "timezone": "Asia/Shanghai",
+            "execution_model": "precomputed_result_replay",
+            "replay_semantics": "result_replay",
             "warnings": warnings,
         },
         "versions": {"strategy_source_hash": EMOTION_ETF_STRATEGY_HASH, "snapshot_id": snapshot.get("snapshot_id"), "manifest_sha256": snapshot.get("manifest_sha256")},
-        "replay_audit": build_replay_audit(run_id=task_id, snapshot_id=str(snapshot.get("snapshot_id") or task_id), events=events),
+        "replay_audit": audit.to_dict(),
         "_replay_events": events,
     }
 

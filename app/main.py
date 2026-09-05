@@ -87,7 +87,7 @@ MANIFEST_ENGINE_TYPES = {
 ENGINE_REQUIRED_DATASETS: dict[str, list[str]] = {
     "vnpy_cta": [],
     "a_share_portfolio": ["kline_daily"],
-    "a_share_emotion_etf": ["etf_snapshots", "market_emotion_daily"],
+    "a_share_emotion_etf": ["kline_etf_daily", "market_emotion_daily"],
     "factor_matrix": ["kline_daily", "factor_matrix_daily"],
     "event_sentiment": ["kline_daily", "factor_matrix_daily", "events"],
     "microstructure": ["market_ticks"],
@@ -677,9 +677,9 @@ def create_app(
                     "intervals": ["1d"],
                     "snapshot_enforcement": "manifest_bound",
                     "replay_modes": ["bar"],
-                    "event_domains": ["market_bar", "market_emotion", "signal", "order", "fill", "position", "account"],
+                    "event_domains": ["market_bar", "sentiment", "signal", "order", "fill", "position", "account"],
                     "execution_stream": "complete_ordered_audited",
-                    "data_contracts": ["pxydata.etf_snapshots.v1", EMOTION_DATA_CONTRACT],
+                    "data_contracts": ["pxydata.kline_etf_daily.v1", EMOTION_DATA_CONTRACT],
                     "strategies": [{
                         "id": EMOTION_ETF_STRATEGY_ID,
                         "name": "ETF情绪极值C（冰点买、过热卖）",
@@ -1023,6 +1023,17 @@ def create_app(
             body.validate_contract()
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if body.engine_type == "a_share_emotion_etf":
+            price_datasets = (
+                body.data.selection.datasets
+                if body.data.selection is not None
+                else [item.name for item in body.data.snapshot.datasets]
+            )
+            if "etf_snapshots" in price_datasets:
+                raise HTTPException(
+                    status_code=422,
+                    detail="unsupported: 新ETF任务不支持etf_snapshots，请新建kline_etf_daily正式日线任务",
+                )
         a_share_catalog: dict = {}
         if body.engine_type in AI_CAPABLE_ENGINE_TYPES and daa_adapter.configured:
             try:

@@ -18,6 +18,7 @@ from app.daa_client import (
     _validate_capabilities,
 )
 from app.main import (
+    ENGINE_REQUIRED_DATASETS,
     _bind_factor_set_to_manifest,
     _data_requirement_payload,
     _snapshot_date_range,
@@ -1007,8 +1008,9 @@ def test_v2_missing_selection_creates_waiting_task_and_requirement(tmp_path: Pat
 
 @pytest.mark.parametrize("symbol", ["159819.SZ", "510300.SH"])
 @pytest.mark.parametrize("quality_policy", ["require_pass", "allow_unverified"])
+@pytest.mark.parametrize("price_dataset", ["kline_etf_daily", "etf_snapshots"])
 def test_emotion_etf_data_requirement_identity(
-    symbol: str, quality_policy: str
+    symbol: str, quality_policy: str, price_dataset: str
 ) -> None:
     payload = _a_share_payload()
     payload.update({
@@ -1024,7 +1026,7 @@ def test_emotion_etf_data_requirement_identity(
     })
     payload["execution"].update({"t_plus_one": True, "stamp_tax_bps": 0})
     payload["data"]["selection"].update({
-        "datasets": ["etf_snapshots", "market_emotion_daily"],
+        "datasets": [price_dataset, "market_emotion_daily"],
         "quality_policy": quality_policy,
     })
     body = SubmitBacktestRequestV2.model_validate(payload)
@@ -1038,7 +1040,7 @@ def test_emotion_etf_data_requirement_identity(
         "frequency": "1d", "market": "cn_equity",
     }
     assert requirement["datasets"] == [
-        {**common, "name": "etf_snapshots", "symbols": [symbol], "pit_required": False},
+        {**common, "name": price_dataset, "symbols": [symbol], "pit_required": False},
         {**common, "name": "market_emotion_daily", "symbols": [], "pit_required": True},
     ]
     assert requirement["quality_policy"] == quality_policy
@@ -1071,6 +1073,65 @@ def test_data_requirement_preserves_other_engine_identity(
         assert dataset["symbols"] == body.universe.symbols
         assert dataset["pit_required"] == (dataset["name"] in pit_datasets)
     assert requirement["quality_policy"] == body.data.selection.quality_policy
+
+
+def test_etf_capabilities_recommend_isolated_daily_prices(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    manager = StoreOnlyManager(TaskStore(settings.database_path))
+    app = create_app(settings, manager, FakeSnapshotClient(_snapshot()))
+    with TestClient(app) as client:
+        response = client.get("/api/v2/capabilities", headers=_headers())
+    assert response.status_code == 200
+    engine = next(item for item in response.json()["engines"] if item["id"] == "a_share_emotion_etf")
+    assert ENGINE_REQUIRED_DATASETS["a_share_emotion_etf"] == ["kline_etf_daily", "market_emotion_daily"]
+    assert engine["data_contracts"] == ["pxydata.kline_etf_daily.v1", "pxydata.market_emotion_daily.v1"]
+    assert set(engine["event_domains"]) == {"market_bar", "sentiment", "signal", "order", "fill", "position", "account"}
+
+
+@pytest.mark.parametrize("data_choice", ["selection", "snapshot"])
+def test_new_etf_task_rejects_legacy_prices_before_any_data_or_queue_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, data_choice: str
+) -> None:
+    payload = _a_share_payload()
+    payload.update({
+        "engine_type": "a_share_emotion_etf",
+        "strategy": {
+            "id": EMOTION_ETF_STRATEGY_ID, "version": "builtin-v1",
+            "source_hash": EMOTION_ETF_STRATEGY_HASH, "entrypoint": EMOTION_ETF_STRATEGY_ID,
+        },
+        "universe": {"symbols": ["159819.SZ"]},
+        "parameters": {},
+    })
+    payload["execution"].update({"t_plus_one": True, "stamp_tax_bps": 0})
+    payload["data"]["selection"]["datasets"] = ["etf_snapshots", "market_emotion_daily"]
+    if data_choice == "snapshot":
+        snapshot = _a_share_snapshot().model_dump(mode="json")
+        dataset = snapshot["datasets"][0]
+        snapshot["datasets"] = [
+            {**dataset, "name": name, "contract_id": f"pxydata.{name}.v1"}
+            for name in ("etf_snapshots", "market_emotion_daily")
+        ]
+        payload["data"] = {"snapshot": snapshot}
+    original = SubmitBacktestRequestV2.model_validate(payload).model_dump(mode="json")
+    settings = _settings(tmp_path)
+    manager = StoreOnlyManager(TaskStore(settings.database_path))
+    snapshots = FakeSnapshotClient(_snapshot())
+
+    async def forbidden_operation(*args, **kwargs):
+        pytest.fail("旧价格源新提交必须在快照、数据需求及队列操作前拒绝")
+
+    for method in ("submit", "register_data_requirement"):
+        monkeypatch.setattr(manager, method, forbidden_operation)
+    for method in ("create_snapshot", "resolve_snapshot", "verify_snapshot"):
+        monkeypatch.setattr(snapshots, method, forbidden_operation)
+    app = create_app(settings, manager, snapshots)
+    with TestClient(app) as client:
+        response = client.post("/api/v2/tasks", json=payload, headers=_headers())
+    assert response.status_code == 422
+    assert "unsupported" in response.json()["detail"]
+    assert "kline_etf_daily" in response.json()["detail"]
+    assert manager.store.list_tasks("user-a") == []
+    assert SubmitBacktestRequestV2.model_validate(payload).model_dump(mode="json") == original
 
 
 def test_ready_factor_bundle_restores_execution_and_input_snapshot_binding() -> None:

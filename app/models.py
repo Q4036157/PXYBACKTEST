@@ -566,9 +566,11 @@ class SubmitBacktestRequestV2(BaseModel):
             if self.data.selection is not None
             else [item.name for item in self.data.snapshot.datasets]  # type: ignore[union-attr]
         )
-        missing = {"etf_snapshots", "market_emotion_daily"} - set(datasets)
-        if missing:
-            raise ValueError(f"情绪ETF数据快照缺少: {', '.join(sorted(missing))}")
+        if "market_emotion_daily" not in datasets:
+            raise ValueError("情绪ETF数据快照缺少: market_emotion_daily")
+        price_datasets = {"kline_etf_daily", "etf_snapshots"} & set(datasets)
+        if len(price_datasets) != 1 or "kline_daily" in datasets:
+            raise ValueError("情绪ETF必须选择且只能选择一种价格源: kline_etf_daily或etf_snapshots")
         entry = float(self.parameters.get("entry_threshold", 30))
         exit_ = float(self.parameters.get("exit_threshold", 80))
         if entry != 30 or exit_ != 80:

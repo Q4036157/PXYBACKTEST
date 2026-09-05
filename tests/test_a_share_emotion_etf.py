@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from app.a_share_emotion_etf import (
     EMOTION_ETF_STRATEGY_HASH,
     EmotionEtfBacktestError,
+    _manifest_rows,
     replay_emotion_etf,
     run_emotion_etf_backtest,
 )
@@ -327,3 +328,89 @@ def test_adapter_reads_verified_formal_daily_parquet(tmp_path):
     assert result["orders"][0]["price"] == 1.1
     assert result["diagnostics"]["price_dataset"] == "kline_etf_daily"
     assert result["diagnostics"]["verified_file_count"] == 2
+
+
+def _partitioned_manifest(tmp_path, rows):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    files = []
+    for index, row in enumerate(rows):
+        path = tmp_path / "date=2026-01-09" / f"part-{index}.parquet"
+        path.parent.mkdir(exist_ok=True)
+        table = pa.Table.from_pylist([row])
+        for field in ("date", "trade_date", "data_date"):
+            if field in row:
+                column = table.schema.get_field_index(field)
+                table = table.set_column(column, field, pa.array([row[field]], type=pa.large_string()))
+        pq.write_table(table, path)
+        files.append({
+            "path": path.relative_to(tmp_path).as_posix(),
+            "size_bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        })
+    return {"datasets": [{"name": "kline_etf_daily", "files": files}]}
+
+
+def test_manifest_large_string_date_reproduces_hive_merge_error(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    expected = [_bar("2026-01-05", 1, 1), _bar("2026-01-06", 1.1, 1.2)]
+    manifest = _partitioned_manifest(tmp_path, expected)
+    files = manifest["datasets"][0]["files"]
+    with pytest.raises(pa.ArrowTypeError, match="Unable to merge.*date.*large_string.*dictionary"):
+        pq.read_table(tmp_path / files[0]["path"])
+    rows, count, size = _manifest_rows(
+        data_root=tmp_path, manifest=manifest, dataset_name="kline_etf_daily",
+    )
+    assert rows == expected
+    assert count == 2
+    assert size == sum(item["size_bytes"] for item in files)
+    assert _replay(rows)["orders"][0]["fill_date"] == "2026-01-06"
+
+
+@pytest.mark.parametrize("date_field", ["data_date", "trade_date", None])
+def test_manifest_does_not_invent_date_from_parent_partition(tmp_path, date_field):
+    expected = [_bar("2026-01-05", 1, 1), _bar("2026-01-06", 1.1, 1.2)]
+    for row in expected:
+        day = row.pop("date")
+        if date_field:
+            row[date_field] = day
+    manifest = _partitioned_manifest(tmp_path, expected)
+    rows, _, _ = _manifest_rows(
+        data_root=tmp_path, manifest=manifest, dataset_name="kline_etf_daily",
+    )
+    assert rows == expected
+    assert all("date" not in row for row in rows)
+    if date_field:
+        assert _replay(rows)["orders"][0]["fill_date"] == "2026-01-06"
+    else:
+        with pytest.raises(EmotionEtfBacktestError, match="有效交易日期"):
+            _replay(rows)
+
+
+@pytest.mark.parametrize("invalid, message", [
+    ("root", "越出数据根目录"),
+    ("size", "大小不一致"),
+    ("hash", "SHA256不一致"),
+])
+def test_manifest_checks_integrity_before_opening_parquet(tmp_path, monkeypatch, invalid, message):
+    import pyarrow.parquet as pq
+
+    manifest = _partitioned_manifest(tmp_path, [_bar("2026-01-05", 1, 1)])
+    record = manifest["datasets"][0]["files"][0]
+    if invalid == "root":
+        record["path"] = "../outside.parquet"
+    elif invalid == "size":
+        record["size_bytes"] += 1
+    else:
+        record["sha256"] = "0" * 64
+
+    def unexpected_read(*args, **kwargs):
+        pytest.fail("安全校验失败前不应读取Parquet")
+
+    monkeypatch.setattr(pq, "ParquetFile", unexpected_read)
+    monkeypatch.setattr(pq, "read_table", unexpected_read)
+    with pytest.raises(EmotionEtfBacktestError, match=message):
+        _manifest_rows(data_root=tmp_path, manifest=manifest, dataset_name="kline_etf_daily")

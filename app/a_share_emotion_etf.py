@@ -69,7 +69,7 @@ def _manifest_rows(
             raise EmotionEtfBacktestError(f"{dataset_name}清单文件大小不一致")
         if _sha256_file(path) != str(record.get("sha256") or "").lower():
             raise EmotionEtfBacktestError(f"{dataset_name}清单文件SHA256不一致")
-        rows.extend(parquet.read_table(path).to_pylist())
+        rows.extend(parquet.ParquetFile(path).read().to_pylist())
         verified_size += expected_size
         verified_files += 1
     if not rows:

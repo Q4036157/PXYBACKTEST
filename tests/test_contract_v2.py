@@ -821,6 +821,11 @@ def test_capabilities_publish_versioned_recommended_defaults(tmp_path: Path) -> 
     assert engines["deep_learning"]["category"] == "learning"
     assert engines["deep_learning"]["frontend_ready"] is True
     assert "submit_ready" in engines["deep_learning"]["availability"]
+    assert engines["deep_learning"]["strategies"][0]["id"] == "temporal_ml_rank_v1"
+    assert engines["deep_learning"]["strategies"][0]["parameters"][3] == {
+        "id": "seq_len",
+        "default": 20,
+    }
     assert engines["ml_factor"]["frontend_ready"] is True
     assert engines["lighter_microstructure"]["frontend_ready"] is True
     assert engines["mt5_native"]["frontend_ready"] is True

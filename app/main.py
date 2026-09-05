@@ -800,6 +800,26 @@ def create_app(
                     "models": [item for item in learning_runtime_capabilities()["models"] if item in {"lstm", "transformer", "transformer_seq", "ensemble"}],
                     "research_adapters": ["qlib", "rd-agent"],
                     "execution_mode": "offline_train_then_signal_only",
+                    "strategies": [
+                        {
+                            "id": "temporal_ml_rank_v1",
+                            "name": "时间序列深度学习横截面排序",
+                            "version": "builtin-v1",
+                            "source_hash": ML_STRATEGY_HASH,
+                            "entrypoint": "temporal_ml_rank_v1",
+                            "parameters": [
+                                {"id": "feature_columns", "required": True},
+                                {"id": "label_column", "default": "forward_return_5d"},
+                                {"id": "task_type", "choices": ["binary", "ranking", "regression"]},
+                                {"id": "seq_len", "default": 20},
+                                {"id": "train_days", "default": 252},
+                                {"id": "test_days", "default": 63},
+                                {"id": "purge_days", "default": 5},
+                                {"id": "embargo_days", "default": 1},
+                                {"id": "epochs", "default": 20},
+                            ],
+                        }
+                    ],
                 },
                 {
                     "id": "lighter_microstructure",

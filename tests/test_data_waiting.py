@@ -6,6 +6,7 @@ from pathlib import Path
 from app.config import Settings
 from app.main import _data_requirement_payload
 from app.manager import (
+    DATA_REQUIREMENT_STATUS_POLL_DELAYS_SECONDS,
     MAX_CONCURRENT_DATA_REQUIREMENTS,
     MAX_DATA_REQUIREMENTS_PER_CYCLE,
     TaskManager,
@@ -437,3 +438,53 @@ def test_data_polling_has_per_cycle_and_concurrency_bounds(tmp_path: Path) -> No
     client = asyncio.run(scenario())
     assert client.create_calls == MAX_DATA_REQUIREMENTS_PER_CYCLE
     assert client.max_active <= MAX_CONCURRENT_DATA_REQUIREMENTS
+
+
+def test_unchanged_requirement_status_uses_bounded_backoff(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = _settings(tmp_path)
+    store = TaskStore(settings.database_path)
+    manager = TaskManager(settings, store)
+    body = _body()
+    receipt = asyncio.run(
+        manager.submit(
+            user_id="user-a",
+            source_node="204",
+            request={"_task_contract": body.model_dump(mode="json")},
+            initial_status="waiting_for_data",
+        )
+    )
+    client = RequirementClient(_snapshot())
+    manager.configure_data_waiting(
+        client,
+        lambda *_: None,  # type: ignore[arg-type]
+        lambda request, task_id: _data_requirement_payload(
+            SubmitBacktestRequestV2.model_validate(request["_task_contract"]),
+            task_id,
+        ),
+    )
+    clock = [1000.0]
+    monkeypatch.setattr("app.manager.time.time", lambda: clock[0])
+    asyncio.run(
+        manager.register_data_requirement(
+            receipt.task_id, _data_requirement_payload(body, receipt.task_id)
+        )
+    )
+    client.bind(store, receipt.task_id)
+
+    for index, delay in enumerate(DATA_REQUIREMENT_STATUS_POLL_DELAYS_SECONDS, start=1):
+        task = store.waiting_tasks()[0]
+        asyncio.run(manager._poll_data_requirement(task))
+        current = store.get_task("user-a", receipt.task_id)["data_requirement"]
+        assert current["status_poll_count"] == index
+        assert current["next_poll_at"] == clock[0] + delay
+        calls = client.get_calls
+        asyncio.run(manager._poll_data_requirement(store.waiting_tasks()[0]))
+        assert client.get_calls == calls
+        clock[0] = current["next_poll_at"]
+
+    asyncio.run(manager._poll_data_requirement(store.waiting_tasks()[0]))
+    capped = store.get_task("user-a", receipt.task_id)["data_requirement"]
+    assert capped["status_poll_count"] == len(DATA_REQUIREMENT_STATUS_POLL_DELAYS_SECONDS) + 1
+    assert capped["next_poll_at"] == clock[0] + 60.0

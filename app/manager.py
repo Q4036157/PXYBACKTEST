@@ -32,6 +32,7 @@ MAX_DATA_REQUIREMENTS_PER_CYCLE = 20
 MAX_CONCURRENT_DATA_REQUIREMENTS = 4
 DATA_REQUIREMENT_POLL_TIMEOUT_SECONDS = 35.0
 DATA_REQUIREMENT_RETRY_MAX_SECONDS = 60.0
+DATA_REQUIREMENT_STATUS_POLL_DELAYS_SECONDS = (2.0, 5.0, 10.0, 30.0, 60.0)
 logger = logging.getLogger("backtest_service")
 
 
@@ -486,6 +487,7 @@ class TaskManager:
                         "registration_confirmed",
                         "last_error",
                         "retry_count",
+                        "status_poll_count",
                         "next_poll_at",
                     }
                 }
@@ -537,6 +539,7 @@ class TaskManager:
                     "last_error": "PXYDATA 未找到已登记需求，准备重新登记",
                     "retry_count": 0,
                     "next_poll_at": 0,
+                    "status_poll_count": 0,
                 }
                 await asyncio.to_thread(
                     self.store.append_waiting_event,
@@ -559,17 +562,35 @@ class TaskManager:
                 return {**current, "status": "failed", "failure_reason": str(exc)}
             await self._record_data_requirement_error(task_id, current, str(exc))
             return current
+        previous_status = str(current.get("status") or "pending")
+        current_status = str(manifest.status)
+        status_changed = previous_status != current_status
+        newly_registered = not bool(current.get("registration_confirmed"))
+        if current_status in {"ready", "failed"} or status_changed or newly_registered:
+            status_poll_count = 0
+            next_poll_at = 0.0
+        else:
+            status_poll_count = int(current.get("status_poll_count") or 0) + 1
+            delay = DATA_REQUIREMENT_STATUS_POLL_DELAYS_SECONDS[
+                min(
+                    status_poll_count - 1,
+                    len(DATA_REQUIREMENT_STATUS_POLL_DELAYS_SECONDS) - 1,
+                )
+            ]
+            next_poll_at = time.time() + delay
         payload = {
             **manifest.model_dump(mode="json"),
             "registration_confirmed": True,
             "request": request,
             "retry_count": 0,
-            "next_poll_at": 0,
+            "status_poll_count": status_poll_count,
+            "next_poll_at": next_poll_at,
         }
         if (
-            current.get("status") != payload["status"]
-            or not current.get("registration_confirmed")
+            status_changed
+            or newly_registered
             or bool(current.get("last_error"))
+            or current_status not in {"ready", "failed"}
         ):
             await asyncio.to_thread(
                 self.store.append_waiting_event,

@@ -7,7 +7,7 @@ import json
 import time
 import zipfile
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import HTMLResponse, Response
@@ -194,7 +194,7 @@ def _data_requirement_payload(
         "contract_version": "pxydata.data-requirement.v1",
         "consumer_task_id": task_id,
         "request_fingerprint": request_fingerprint,
-        "decision_time": body.data.selection.decision_time,
+        "decision_time": _canonical_decision_time(body.data.selection.decision_time),
         "datasets": datasets,
         "quality_policy": body.data.selection.quality_policy,
         "snapshot_kind": (
@@ -216,6 +216,10 @@ def _waiting_worker_request(body: SubmitBacktestRequestV2) -> dict[str, object]:
         "execution_mode": body.execution.execution_mode,
         "_task_contract": body.model_dump(mode="json"),
     }
+
+
+def _canonical_decision_time(value: str) -> str:
+    return datetime.fromisoformat(value).isoformat(timespec="seconds")
 
 
 def _validate_waiting_snapshot_manifest(
@@ -240,16 +244,25 @@ def _validate_waiting_snapshot_manifest(
     }
     if actual_symbols != expected_symbols:
         raise SnapshotProviderError("就绪快照标的范围与需求不一致", status_code=409)
-    requirement_decision_time = requirement.decision_time
+    body_decision_time = _canonical_decision_time(body.data.selection.decision_time)
+    requirement_decision_time = (
+        _canonical_decision_time(requirement.decision_time)
+        if requirement.decision_time is not None
+        else None
+    )
     if (
         requirement_decision_time is not None
-        and requirement_decision_time != body.data.selection.decision_time
+        and requirement_decision_time != body_decision_time
     ):
         raise SnapshotProviderError("数据需求决策时点与原始请求不一致", status_code=409)
     expected_decision_time = (
         requirement_decision_time or f"{end_date}T23:59:59+08:00"
     )
-    if str(selection.get("decision_time") or "") != expected_decision_time:
+    snapshot_decision_time = str(selection.get("decision_time") or "")
+    if (
+        not snapshot_decision_time
+        or _canonical_decision_time(snapshot_decision_time) != expected_decision_time
+    ):
         raise SnapshotProviderError("就绪快照决策时点与需求不一致", status_code=409)
     expected_datasets = (
         {"kline_daily", "factor_matrix_daily"}

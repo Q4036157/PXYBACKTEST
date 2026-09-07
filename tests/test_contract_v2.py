@@ -1035,6 +1035,7 @@ def test_emotion_etf_data_requirement_identity(
     payload["execution"].update({"t_plus_one": True, "stamp_tax_bps": 0})
     payload["data"]["selection"].update({
         "datasets": [price_dataset, "market_emotion_daily"],
+        "decision_time": "2026-08-02T15:00:00.123+08:00",
         "quality_policy": quality_policy,
     })
     body = SubmitBacktestRequestV2.model_validate(payload)
@@ -1053,7 +1054,7 @@ def test_emotion_etf_data_requirement_identity(
     ]
     assert requirement["quality_policy"] == quality_policy
     assert requirement["snapshot_kind"] == "snapshot"
-    assert requirement["decision_time"] == body.data.selection.decision_time
+    assert requirement["decision_time"] == "2026-08-02T15:00:00+08:00"
     fingerprint = hashlib.sha256(
         json.dumps(original, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()

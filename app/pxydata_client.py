@@ -31,6 +31,7 @@ class DataRequirementManifestV1(BaseModel):
     contract_version: Literal["pxydata.data-requirement.v1"]
     consumer_task_id: str
     request_fingerprint: str
+    decision_time: str | None = None
     datasets: list[dict[str, Any]] = Field(min_length=1)
     quality_policy: Literal["require_pass", "allow_warn", "allow_unverified"]
     snapshot_kind: Literal["snapshot", "factor_bundle"] = "snapshot"
@@ -384,6 +385,10 @@ def _validate_data_requirement(
             expected.get("request_fingerprint") or ""
         ):
             raise SnapshotProviderError("PXYDATA 数据需求指纹不一致", status_code=409)
+        if (manifest.decision_time or None) != (
+            expected.get("decision_time") or None
+        ):
+            raise SnapshotProviderError("PXYDATA 数据需求决策时点不一致", status_code=409)
         if manifest.quality_policy != str(expected.get("quality_policy") or ""):
             raise SnapshotProviderError("PXYDATA 数据需求质量策略不一致", status_code=409)
         if manifest.snapshot_kind != str(expected.get("snapshot_kind") or "snapshot"):

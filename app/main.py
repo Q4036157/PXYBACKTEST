@@ -194,6 +194,7 @@ def _data_requirement_payload(
         "contract_version": "pxydata.data-requirement.v1",
         "consumer_task_id": task_id,
         "request_fingerprint": request_fingerprint,
+        "decision_time": body.data.selection.decision_time,
         "datasets": datasets,
         "quality_policy": body.data.selection.quality_policy,
         "snapshot_kind": (
@@ -239,7 +240,16 @@ def _validate_waiting_snapshot_manifest(
     }
     if actual_symbols != expected_symbols:
         raise SnapshotProviderError("就绪快照标的范围与需求不一致", status_code=409)
-    if str(selection.get("decision_time") or "") != body.data.selection.decision_time:
+    requirement_decision_time = requirement.decision_time
+    if (
+        requirement_decision_time is not None
+        and requirement_decision_time != body.data.selection.decision_time
+    ):
+        raise SnapshotProviderError("数据需求决策时点与原始请求不一致", status_code=409)
+    expected_decision_time = (
+        requirement_decision_time or f"{end_date}T23:59:59+08:00"
+    )
+    if str(selection.get("decision_time") or "") != expected_decision_time:
         raise SnapshotProviderError("就绪快照决策时点与需求不一致", status_code=409)
     expected_datasets = (
         {"kline_daily", "factor_matrix_daily"}

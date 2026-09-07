@@ -1053,6 +1053,7 @@ def test_emotion_etf_data_requirement_identity(
     ]
     assert requirement["quality_policy"] == quality_policy
     assert requirement["snapshot_kind"] == "snapshot"
+    assert requirement["decision_time"] == body.data.selection.decision_time
     fingerprint = hashlib.sha256(
         json.dumps(original, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -1190,6 +1191,53 @@ def test_ready_factor_bundle_restores_execution_and_input_snapshot_binding() -> 
     }
     with pytest.raises(SnapshotProviderError, match="结束日期"):
         _validate_waiting_snapshot_manifest(body, validated, snapshot, drifted)
+
+    drifted_decision_time = {
+        **manifest,
+        "selection": {
+            **manifest["selection"],
+            "decision_time": "2026-09-04T23:59:59+08:00",
+        },
+    }
+    with pytest.raises(SnapshotProviderError, match="决策时点"):
+        _validate_waiting_snapshot_manifest(
+            body, validated, snapshot, drifted_decision_time
+        )
+
+
+def test_ready_legacy_requirement_accepts_documented_end_of_day_fallback() -> None:
+    body = SubmitBacktestRequestV2.model_validate(_payload())
+    requirement_payload = _data_requirement_payload(body, "legacy-waiting-task")
+    requirement_payload.pop("decision_time")
+    snapshot_payload = _snapshot().model_dump(mode="json")
+    snapshot_payload["quality_policy"] = body.data.selection.quality_policy
+    snapshot = DataSnapshotRefV2.model_validate(snapshot_payload)
+    requirement = DataRequirementManifestV1.model_validate(
+        {
+            **requirement_payload,
+            "status": "ready",
+            "failure_reason": "",
+            "snapshot": snapshot.model_dump(mode="json"),
+            "created_at": "2026-09-04T08:00:00+00:00",
+            "updated_at": "2026-09-04T08:01:00+00:00",
+        }
+    )
+    start_date, end_date = _snapshot_date_range(body)
+    manifest = {
+        "selection": {
+            "datasets": body.data.selection.datasets,
+            "start_date": start_date,
+            "end_date": end_date,
+            "symbols": body.universe.symbols,
+            "decision_time": f"{end_date}T23:59:59+08:00",
+            "quality_policy": body.data.selection.quality_policy,
+        },
+        "datasets": [
+            {"name": name} for name in body.data.selection.datasets
+        ],
+    }
+
+    _validate_waiting_snapshot_manifest(body, requirement, snapshot, manifest)
 
 
 def test_result_v2_maps_legacy_vnpy_result_without_inventing_orders() -> None:

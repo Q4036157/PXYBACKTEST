@@ -43,7 +43,7 @@ echo [等待] 正在等待 http://127.0.0.1:3000 ……
 for /L %%I in (1,1,60) do (
     curl.exe -fsS --max-time 1 "http://127.0.0.1:3000/" >nul 2>&1
     if not errorlevel 1 goto :open_page
-    timeout /t 1 /nobreak >nul
+    powershell.exe -NoLogo -NoProfile -Command "Start-Sleep -Seconds 1"
 )
 goto :start_timeout
 

@@ -121,7 +121,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify.ps1
 
 ## CLI 自动回测
 
-安装项目后可用 `python -m app.cli`（或安装脚本注册的 `pxybacktest`）调用与前端相同的任务 API。CLI 不绕过 PXYDATA 快照契约：请求文件应填写 `SubmitBacktestRequestV2`，使用 `data.selection` 时由服务自动创建并绑定数据快照。
+安装项目后可用根目录 `pxybacktest.cmd`、`python -m app.cli`（或安装脚本注册的 `pxybacktest`）调用与前端相同的任务 API。CLI 不绕过 PXYDATA 快照契约：请求文件应填写 `SubmitBacktestRequestV2`，使用 `data.selection` 时由服务自动创建并绑定数据快照。根目录 CMD 同时兼容源码目录和不携带虚拟环境的 E 盘发布目录。
 
 ```powershell
 # 检查工作站服务

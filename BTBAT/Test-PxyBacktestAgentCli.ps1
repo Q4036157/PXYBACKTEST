@@ -4,15 +4,12 @@ param()
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$python = Join-Path $root ".venv\Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
-    throw "PXYBACKTEST Python environment is not installed: $python"
-}
+$cli = Join-Path $root "pxybacktest.cmd"
 
 function Invoke-AgentCommand([string[]]$Arguments, [string]$ExpectedProperty) {
     Push-Location $root
     try {
-        $raw = & $python -X utf8 -m app.cli @Arguments
+        $raw = & $cli @Arguments
     } finally {
         Pop-Location
     }

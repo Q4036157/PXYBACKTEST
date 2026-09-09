@@ -6,6 +6,60 @@ import json
 from app import cli
 
 
+def test_version_and_schema_are_machine_readable_json():
+    version_output = io.StringIO()
+    schema_output = io.StringIO()
+
+    assert cli.main(["--version"], output=version_output) == 0
+    assert cli.main(["--schema"], output=schema_output) == 0
+
+    version = json.loads(version_output.getvalue())
+    schema = json.loads(schema_output.getvalue())
+    assert version == {
+        "program": "pxybacktest",
+        "version": "0.2.0",
+        "contract_version": "pxybacktest.agent-cli.v1",
+    }
+    assert schema["output"]["stdout"] == "json"
+    assert schema["commands"]["status"]["job_id_option"] == "--job-id"
+
+
+def test_status_and_result_accept_job_id_option(monkeypatch):
+    calls = []
+
+    def fake_request(self, method, path, payload=None, *, auth=True):
+        calls.append((method, path))
+        return {"task_id": "task-42", "status": "completed", "result": {"ok": True}}
+
+    monkeypatch.setattr(cli.BacktestApiClient, "request", fake_request)
+    status_output = io.StringIO()
+    result_output = io.StringIO()
+
+    assert cli.main(["--token", "x", "--json", "status", "--job-id", "task-42"], output=status_output) == 0
+    assert cli.main(["--token", "x", "result", "--job-id", "task-42"], output=result_output) == 0
+
+    assert calls == [
+        ("GET", "/api/v1/tasks/task-42"),
+        ("GET", "/api/v1/tasks/task-42"),
+    ]
+    assert json.loads(result_output.getvalue())["result"]["ok"] is True
+
+
+def test_conflicting_task_and_job_ids_fail_without_http_call(monkeypatch, capsys):
+    def unexpected_request(*args, **kwargs):
+        raise AssertionError("HTTP must not be called")
+
+    monkeypatch.setattr(cli.BacktestApiClient, "request", unexpected_request)
+    output = io.StringIO()
+
+    assert cli.main(
+        ["--token", "x", "status", "task-1", "--job-id", "task-2"],
+        output=output,
+    ) == 1
+    assert output.getvalue() == ""
+    assert "不一致" in capsys.readouterr().err
+
+
 def test_submit_chooses_v2_and_reads_request_file(tmp_path, monkeypatch):
     request_file = tmp_path / "request.json"
     request_file.write_text(json.dumps({"schema_version": 2, "engine_type": "vnpy_cta"}), encoding="utf-8")

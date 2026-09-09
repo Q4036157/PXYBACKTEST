@@ -16,10 +16,13 @@ from typing import Any, TextIO
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .version import __version__
+
 
 DEFAULT_BASE_URL = "http://127.0.0.1:3024"
 DEFAULT_TOKEN_FILE = Path(r"C:\ProgramData\PXY\secrets\pxy-backtest-service-token")
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+CLI_CONTRACT = "pxybacktest.agent-cli.v1"
 
 
 class CliError(RuntimeError):
@@ -135,15 +138,51 @@ def _wait(client: BacktestApiClient, task_id: str, poll_seconds: float, timeout_
         time.sleep(poll_seconds)
 
 
+def _task_id(args: argparse.Namespace, *, required: bool) -> str | None:
+    positional = str(getattr(args, "task_id", "") or "").strip()
+    option = str(getattr(args, "job_id", "") or "").strip()
+    if positional and option and positional != option:
+        raise CliError("task-id 与 --job-id 不一致")
+    value = option or positional
+    if required and not value:
+        raise CliError("必须提供 task-id 或 --job-id")
+    return value or None
+
+
+def _cli_schema() -> dict[str, Any]:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "program": "pxybacktest",
+        "version": __version__,
+        "contract_version": CLI_CONTRACT,
+        "output": {"stdout": "json", "stderr": "progress_and_errors", "success_exit_code": 0},
+        "commands": {
+            "health": {"auth": False, "method": "GET", "path": "/health"},
+            "capabilities": {"auth": True, "method": "GET", "path": "/api/v2/capabilities"},
+            "run": {
+                "auth": True,
+                "input": "SubmitBacktestRequest JSON file",
+                "submit_paths": ["/api/v1/tasks", "/api/v2/tasks", "/api/v2/tqsdk/tasks"],
+                "terminal_statuses": sorted(TERMINAL_STATUSES),
+            },
+            "status": {"auth": True, "job_id_option": "--job-id", "path": "/api/v1/tasks/{job_id}"},
+            "result": {"auth": True, "job_id_option": "--job-id", "path": "/api/v1/tasks/{job_id}"},
+        },
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="PXYBACKTEST 自动回测 CLI")
+    parser.add_argument("--version", dest="show_version", action="store_true", help="输出机器可读版本 JSON")
+    parser.add_argument("--schema", dest="show_schema", action="store_true", help="输出 Agent CLI 契约 JSON Schema")
+    parser.add_argument("--json", action="store_true", help="显式要求 JSON 输出；CLI 默认即为 JSON")
     parser.add_argument("--base-url", default=None, help="回测服务地址，默认 http://127.0.0.1:3024")
     parser.add_argument("--token", default=None, help="服务令牌（不建议写入命令历史）")
     parser.add_argument("--token-file", default=None, help="服务令牌文件")
     parser.add_argument("--user-id", default=None, help="用户标识，默认 cli-user")
     parser.add_argument("--source-node", default=None, help="来源节点，默认 cli")
     parser.add_argument("--timeout", type=float, default=30.0, help="单次 HTTP 超时秒数")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("health", help="读取服务健康状态")
     sub.add_parser("capabilities", help="读取引擎能力目录")
@@ -223,8 +262,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="读取任务状态；不指定 task-id 时列出任务")
     status.add_argument("task_id", nargs="?")
+    status.add_argument("--job-id", dest="job_id", default=None)
     result = sub.add_parser("result", help="读取任务结果/执行快照")
-    result.add_argument("task_id")
+    result.add_argument("task_id", nargs="?")
+    result.add_argument("--job-id", dest="job_id", default=None)
     result.add_argument("--save", default=None)
     for name in ("pause", "resume", "cancel"):
         action = sub.add_parser(name, help=f"{name} 任务")
@@ -237,7 +278,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None, *, output: TextIO | None = None) -> int:
     out = output or sys.stdout
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args([item for item in raw_argv if item != "--json"])
+    if args.show_version:
+        _write_json({"program": "pxybacktest", "version": __version__, "contract_version": CLI_CONTRACT}, out)
+        return 0
+    if args.show_schema:
+        _write_json(_cli_schema(), out)
+        return 0
+    if not args.command:
+        parser.error("the following arguments are required: command")
     try:
         if args.command == "accept-result":
             from .parity_acceptance import (
@@ -397,10 +448,12 @@ def main(argv: list[str] | None = None, *, output: TextIO | None = None) -> int:
             _write_json({"total": len(files), "results": results}, out)
             return 0 if all_completed else 2
         elif args.command == "status":
-            path = f"/api/v1/tasks/{args.task_id}" if args.task_id else "/api/v1/tasks"
+            task_id = _task_id(args, required=False)
+            path = f"/api/v1/tasks/{task_id}" if task_id else "/api/v1/tasks"
             _write_json(client.request("GET", path), out)
         elif args.command == "result":
-            task = client.request("GET", f"/api/v1/tasks/{args.task_id}")
+            task_id = _task_id(args, required=True)
+            task = client.request("GET", f"/api/v1/tasks/{task_id}")
             if args.save:
                 Path(args.save).write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             _write_json(task, out)

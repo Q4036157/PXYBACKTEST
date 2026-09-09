@@ -64,6 +64,7 @@ from .models import (
     SubmitBacktestRequestV2,
 )
 from .workflow import WorkflowSpec, validate_workflow
+from .version import __version__
 from .pxydata_client import (
     DataRequirementManifestV1,
     PxyDataSnapshotClient,
@@ -580,7 +581,7 @@ def create_app(
         finally:
             await task_manager.stop()
 
-    app = FastAPI(title="PXYBACKTEST", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="PXYBACKTEST", version=__version__, lifespan=lifespan)
     app.state.settings = configured
     app.state.manager = task_manager
     app.state.snapshot_client = data_snapshots

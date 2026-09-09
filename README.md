@@ -127,6 +127,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify.ps1
 # 检查工作站服务
 python -m app.cli health
 python -m app.cli capabilities
+python -m app.cli --version
+python -m app.cli --schema
 
 # 提交并等待终态；取消任务时仍会返回已保存的执行快照
 python -m app.cli run --request-file .\requests\gold.json --save .\results\gold.json
@@ -135,15 +137,17 @@ python -m app.cli run --request-file .\requests\gold.json --save .\results\gold.
 python -m app.cli batch --request-dir .\requests --continue-on-error
 
 # 任务控制
-python -m app.cli status <task-id>
+python -m app.cli status --job-id <task-id>
 python -m app.cli pause <task-id>
 python -m app.cli resume <task-id>
 python -m app.cli speed <task-id> 80
 python -m app.cli cancel <task-id>
-python -m app.cli result <task-id> --save .\results\<task-id>.json
+python -m app.cli result --job-id <task-id> --save .\results\<task-id>.json
 ```
 
 CLI 默认读取 `C:\ProgramData\PXY\secrets\pxy-backtest-service-token`，也可通过
 `PXYBACKTEST_SERVICE_TOKEN_FILE` 或 `--token-file` 指定；令牌不会写入请求文件。
+全部业务结果写 stdout JSON，等待进度和错误写 stderr，并以退出码区分成功与失败。
+本地工作台启动后可双击 `BTBAT\回测Agent CLI自检.bat` 做版本、Schema、健康和能力目录验收。
 
 WinSW、端口、Caddy 和来源限制由 PXYOPS 管理。本仓库不保存生产令牌或节点地址。

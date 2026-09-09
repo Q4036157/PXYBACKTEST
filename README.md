@@ -68,6 +68,12 @@ Lighter 微观结构面板可直接使用 `ofi_normalized`、`trade_imbalance`�
 LightGBM、LSTM、Transformer 的 OOS 预测按 `ensemble_weights` 加权。没有安装对应
 可选依赖时，服务会在能力接口中标记不可用并拒绝任务，不会悄悄降级。
 
+国内期货 `microstructure` 引擎直接回放 PXYDATA 的 `market_ticks` 快照。
+内置策略支持 `book_depth=1..5`、`flow_window_ticks` 和
+`trade_flow_weight`：多档深度失衡与采集器标注的主动成交推断按权重合成信号，
+订单仍使用下一 Tick 可见的一档数量撮合。原油使用真实挂牌的 `INE.SCxxxx`
+合约；连续合约用于分钟研究，不进入盘口回放。
+
 Lighter 专用 `lighter_microstructure` 引擎会从同一份 manifest 回放主动买/卖、资金费
 和多档盘口事件；若只有 `lighter_funding_history`，也可执行资金费研究回放。盘口重建
 遇到 nonce 断档会丢弃断档后的状态，避免坏盘口进入结果。

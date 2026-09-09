@@ -1,4 +1,4 @@
-"""基于不可变真实 Tick 快照的一档盘口事件回放。"""
+"""基于不可变真实 Tick 快照的盘口与主动成交事件回放。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any
 
 MICROSTRUCTURE_STRATEGY_ID = "order_book_imbalance_v1"
 MICROSTRUCTURE_STRATEGY_HASH = hashlib.sha256(
-    b"pxybacktest.order-book-imbalance.v1"
+    b"pxybacktest.order-book-imbalance.v2-depth-flow"
 ).hexdigest()
 _REQUIRED_COLUMNS = {
     "event_id",
@@ -332,22 +332,44 @@ def replay_order_book_imbalance(
     slippage_bps: float,
     parameters: dict[str, Any],
 ) -> dict[str, Any]:
-    """按下一 Tick 的可见一档深度撮合盘口不平衡信号。"""
+    """使用一至五档深度和主动成交推断信号，按下一 Tick 一档撮合。"""
     threshold = float(parameters.get("entry_threshold", 0.2))
     exit_threshold = float(parameters.get("exit_threshold", 0.0))
     latency_ticks = int(parameters.get("latency_ticks", 1))
     max_hold_ticks = int(parameters.get("max_hold_ticks", 100))
     quantity = float(parameters.get("quantity", 1.0))
     multiplier = float(parameters.get("contract_multiplier", 1.0))
+    book_depth = int(parameters.get("book_depth", 1))
+    flow_window_ticks = int(parameters.get("flow_window_ticks", 20))
+    trade_flow_weight = float(parameters.get("trade_flow_weight", 0.0))
     if not 0 < threshold < 1:
         raise MicrostructureBacktestError("entry_threshold 必须在 (0, 1) 内")
     if not 0 <= exit_threshold < threshold:
         raise MicrostructureBacktestError("exit_threshold 必须在 [0, entry_threshold) 内")
     if latency_ticks < 1 or max_hold_ticks < 1 or quantity <= 0 or multiplier <= 0:
         raise MicrostructureBacktestError("延迟、持有 Tick、数量和合约乘数必须大于 0")
+    if not 1 <= book_depth <= 5:
+        raise MicrostructureBacktestError("book_depth 必须在 1 到 5 之间")
+    if flow_window_ticks < 1:
+        raise MicrostructureBacktestError("flow_window_ticks 必须大于 0")
+    if not 0 <= trade_flow_weight <= 1:
+        raise MicrostructureBacktestError("trade_flow_weight 必须在 [0, 1] 内")
+    if book_depth > 1:
+        required_depth = {
+            f"{side}_volume{level}"
+            for side in ("bid", "ask")
+            for level in range(2, book_depth + 1)
+        }
+        missing_depth = required_depth - set(ticks[0])
+        if missing_depth:
+            raise MicrostructureBacktestError(
+                f"请求 {book_depth} 档信号但 Tick 缺少字段: {', '.join(sorted(missing_depth))}"
+            )
 
     spreads: list[float] = []
     imbalances: list[float] = []
+    depth_imbalances: list[float] = []
+    trade_flow_imbalances: list[float] = []
     orders: list[dict[str, Any]] = []
     deals: list[dict[str, Any]] = []
     slippage_costs: list[float] = []
@@ -358,8 +380,17 @@ def replay_order_book_imbalance(
     pending: dict[str, Any] | None = None
     submitted = 0
     filled = 0
+    recent_flow: list[tuple[float, float]] = []
 
-    def schedule(action: str, index: int, row: dict[str, Any]) -> dict[str, Any]:
+    def schedule(
+        action: str,
+        index: int,
+        row: dict[str, Any],
+        *,
+        depth_imbalance: float,
+        trade_flow_imbalance: float,
+        combined_signal: float,
+    ) -> dict[str, Any]:
         nonlocal submitted
         submitted += 1
         return {
@@ -368,15 +399,33 @@ def replay_order_book_imbalance(
             "execute_index": index + latency_ticks,
             "signal_time": row["exchange_ts"],
             "signal_mid": _mid(row),
+            "depth_imbalance": depth_imbalance,
+            "trade_flow_imbalance": trade_flow_imbalance,
+            "combined_signal": combined_signal,
         }
 
     for index, tick in enumerate(ticks):
         bid = float(tick["bid_price1"])
         ask = float(tick["ask_price1"])
         spread = ask - bid
-        imbalance = _imbalance(tick)
+        depth_imbalance = _depth_imbalance(tick, book_depth)
+        recent_flow.append(_inferred_trade_volume(tick))
+        if len(recent_flow) > flow_window_ticks:
+            recent_flow.pop(0)
+        buy_flow = sum(item[0] for item in recent_flow)
+        sell_flow = sum(item[1] for item in recent_flow)
+        classified_flow = buy_flow + sell_flow
+        trade_flow_imbalance = (
+            (buy_flow - sell_flow) / classified_flow if classified_flow > 0 else 0.0
+        )
+        imbalance = (
+            (1.0 - trade_flow_weight) * depth_imbalance
+            + trade_flow_weight * trade_flow_imbalance
+        )
         spreads.append(spread)
         imbalances.append(imbalance)
+        depth_imbalances.append(depth_imbalance)
+        trade_flow_imbalances.append(trade_flow_imbalance)
 
         if pending is not None and index >= int(pending["execute_index"]):
             action = str(pending["action"])
@@ -406,6 +455,9 @@ def replay_order_book_imbalance(
                     "quantity": quantity,
                     "visible_depth": depth,
                     "latency_ticks": index - int(pending["signal_index"]),
+                    "depth_imbalance": pending["depth_imbalance"],
+                    "trade_flow_imbalance": pending["trade_flow_imbalance"],
+                    "combined_signal": pending["combined_signal"],
                     "status": "filled",
                 }
                 orders.append(order)
@@ -459,6 +511,9 @@ def replay_order_book_imbalance(
                         "fill_time": tick["exchange_ts"],
                         "quantity": quantity,
                         "visible_depth": depth,
+                        "depth_imbalance": pending["depth_imbalance"],
+                        "trade_flow_imbalance": pending["trade_flow_imbalance"],
+                        "combined_signal": pending["combined_signal"],
                         "status": "rejected_depth",
                     }
                 )
@@ -470,15 +525,43 @@ def replay_order_book_imbalance(
             continue
         if position is None:
             if imbalance >= threshold:
-                pending = schedule("enter_long", index, tick)
+                pending = schedule(
+                    "enter_long",
+                    index,
+                    tick,
+                    depth_imbalance=depth_imbalance,
+                    trade_flow_imbalance=trade_flow_imbalance,
+                    combined_signal=imbalance,
+                )
             elif imbalance <= -threshold:
-                pending = schedule("enter_short", index, tick)
+                pending = schedule(
+                    "enter_short",
+                    index,
+                    tick,
+                    depth_imbalance=depth_imbalance,
+                    trade_flow_imbalance=trade_flow_imbalance,
+                    combined_signal=imbalance,
+                )
             continue
         held = index - int(position["entry_index"])
         if position["side"] > 0 and (imbalance <= exit_threshold or held >= max_hold_ticks):
-            pending = schedule("exit_long", index, tick)
+            pending = schedule(
+                "exit_long",
+                index,
+                tick,
+                depth_imbalance=depth_imbalance,
+                trade_flow_imbalance=trade_flow_imbalance,
+                combined_signal=imbalance,
+            )
         elif position["side"] < 0 and (imbalance >= -exit_threshold or held >= max_hold_ticks):
-            pending = schedule("exit_short", index, tick)
+            pending = schedule(
+                "exit_short",
+                index,
+                tick,
+                depth_imbalance=depth_imbalance,
+                trade_flow_imbalance=trade_flow_imbalance,
+                combined_signal=imbalance,
+            )
 
     if position is not None:
         final = ticks[-1]
@@ -544,6 +627,12 @@ def replay_order_book_imbalance(
             "fill_rate": filled / submitted if submitted else 0.0,
             "average_spread": statistics.fmean(spreads),
             "average_abs_imbalance": statistics.fmean(abs(value) for value in imbalances),
+            "average_abs_depth_imbalance": statistics.fmean(
+                abs(value) for value in depth_imbalances
+            ),
+            "average_abs_trade_flow_imbalance": statistics.fmean(
+                abs(value) for value in trade_flow_imbalances
+            ),
             "realized_slippage_bps": (
                 statistics.fmean(slippage_costs) if slippage_costs else 0.0
             ),
@@ -559,6 +648,10 @@ def replay_order_book_imbalance(
             "signals_submitted": submitted,
             "orders_filled": filled,
             "matching_model": "next_tick_visible_l1_ioc",
+            "signal_model": "depth_and_inferred_trade_flow",
+            "book_depth": book_depth,
+            "flow_window_ticks": flow_window_ticks,
+            "trade_flow_weight": trade_flow_weight,
         },
     }
 
@@ -579,11 +672,29 @@ def _mid(row: dict[str, Any]) -> float:
     return (float(row["bid_price1"]) + float(row["ask_price1"])) / 2.0
 
 
-def _imbalance(row: dict[str, Any]) -> float:
-    bid = float(row["bid_volume1"])
-    ask = float(row["ask_volume1"])
+def _depth_imbalance(row: dict[str, Any], levels: int) -> float:
+    bid = sum(
+        max(0.0, float(row.get(f"bid_volume{level}") or 0.0))
+        for level in range(1, levels + 1)
+    )
+    ask = sum(
+        max(0.0, float(row.get(f"ask_volume{level}") or 0.0))
+        for level in range(1, levels + 1)
+    )
     total = bid + ask
     return (bid - ask) / total if total > 0 else 0.0
+
+
+def _inferred_trade_volume(row: dict[str, Any]) -> tuple[float, float]:
+    if row.get("volume_delta_valid") is not True:
+        return (0.0, 0.0)
+    volume = max(0.0, float(row.get("volume_delta") or 0.0))
+    side = str(row.get("aggressor_side") or "").strip().lower()
+    if side == "buy":
+        return (volume, 0.0)
+    if side == "sell":
+        return (0.0, volume)
+    return (0.0, 0.0)
 
 
 def _datetime_ms(value: str) -> int:

@@ -667,6 +667,15 @@ class SubmitBacktestRequestV2(BaseModel):
         exit_threshold = float(self.parameters.get("exit_threshold", 0.0))
         if not 0 < threshold < 1 or not 0 <= exit_threshold < threshold:
             raise ValueError("microstructure 盘口不平衡阈值无效")
+        book_depth = int(self.parameters.get("book_depth", 1))
+        flow_window_ticks = int(self.parameters.get("flow_window_ticks", 20))
+        trade_flow_weight = float(self.parameters.get("trade_flow_weight", 0.0))
+        if not 1 <= book_depth <= 5:
+            raise ValueError("microstructure parameters.book_depth 必须在 1 到 5 之间")
+        if flow_window_ticks < 1:
+            raise ValueError("microstructure parameters.flow_window_ticks 必须大于 0")
+        if not 0 <= trade_flow_weight <= 1:
+            raise ValueError("microstructure parameters.trade_flow_weight 必须在 [0, 1] 内")
 
     def _validate_lighter_contract(self) -> None:
         if len(self.universe.symbols) != 1:

@@ -105,6 +105,56 @@ def test_depth_shortage_rejects_order_without_fake_fill() -> None:
     assert result["orders"][0]["status"] == "rejected_depth"
 
 
+def test_five_level_depth_and_inferred_flow_drive_signal() -> None:
+    ticks = []
+    for index, (bid_depth, ask_depth, side) in enumerate(
+        [(20, 2, "buy"), (20, 2, "buy"), (2, 20, "sell"), (2, 20, "sell")]
+    ):
+        tick = _tick(index, bid_depth=5, ask_depth=5)
+        for level in range(2, 6):
+            tick[f"bid_volume{level}"] = bid_depth
+            tick[f"ask_volume{level}"] = ask_depth
+        tick.update(
+            {
+                "volume_delta": 10,
+                "volume_delta_valid": True,
+                "aggressor_side": side,
+            }
+        )
+        ticks.append(tick)
+
+    result = replay_order_book_imbalance(
+        ticks,
+        capital=100_000,
+        fee_rate=0,
+        slippage_bps=0,
+        parameters={
+            **_payload()["parameters"],
+            "book_depth": 5,
+            "flow_window_ticks": 1,
+            "trade_flow_weight": 0.35,
+        },
+    )
+
+    assert result["metrics"]["n_trades"] == 1
+    assert result["diagnostics"]["book_depth"] == 5
+    assert result["diagnostics"]["signal_model"] == "depth_and_inferred_trade_flow"
+    assert result["orders"][0]["combined_signal"] > 0.2
+
+
+def test_requested_depth_requires_corresponding_tick_fields() -> None:
+    ticks = [_tick(0, bid_depth=10, ask_depth=2), _tick(1, bid_depth=10, ask_depth=2)]
+
+    with pytest.raises(ValueError, match="缺少字段"):
+        replay_order_book_imbalance(
+            ticks,
+            capital=100_000,
+            fee_rate=0,
+            slippage_bps=0,
+            parameters={**_payload()["parameters"], "book_depth": 5},
+        )
+
+
 def test_microstructure_contract_fails_closed_without_real_ticks() -> None:
     payload = _payload()
     payload["data"]["selection"]["datasets"] = ["kline_1m"]

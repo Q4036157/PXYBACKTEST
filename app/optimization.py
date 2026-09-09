@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Callable
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 
@@ -89,10 +89,15 @@ def _run_walk_forward(
         step_days=int(config["step_days"]),
     )
     fold_results: list[dict[str, Any]] = []
-    combined_deals: list[dict[str, Any]] = []
-    combined_equity: list[dict[str, Any]] = []
     base_result: dict[str, Any] | None = None
     compounded = 1.0
+    total_trades = 0
+    initial_capital = float(
+        dict(task.get("execution") or {}).get("capital") or 1_000_000
+    )
+    combined_equity: list[dict[str, Any]] = [
+        {"date": start.isoformat(), "value": initial_capital}
+    ]
     for index, fold in enumerate(folds):
         if cancel_check is not None and cancel_check():
             raise OptimizationError("walk-forward 已取消")
@@ -129,6 +134,11 @@ def _run_walk_forward(
         metrics = dict(oos.get("metrics") or {})
         fold_return = float(metrics.get("total_return") or 0.0)
         compounded *= 1 + fold_return
+        total_trades += int(metrics.get("n_trades") or 0)
+        execution_evidence = {
+            key: copy.deepcopy(oos.get(key) or [])
+            for key in ("orders", "fills", "deals", "positions")
+        }
         fold_results.append(
             {
                 "index": index,
@@ -140,19 +150,26 @@ def _run_walk_forward(
                 "best_params": dict(best.params),
                 "is_values": list(best.values or []),
                 "oos_metrics": metrics,
+                "oos_execution": execution_evidence,
+                "oos_replay_audit": copy.deepcopy(oos.get("replay_audit") or {}),
+                "oos_reproducibility": copy.deepcopy(
+                    oos.get("reproducibility") or {}
+                ),
                 "n_trials": len(trial_rows),
             }
         )
-        combined_deals.extend(list(oos.get("deals") or []))
-        combined_equity.append({"date": fold[3].isoformat(), "value": compounded})
+        combined_equity.append(
+            {"date": fold[3].isoformat(), "value": initial_capital * compounded}
+        )
     valid = [item for item in fold_results if item["status"] == "completed"]
     if not valid or base_result is None:
         raise OptimizationError("walk-forward 没有有效 OOS 折")
     returns = [float(item["oos_metrics"].get("total_return") or 0.0) for item in valid]
     base_result["metrics"] = {
-        **dict(base_result.get("metrics") or {}),
         "total_return": compounded - 1.0,
-        "n_trades": len(combined_deals),
+        "final_equity": initial_capital * compounded,
+        "net_profit": initial_capital * (compounded - 1.0),
+        "n_trades": total_trades,
         "walk_forward_folds": len(valid),
         "walk_forward_consistency": sum(value > 0 for value in returns) / len(returns),
         "walk_forward_average_return": sum(returns) / len(returns),
@@ -161,7 +178,40 @@ def _run_walk_forward(
         "equity": combined_equity,
         "drawdown": _drawdown_curve(combined_equity),
     }
-    base_result["deals"] = combined_deals
+    for key in (
+        "orders",
+        "fills",
+        "deals",
+        "positions",
+        "sentiment",
+        "funding",
+        "_replay_events",
+        "execution_snapshot",
+        "replay_audit",
+        "reproducibility",
+    ):
+        base_result.pop(key, None)
+    base_result["orders"] = []
+    base_result["fills"] = []
+    base_result["deals"] = []
+    base_result["positions"] = []
+    base_result["market"] = {"bars": []}
+    base_result["run"] = {
+        "universe": copy.deepcopy(task.get("universe") or {}),
+        "period": copy.deepcopy(task.get("period") or {}),
+        "execution": copy.deepcopy(task.get("execution") or {}),
+        "parameters": copy.deepcopy(task.get("parameters") or {}),
+        "random_seed": task.get("random_seed"),
+    }
+    diagnostics = dict(base_result.get("diagnostics") or {})
+    diagnostics.update(
+        {
+            "walk_forward_result_scope": "aggregate_only",
+            "fold_execution_scope": "optimization.folds[].oos_execution",
+            "top_level_execution_lists_empty": True,
+        }
+    )
+    base_result["diagnostics"] = diagnostics
     base_result["optimization"] = {
         "method": "walk_forward",
         "objectives": list(config["objectives"]),
@@ -305,7 +355,19 @@ def _task_with_parameters(task: dict[str, Any], values: dict[str, Any]) -> dict[
 def _task_with_period(task: dict[str, Any], start: date, end: date) -> dict[str, Any]:
     candidate = copy.deepcopy(task)
     period = dict(candidate.get("period") or {})
-    timezone_suffix = "+08:00"
+    original_start = str(period.get("start") or "")
+    if original_start.endswith("Z"):
+        timezone_suffix = "Z"
+    else:
+        parsed = datetime.fromisoformat(original_start)
+        offset = parsed.utcoffset()
+        if offset is None:
+            timezone_suffix = ""
+        else:
+            total_minutes = int(offset.total_seconds() // 60)
+            sign = "+" if total_minutes >= 0 else "-"
+            hours, minutes = divmod(abs(total_minutes), 60)
+            timezone_suffix = f"{sign}{hours:02d}:{minutes:02d}"
     period["start"] = f"{start.isoformat()}T00:00:00{timezone_suffix}"
     period["end"] = f"{end.isoformat()}T23:59:59{timezone_suffix}"
     candidate["period"] = period

@@ -331,6 +331,15 @@ def load_manifest_feature_rows(
                 "available_at": available_dt.isoformat(),
                 "decision_time": decision_dt.isoformat(),
             }
+            label_available_raw = (
+                raw.get("label_available_at")
+                or raw.get("label_maturity_at")
+                or raw.get("target_available_at")
+            )
+            if label_available_raw is not None:
+                row["label_available_at"] = _parse_datetime(
+                    label_available_raw
+                ).isoformat()
             try:
                 if label_column in raw and raw[label_column] is not None:
                     row[label_column] = float(raw[label_column])
@@ -381,6 +390,7 @@ def run_learning_backtest(
     if not feature_columns:
         raise LearningBacktestError("学习回测必须指定 parameters.feature_columns")
     label_column = str(parameters.get("label_column") or "label").strip()
+    label_horizon_days = _label_horizon_days(label_column, parameters)
     model_type = str(parameters.get("model_type") or "linear_regression").strip().lower()
     task_type = str(parameters.get("task_type") or "regression").strip().lower()
     if task_type not in {"binary", "ranking", "regression"}:
@@ -407,6 +417,11 @@ def run_learning_backtest(
         end=str(period.get("end") or ""),
         feature_columns=feature_columns,
         label_column=label_column,
+    )
+    _attach_label_maturities(
+        rows,
+        label_column=label_column,
+        horizon_days=label_horizon_days,
     )
     folds = _generate_folds(rows, parameters)
     snapshot = dict((task.get("data") or {}).get("snapshot") or {})
@@ -505,6 +520,10 @@ def run_learning_backtest(
     fee_rate = float(dict(task.get("execution") or {}).get("rate") or 0.0)
     threshold = float(parameters.get("prediction_threshold") or 0.0)
     top_k = int(parameters.get("top_k") or 0)
+    period_end = _parse_datetime(str(period.get("end") or ""))
+    account_label_mode = _account_label_mode(
+        label_column, label_horizon_days, task_type
+    )
     if top_k < 0:
         raise LearningBacktestError("top_k 不能为负数")
     all_daily: list[dict[str, Any]] = (
@@ -595,7 +614,13 @@ def run_learning_backtest(
             continue
         train_cutoff = train_end - timedelta(days=int(parameters.get("purge_days") or 0))
         test_cutoff = test_start + timedelta(days=int(parameters.get("embargo_days") or 0))
-        train = [r for r in rows if _date(r["event_time"]) <= train_cutoff and _date(r["available_at"]) <= train_cutoff]
+        train = [
+            r
+            for r in rows
+            if _date(r["event_time"]) <= train_cutoff
+            and _date(r["available_at"]) <= train_cutoff
+            and _label_matured_by_date(r, train_cutoff)
+        ]
         test = [r for r in rows if test_cutoff <= _date(r["event_time"]) <= test_end]
         if len(train) < 2 or not test:
             continue
@@ -663,12 +688,76 @@ def run_learning_backtest(
                 selected = [item for item in values if item[1] > threshold]
             if top_k:
                 selected = selected[:top_k]
+            matured_values = [
+                item for item in values if _label_matured_by(item[0], period_end)
+            ]
+            prediction_errors = [
+                float(prediction) - float(row[label_column])
+                for row, prediction in matured_values
+            ]
+            daily = {
+                "date": day,
+                "return": None,
+                "n_selected": len(selected),
+                "symbols": [row["symbol"] for row, _ in selected],
+                "prediction_count": len(matured_values),
+                "absolute_error_sum": sum(abs(value) for value in prediction_errors),
+                "squared_error_sum": sum(value * value for value in prediction_errors),
+                "direction_correct_count": sum(
+                    (prediction >= 0) == (float(row[label_column]) >= 0)
+                    for row, prediction in matured_values
+                ),
+            }
+            if matured_values:
+                daily["evaluation_available_at"] = max(
+                    _parse_datetime(row["label_available_at"])
+                    for row, _ in matured_values
+                ).isoformat()
             if not selected:
-                all_daily.append({"date": day, "return": 0.0, "n_selected": 0})
+                if account_label_mode is not None:
+                    daily.update(
+                        {
+                            "return": 0.0,
+                            "realized_at": day,
+                            "account_status": "cash_only",
+                        }
+                    )
+                all_daily.append(daily)
                 continue
-            gross = statistics.fmean(float(row[label_column]) for row, _ in selected)
-            net = gross - fee_rate * 2.0
-            all_daily.append({"date": day, "return": net, "n_selected": len(selected), "symbols": [row["symbol"] for row, _ in selected]})
+            matured_selected = [
+                item for item in selected if _label_matured_by(item[0], period_end)
+            ]
+            daily["selected_matured_count"] = len(matured_selected)
+            daily["selected_pending_count"] = len(selected) - len(matured_selected)
+            if matured_selected:
+                selected_targets = [
+                    float(row[label_column]) for row, _ in matured_selected
+                ]
+                daily["selected_target_sum"] = sum(selected_targets)
+                daily["selected_target_mean"] = statistics.fmean(selected_targets)
+            if account_label_mode is None:
+                daily["account_status"] = "prediction_evaluation_only"
+            elif len(matured_selected) != len(selected):
+                daily["account_status"] = "label_pending"
+            else:
+                maturity_dates = {
+                    _date(row["label_available_at"]).isoformat()
+                    for row, _ in selected
+                }
+                if len(maturity_dates) != 1:
+                    daily["account_status"] = "mixed_label_maturity"
+                else:
+                    gross = statistics.fmean(
+                        float(row[label_column]) for row, _ in selected
+                    )
+                    daily.update(
+                        {
+                            "return": gross - fee_rate * 2.0,
+                            "realized_at": maturity_dates.pop(),
+                            "account_status": "realized",
+                        }
+                    )
+            all_daily.append(daily)
         fold_meta.append({"index": fold_index, "train_end": train_end.isoformat(), "test_start": test_start.isoformat(), "test_end": test_end.isoformat(), "train_rows": len(train), "test_rows": len(test)})
         if model_type in {"linear_regression", "linear_logit"}:
             latest_checkpoint = make_checkpoint(fold_index=fold_index + 1)
@@ -705,48 +794,116 @@ def run_learning_backtest(
     latest_checkpoint = final_checkpoint
     all_daily.sort(key=lambda item: item["date"])
     equity = capital
-    peak = capital
     equity_curve: list[dict[str, Any]] = []
     returns: list[float] = []
-    for point in all_daily:
+    account_points = [point for point in all_daily if point.get("return") is not None]
+    for point in sorted(
+        account_points,
+        key=lambda item: (str(item.get("realized_at") or item["date"]), item["date"]),
+    ):
         daily_return = float(point["return"])
         returns.append(daily_return)
         equity *= 1.0 + daily_return
-        peak = max(peak, equity)
-        equity_curve.append({"date": point["date"], "value": equity})
+        equity_curve.append(
+            {"date": str(point.get("realized_at") or point["date"]), "value": equity}
+        )
     drawdowns = [point["value"] / max(capital, max(p["value"] for p in equity_curve[:i + 1])) - 1.0 for i, point in enumerate(equity_curve)]
     volatility = statistics.pstdev(returns) if len(returns) > 1 else 0.0
+    prediction_count = sum(int(point.get("prediction_count") or 0) for point in all_daily)
+    absolute_error_sum = sum(float(point.get("absolute_error_sum") or 0.0) for point in all_daily)
+    squared_error_sum = sum(float(point.get("squared_error_sum") or 0.0) for point in all_daily)
+    direction_correct_count = sum(
+        int(point.get("direction_correct_count") or 0) for point in all_daily
+    )
+    selected_matured_count = sum(
+        int(point.get("selected_matured_count") or 0) for point in all_daily
+    )
+    selected_target_sum = sum(
+        float(point.get("selected_target_sum") or 0.0) for point in all_daily
+    )
+    pending_label_count = sum(
+        int(point.get("selected_pending_count") or 0) for point in all_daily
+    )
+    account_available = account_label_mode is not None and bool(account_points)
+    warnings = [
+        "学习回测只生成研究信号，不提交真实订单。",
+        "训练检查点不包含不可序列化的外部模型或优化器状态。",
+    ]
+    if account_label_mode is None:
+        warnings.append(
+            "当前标签不能严格构造逐日账户收益；结果仅提供预测评估，不生成账户净值。"
+        )
+    if pending_label_count:
+        warnings.append(
+            f"有 {pending_label_count} 个入选标签在回测截止时尚未成熟，未计入评估或账户净值。"
+        )
     from app.replay import build_replay_audit
 
-    replay_events: list[dict[str, Any]] = [
-        {
-            "event_type": "factor",
-            "event_time": row.get("event_time"),
-            "available_at": row.get("available_at"),
-            "payload": row,
-            "symbol": row.get("symbol"),
-            "source_seq": index,
-        }
-        for index, row in enumerate(rows)
-    ]
-    replay_events.extend(
-        {
-            "event_type": "signal",
-            "event_time": item.get("date"),
-            "payload": item,
-            "source_seq": len(replay_events) + index,
-        }
-        for index, item in enumerate(all_daily)
-    )
-    replay_events.extend(
-        {
-            "event_type": "account",
-            "event_time": item.get("date"),
-            "payload": item,
-            "source_seq": len(replay_events) + index,
-        }
-        for index, item in enumerate(equity_curve)
-    )
+    replay_events: list[dict[str, Any]] = []
+    for row in rows:
+        replay_events.append(
+            {
+                "event_type": "factor",
+                "event_time": row.get("event_time"),
+                "available_at": row.get("available_at"),
+                "payload": {
+                    key: value
+                    for key, value in row.items()
+                    if key not in {label_column, "label_available_at"}
+                },
+                "symbol": row.get("symbol"),
+                "source_seq": len(replay_events),
+            }
+        )
+    for row in rows:
+        if not _label_matured_by(row, period_end):
+            continue
+        replay_events.append(
+            {
+                "event_type": "label",
+                "event_time": row["label_available_at"],
+                "available_at": row["label_available_at"],
+                "payload": {
+                    "source_event_time": row["event_time"],
+                    "label_column": label_column,
+                    "value": row[label_column],
+                },
+                "symbol": row.get("symbol"),
+                "source_seq": len(replay_events),
+            }
+        )
+    for item in all_daily:
+        replay_events.append(
+            {
+                "event_type": "signal",
+                "event_time": item.get("date"),
+                "payload": {
+                    "date": item.get("date"),
+                    "n_selected": item.get("n_selected"),
+                    "symbols": item.get("symbols") or [],
+                },
+                "source_seq": len(replay_events),
+            }
+        )
+        if item.get("evaluation_available_at"):
+            replay_events.append(
+                {
+                    "event_type": "prediction_evaluation",
+                    "event_time": item["evaluation_available_at"],
+                    "available_at": item["evaluation_available_at"],
+                    "payload": item,
+                    "source_seq": len(replay_events),
+                }
+            )
+    for item in equity_curve:
+        replay_events.append(
+            {
+                "event_type": "account",
+                "event_time": item.get("date"),
+                "payload": item,
+                "source_seq": len(replay_events),
+            }
+        )
     return {
         "schema_version": 2,
         "contract_version": "pxybacktest.task-result.v2",
@@ -755,10 +912,52 @@ def run_learning_backtest(
         "strategy": task.get("strategy") or {},
         "data_snapshot": snapshot,
         "run": {"universe": universe, "period": period, "execution": task.get("execution") or {}, "parameters": parameters, "random_seed": random_seed},
-        "metrics": {"total_return": equity / capital - 1.0, "final_equity": equity, "net_profit": equity - capital, "max_drawdown": min(drawdowns, default=0.0), "sharpe": (statistics.fmean(returns) / volatility * math.sqrt(252) if volatility > 0 else 0.0), "hit_rate": sum(value > 0 for value in returns) / len(returns), "n_trades": sum(int(point.get("n_selected") or 0) for point in all_daily), "n_days": len(all_daily)},
-        "curves": {"equity": equity_curve, "drawdown": [{"date": p["date"], "value": drawdowns[i]} for i, p in enumerate(all_daily)]},
+        "metrics": {
+            "total_return": equity / capital - 1.0 if account_available else None,
+            "final_equity": equity if account_available else None,
+            "net_profit": equity - capital if account_available else None,
+            "max_drawdown": min(drawdowns, default=0.0) if account_available else None,
+            "sharpe": (
+                statistics.fmean(returns) / volatility * math.sqrt(252)
+                if account_available and volatility > 0
+                else 0.0
+                if account_available
+                else None
+            ),
+            "hit_rate": (
+                sum(value > 0 for value in returns) / len(returns)
+                if account_available
+                else None
+            ),
+            "n_trades": (
+                sum(int(point.get("n_selected") or 0) for point in account_points)
+                if account_available
+                else 0
+            ),
+            "n_days": len(account_points) if account_available else 0,
+            "prediction_count": prediction_count,
+            "prediction_mae": (
+                absolute_error_sum / prediction_count if prediction_count else None
+            ),
+            "prediction_rmse": (
+                math.sqrt(squared_error_sum / prediction_count)
+                if prediction_count
+                else None
+            ),
+            "prediction_directional_accuracy": (
+                direction_correct_count / prediction_count
+                if prediction_count
+                else None
+            ),
+            "selected_target_mean": (
+                selected_target_sum / selected_matured_count
+                if selected_matured_count
+                else None
+            ),
+        },
+        "curves": {"equity": equity_curve, "drawdown": [{"date": p["date"], "value": drawdowns[i]} for i, p in enumerate(equity_curve)]},
         "deals": [],
-        "diagnostics": {"adapter": f"pxybacktest.{model_type}.v1", "data_source_policy": "pxydata_snapshot_only", "snapshot_enforcement": "manifest_bound", "strictly_reproducible": model_type in {"linear_regression", "linear_logit"}, "feature_columns": feature_columns, "label_column": label_column, "model_type": model_type, "task_type": task_type, "seq_len": int(parameters.get("seq_len") or 1), "purge_days": int(parameters.get("purge_days") or 0), "embargo_days": int(parameters.get("embargo_days") or 0), "folds": fold_meta, "training_checkpoint_scope": ("builtin_linear_epoch" if model_type in {"linear_regression", "linear_logit"} else "completed_fold_only"), "warnings": ["学习回测只生成研究信号，不提交真实订单。", "训练检查点不包含不可序列化的外部模型或优化器状态。"]},
+        "diagnostics": {"adapter": f"pxybacktest.{model_type}.v1", "data_source_policy": "pxydata_snapshot_only", "snapshot_enforcement": "manifest_bound", "strictly_reproducible": model_type in {"linear_regression", "linear_logit"}, "feature_columns": feature_columns, "label_column": label_column, "label_horizon_days": label_horizon_days, "model_type": model_type, "task_type": task_type, "seq_len": int(parameters.get("seq_len") or 1), "purge_days": int(parameters.get("purge_days") or 0), "embargo_days": int(parameters.get("embargo_days") or 0), "folds": fold_meta, "accounting_mode": account_label_mode or "prediction_evaluation_only", "account_equity_available": account_available, "pending_label_count": pending_label_count, "training_checkpoint_scope": ("builtin_linear_epoch" if model_type in {"linear_regression", "linear_logit"} else "completed_fold_only"), "warnings": warnings},
         "training": {
             "complete": True,
             "metrics_emitted": metric_count,
@@ -1111,6 +1310,102 @@ def _parse_datetime(value: Any) -> datetime:
 
 def _date(value: Any) -> date:
     return _parse_datetime(value).date()
+
+
+def _label_horizon_days(
+    label_column: str, parameters: Mapping[str, Any]
+) -> int | None:
+    encoded_match = re.fullmatch(r"forward_return_(\d+)d", label_column)
+    encoded_horizon = int(encoded_match.group(1)) if encoded_match else None
+    if encoded_horizon is not None and encoded_horizon < 1:
+        raise LearningBacktestError("forward_return 标签期限必须至少为 1 天")
+    explicit = parameters.get("label_horizon_days")
+    if explicit is not None:
+        if isinstance(explicit, bool):
+            raise LearningBacktestError("label_horizon_days 必须是正整数")
+        try:
+            horizon = int(explicit)
+        except (TypeError, ValueError) as exc:
+            raise LearningBacktestError("label_horizon_days 必须是正整数") from exc
+        if horizon < 1:
+            raise LearningBacktestError("label_horizon_days 必须是正整数")
+        if encoded_horizon is not None and horizon != encoded_horizon:
+            raise LearningBacktestError(
+                "label_horizon_days 与 forward_return 标签列期限不一致"
+            )
+        return horizon
+    if encoded_horizon is not None:
+        return encoded_horizon
+    if label_column in {"label", "daily_return", "return_1d"}:
+        return 1
+    return None
+
+
+def _account_label_mode(
+    label_column: str, horizon_days: int | None, task_type: str
+) -> str | None:
+    """监督标签只用于训练与评估，不能直接充当模拟账户收益。"""
+
+    _ = (label_column, horizon_days, task_type)
+    return None
+
+
+def _attach_label_maturities(
+    rows: list[dict[str, Any]],
+    *,
+    label_column: str,
+    horizon_days: int | None,
+) -> None:
+    """为监督标签绑定独立成熟时间，避免把特征可得时间误作标签可得时间。"""
+    rows_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        rows_by_symbol.setdefault(str(row.get("symbol") or ""), []).append(row)
+
+    for symbol_rows in rows_by_symbol.values():
+        rows_by_day: dict[date, list[dict[str, Any]]] = {}
+        for row in symbol_rows:
+            rows_by_day.setdefault(_date(row["event_time"]), []).append(row)
+        days = sorted(rows_by_day)
+        day_indexes = {day: index for index, day in enumerate(days)}
+        for row in symbol_rows:
+            if row.get(label_column) is None:
+                continue
+            maturity_raw = row.get("label_available_at")
+            if maturity_raw is None and horizon_days is not None:
+                maturity_index = day_indexes[_date(row["event_time"])] + horizon_days
+                if maturity_index < len(days):
+                    maturity_rows = rows_by_day[days[maturity_index]]
+                    maturity_raw = max(
+                        max(
+                            _parse_datetime(item["event_time"]),
+                            _parse_datetime(item.get("available_at") or item["event_time"]),
+                            _parse_datetime(item.get("decision_time") or item["event_time"]),
+                        )
+                        for item in maturity_rows
+                    )
+            if maturity_raw is None:
+                row["label_available_at"] = None
+                continue
+            maturity = _parse_datetime(maturity_raw)
+            decision_time = _parse_datetime(
+                row.get("decision_time") or row["event_time"]
+            )
+            if maturity <= decision_time:
+                raise LearningBacktestError(
+                    f"标签 PIT 违规: {row.get('symbol')} {_date(row['event_time'])} "
+                    "的 label_available_at 不晚于 decision_time"
+                )
+            row["label_available_at"] = maturity.isoformat()
+
+
+def _label_matured_by(row: Mapping[str, Any], cutoff: datetime) -> bool:
+    maturity = row.get("label_available_at")
+    return maturity is not None and _parse_datetime(maturity) <= cutoff
+
+
+def _label_matured_by_date(row: Mapping[str, Any], cutoff: date) -> bool:
+    maturity = row.get("label_available_at")
+    return maturity is not None and _date(maturity) <= cutoff
 
 
 def _sha256_file(path: Path) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -14,10 +15,13 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from app.kernel import stable_hash as _kernel_stable_hash
+
 A_SHARE_ADAPTER_CONTRACT = "pxybacktest.engine-adapter.a-share.v1"
 DAA_ENGINE_TYPES = {"a_share_portfolio", "factor_matrix", "event_sentiment"}
 ML_ENGINE_TYPES = {"ml_factor", "deep_learning"}
 LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
+UNIVERSAL_ENGINE_TYPES = {"universal_1m"}
 EMOTION_ETF_ENGINE_TYPES = {"a_share_emotion_etf"}
 TQSDK_ENGINE_TYPES = {"tqsdk_native"}
 RELIABLE_EVENT_TIMEOUT_SECONDS = 5.0
@@ -93,6 +97,26 @@ def _configure_pxylh_cta_worker_environment() -> dict[str, Any]:
 def _stable_hash(value: Any) -> str:
     payload = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _canonical_hash(value: Any) -> str:
+    return _kernel_stable_hash(value)
+
+
+def _set_result_hash(result: dict[str, Any]) -> str:
+    payload = copy.deepcopy(result)
+    reproducibility = dict(payload.get("reproducibility") or {})
+    reproducibility.pop("result_sha256", None)
+    payload["reproducibility"] = reproducibility
+    run_card = dict(payload.get("run_card") or {})
+    run_card.pop("result_sha256", None)
+    if run_card:
+        payload["run_card"] = run_card
+    result_sha256 = _canonical_hash(payload)
+    result.setdefault("reproducibility", {})["result_sha256"] = result_sha256
+    if isinstance(result.get("run_card"), dict):
+        result["run_card"]["result_sha256"] = result_sha256
+    return result_sha256
 
 
 def _atomic_json_write(path: Path, payload: Any) -> None:
@@ -415,6 +439,16 @@ def run_preloaded_worker(
         return
     if engine_type in LIGHTER_ENGINE_TYPES:
         run_lighter_worker(
+            task_id,
+            request,
+            pxydata_root,
+            result_path,
+            event_queue,
+            command_queue,
+        )
+        return
+    if engine_type in UNIVERSAL_ENGINE_TYPES:
+        run_universal_minute_worker(
             task_id,
             request,
             pxydata_root,
@@ -1102,6 +1136,108 @@ def run_lighter_worker(
         _emit(event_queue, "failed", {"error": f"Lighter 回测失败: {type(exc).__name__}: {exc}"}, terminal=True)
 
 
+def run_universal_minute_worker(
+    task_id: str,
+    request: dict[str, Any],
+    pxydata_root: str,
+    result_path: str,
+    event_queue,
+    command_queue,
+) -> None:
+    """Execute the manifest-bound cross-market one-minute engine."""
+
+    cancelled = False
+    deferred_commands: list[dict[str, Any]] = []
+    try:
+        task = request.get("_task_contract")
+        manifest = request.get("_snapshot_manifest")
+        if not isinstance(task, dict) or not isinstance(manifest, dict):
+            raise ValueError("universal_1m worker 缺少任务契约或完整快照清单")
+
+        def cancel_requested() -> bool:
+            nonlocal cancelled
+            cancelled = cancelled or _drain_worker_commands(
+                command_queue, deferred_commands
+            )
+            return cancelled
+
+        if cancel_requested():
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
+        _emit(
+            event_queue,
+            "state",
+            {
+                "status": "running",
+                "phase": "replaying_universal_1m",
+                "progress": 5.0,
+            },
+        )
+        from app.optimization import run_task_optimization
+        from app.universal_minute import run_universal_minute_backtest
+
+        def evaluate(candidate: dict[str, Any]) -> dict[str, Any]:
+            if cancel_requested():
+                raise InterruptedError("universal_1m 回测任务已取消")
+            return run_universal_minute_backtest(
+                task_id=task_id,
+                task=candidate,
+                manifest=manifest,
+                data_root=pxydata_root,
+            )
+
+        result = run_task_optimization(
+            task,
+            evaluate,
+            cancel_check=cancel_requested,
+        )
+        outcome = _replay_non_cta_result(
+            event_queue,
+            command_queue,
+            task_id=task_id,
+            request=request,
+            result=result,
+            engine_type="universal_1m",
+            deferred_commands=deferred_commands,
+        )
+        _atomic_json_write(Path(result_path), result)
+        if not outcome["complete"]:
+            _emit(
+                event_queue,
+                "cancelled",
+                {
+                    "result_path": str(result_path),
+                    "result_available": True,
+                    "partial": True,
+                    "processed_events": outcome["processed_events"],
+                },
+                terminal=True,
+            )
+            return
+        logger.info(
+            "universal_1m 回测完成: task_id=%s fills=%s total_return=%s",
+            task_id,
+            (result.get("metrics") or {}).get("n_fills"),
+            (result.get("metrics") or {}).get("total_return"),
+        )
+        _emit(
+            event_queue,
+            "completed",
+            {"result_path": str(result_path), "progress": 100.0},
+            terminal=True,
+        )
+    except Exception as exc:
+        if cancelled:
+            _emit(event_queue, "cancelled", {}, terminal=True)
+            return
+        _emit(
+            event_queue,
+            "failed",
+            {"error": f"universal_1m 回测失败: {type(exc).__name__}: {exc}"},
+            terminal=True,
+        )
+
+
 def _emit(
     event_queue,
     event_type: str,
@@ -1178,7 +1314,7 @@ def _emit_result_execution_snapshot(
         or result.get("books")
     )
     positions = _symbol_map(result.get("positions"))
-    fills = result.get("deals") or result.get("trades") or []
+    fills = result.get("fills") or result.get("deals") or result.get("trades") or []
     if not isinstance(fills, list):
         fills = []
     if engine_type in {"microstructure", "lighter_microstructure"}:
@@ -1226,6 +1362,64 @@ def _emit_result_execution_snapshot(
     _emit(event_queue, "execution_snapshot", {"snapshot": snapshot})
 
 
+def _attach_run_card(
+    result: dict[str, Any],
+    *,
+    task: dict[str, Any],
+    engine_type: str,
+    event_log_sha256: str | None,
+    event_count: int,
+) -> None:
+    strategy = dict(task.get("strategy") or {})
+    snapshot_ref = dict((task.get("data") or {}).get("snapshot") or {})
+    parameters = dict(task.get("parameters") or {})
+    execution = dict(task.get("execution") or {})
+    diagnostics = dict(result.get("diagnostics") or {})
+    timeline_policy = {
+        "visibility": diagnostics.get("availability_rule")
+        or "max(event_time,available_at)",
+        "matching": diagnostics.get("matching_model")
+        or execution.get("matching_policy"),
+        "funding_direction": diagnostics.get("funding_direction"),
+    }
+    result["run_card"] = {
+        "contract_version": "pxybacktest.run-card.v1",
+        "task_authority": "PXYBACKTEST",
+        "engine_type": engine_type,
+        "engine_version": str(
+            result.get("engine_version")
+            or diagnostics.get("adapter")
+            or "unknown"
+        ),
+        "task_sha256": _canonical_hash(task),
+        "parameters_sha256": _canonical_hash(parameters),
+        "execution_sha256": _canonical_hash(execution),
+        "strategy_id": strategy.get("id"),
+        "strategy_version": strategy.get("version"),
+        "strategy_sha256": strategy.get("source_hash"),
+        "strategy_provider": parameters.get("strategy_provider") or "builtin",
+        "snapshot_id": snapshot_ref.get("snapshot_id"),
+        "manifest_sha256": snapshot_ref.get("manifest_sha256"),
+        "event_log_sha256": event_log_sha256,
+        "event_count": event_count,
+        "timeline_policy_sha256": _canonical_hash(timeline_policy),
+        "matching_policy": dict(task.get("execution") or {}).get(
+            "matching_policy"
+        ),
+        "random_seed": task.get("random_seed"),
+        "base_currency": parameters.get("base_currency"),
+        "software_commit": str(
+            os.getenv("PXYBACKTEST_SOURCE_COMMIT") or "unknown"
+        ),
+        "strictly_reproducible": bool(
+            diagnostics.get("strictly_reproducible", False)
+        ),
+        "degraded_capabilities": list(
+            diagnostics.get("degraded_capabilities") or []
+        ),
+    }
+
+
 def _replay_non_cta_result(
     event_queue,
     command_queue,
@@ -1251,6 +1445,20 @@ def _replay_non_cta_result(
         )
         result["complete"] = True
         result["termination_reason"] = "completed"
+        task = dict(request.get("_task_contract") or {})
+        replay_audit = dict(result.get("replay_audit") or {})
+        reproducibility = dict(result.get("reproducibility") or {})
+        reproducibility["event_log_sha256"] = replay_audit.get("chain_sha256")
+        reproducibility["event_count"] = int(replay_audit.get("event_count") or 0)
+        result["reproducibility"] = reproducibility
+        _attach_run_card(
+            result,
+            task=task,
+            engine_type=engine_type,
+            event_log_sha256=reproducibility.get("event_log_sha256"),
+            event_count=int(reproducibility["event_count"]),
+        )
+        _set_result_hash(result)
         return {
             "complete": True,
             "termination_reason": "completed",
@@ -1390,7 +1598,14 @@ def _replay_non_cta_result(
         outcome["replay_audit"].get("event_count") or 0
     )
     result["reproducibility"] = reproducibility
-    reproducibility["result_sha256"] = _stable_hash(result)
+    _attach_run_card(
+        result,
+        task=task,
+        engine_type=engine_type,
+        event_log_sha256=reproducibility.get("event_log_sha256"),
+        event_count=int(reproducibility["event_count"]),
+    )
+    _set_result_hash(result)
     return outcome
 
 
@@ -1403,6 +1618,30 @@ def _apply_partial_execution_result(
     """取消时移除尚未回放的最终结果，只保留已执行区间。"""
 
     fills = list(snapshot.get("fills") or [])
+    original_deals = [
+        item for item in list(result.get("deals") or []) if isinstance(item, dict)
+    ]
+    processed_fill_ids = {
+        str(identifier)
+        for item in fills
+        if isinstance(item, dict)
+        for identifier in (item.get("fill_id"), item.get("trade_id"), item.get("id"))
+        if identifier is not None
+    }
+    if any(item.get("exit_fill_id") is not None for item in original_deals):
+        deals = [
+            item
+            for item in original_deals
+            if str(item.get("exit_fill_id")) in processed_fill_ids
+        ]
+    else:
+        deals = [
+            item
+            for item in fills
+            if isinstance(item, dict)
+            and str(item.get("position_effect") or "").lower()
+            in {"reduce", "close", "reverse"}
+        ]
     orders = list(snapshot.get("orders") or [])
     positions = list(dict(snapshot.get("positions") or {}).values())
     account_curve = list(snapshot.get("account_curve") or [])
@@ -1427,9 +1666,11 @@ def _apply_partial_execution_result(
         final_equity = initial_capital + realized
     final_equity = float(final_equity)
     result["orders"] = orders
-    result["deals"] = fills
+    result["fills"] = fills
+    result["deals"] = deals
     result["positions"] = positions
     result["curves"] = {"equity": account_curve}
+    result["accounts"] = account_curve
     result["market"] = {"bars": bar_history}
     result["order_books"] = snapshot.get("order_books") or {}
     result["sentiment"] = snapshot.get("sentiment") or {}
@@ -1441,7 +1682,8 @@ def _apply_partial_execution_result(
         "final_equity": final_equity,
         "net_profit": final_equity - initial_capital,
         "total_return": final_equity / initial_capital - 1.0,
-        "n_trades": len(fills),
+        "n_fills": len(fills),
+        "n_trades": len(deals),
         "partial": True,
     }
 

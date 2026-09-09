@@ -76,9 +76,13 @@ _EVENT_PRIORITIES = {
     "fundamental": 22,
     "factor": 23,
     "calendar": 24,
+    "funding": 25,
     "signal": 30,
     "order": 40,
     "fill": 50,
+    "position": 60,
+    "account": 70,
+    "bar_open": 8,
 }
 
 _EVENT_TYPE_ALIASES = {
@@ -1487,7 +1491,7 @@ def build_replay_audit(
     """对适配器产生的完整事件序列生成统一审计链。
 
     ``events`` 的每一项至少包含 ``event_type`` 和 ``payload``，可选
-    ``event_time``/``available_at``/``source_seq``。排序使用策略可见的
+    ``event_time``/``available_at``/``source_seq``/``priority``。排序使用策略可见的
     ``max(event_time, available_at)``，因此真实 Tick、因子和账户事件可以在
     不保留完整事件日志的情况下共享同一确定性校验规则。
     """
@@ -1499,7 +1503,7 @@ def build_replay_audit(
             payload = {
                 str(key): value
                 for key, value in item.items()
-                if key not in {"event_type", "type", "event_time", "available_at", "source_seq", "payload"}
+                if key not in {"event_type", "type", "event_time", "available_at", "source_seq", "priority", "payload"}
             }
         event_time = item.get("event_time") or item.get("timestamp") or item.get("datetime")
         if not event_time:
@@ -1520,6 +1524,11 @@ def build_replay_audit(
             source=str(item.get("source") or "adapter"),
             symbol=str(item.get("symbol")) if item.get("symbol") is not None else None,
             source_seq=int(item.get("source_seq") or index),
+            priority=(
+                int(item["priority"])
+                if item.get("priority") is not None
+                else None
+            ),
         )
         normalized.append((event, index))
     normalized.sort(key=lambda pair: (pair[0].sort_key(), pair[1]))

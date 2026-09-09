@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 import statistics
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,19 @@ LIGHTER_DATASETS = {
 
 class LighterBacktestError(ValueError):
     """Lighter 快照或回放参数不满足执行要求。"""
+
+
+def _row_ready_time(row: dict[str, Any]) -> datetime:
+    event_time = _parse_datetime(row.get("event_time"))
+    available_at = _parse_datetime(row.get("available_at") or row.get("event_time"))
+    return max(event_time, available_at)
+
+
+def _row_ready_time_text(row: dict[str, Any]) -> str:
+    event_time = _parse_datetime(row.get("event_time"))
+    available_value = row.get("available_at") or row.get("event_time")
+    available_at = _parse_datetime(available_value)
+    return str(available_value if available_at > event_time else row.get("event_time"))
 
 
 def lighter_runtime_available() -> bool:
@@ -74,10 +88,18 @@ def load_manifest_rows(
             raise LighterBacktestError("Lighter manifest 文件 SHA256 不一致")
         table = parquet.read_table(path)
         for raw in _safe_table_rows(table):
-            symbol = str(raw.get("symbol") or "").strip().upper()
+            symbol = str(
+                raw.get("symbol") or raw.get("instrument_id") or ""
+            ).strip().upper()
             if wanted and symbol not in wanted:
                 continue
-            raw_time = raw.get("event_time") or raw.get("timestamp_utc") or raw.get("funding_time") or raw.get("exchange_ts")
+            raw_time = (
+                raw.get("event_time")
+                or raw.get("settlement_time")
+                or raw.get("timestamp_utc")
+                or raw.get("funding_time")
+                or raw.get("exchange_ts")
+            )
             if raw_time is None and raw.get("ts_ms") is not None:
                 raw_time = datetime.fromtimestamp(float(raw["ts_ms"]) / 1000.0).isoformat()
             try:
@@ -194,62 +216,345 @@ def run_lighter_backtest(
     if not factors and rebuilt:
         factors = rebuilt
     if funding_rows:
-        by_time = {(str(row.get("symbol") or "").upper(), str(row.get("event_time"))): row for row in factors}
+        factors = list(factors)
         for funding in funding_rows:
-            key = (str(funding.get("symbol") or "").upper(), str(funding.get("event_time")))
-            target = by_time.get(key)
-            if target is None:
-                target = {"symbol": funding.get("symbol"), "event_time": funding.get("event_time"), "mid_price": funding.get("mark_price") or funding.get("index_price")}
-                factors.append(target)
-                by_time[key] = target
-            target["funding_rate"] = funding.get("funding_rate", funding.get("rate_decimal", funding.get("rate")))
-        factors.sort(key=lambda row: (str(row.get("event_time") or ""), str(row.get("symbol") or "")))
+            funding_time = (
+                funding.get("settlement_time")
+                or funding.get("event_time")
+                or funding.get("funding_time")
+            )
+            mark_price = funding.get("mark_price") or funding.get("index_price")
+            factors.append(
+                {
+                    "symbol": funding.get("symbol"),
+                    "event_time": funding_time,
+                    "available_at": funding.get("available_at") or funding_time,
+                    "mid_price": mark_price,
+                    "funding_rate": funding.get(
+                        "funding_rate",
+                        funding.get("rate_decimal", funding.get("rate")),
+                    ),
+                    "_funding_only": True,
+                    "_funding_event_time": funding_time,
+                    "_funding_available_at": funding.get("available_at")
+                    or funding_time,
+                    "_funding_mark_price": mark_price,
+                    "_funding_event": True,
+                }
+            )
+    factors.sort(
+        key=lambda row: (
+            _row_ready_time(row),
+            0 if row.get("_funding_event") else 1,
+            _parse_datetime(row.get("event_time")),
+            str(row.get("symbol") or ""),
+        )
+    )
     if not factors:
         raise LighterBacktestError("快照中没有可回放的 Lighter 因子或盘口事件")
-    threshold = float(parameters.get("entry_threshold", 0.2))
-    exit_threshold = float(parameters.get("exit_threshold", 0.0))
+    threshold = _decimal_number(parameters.get("entry_threshold", "0.2"))
+    exit_threshold = _decimal_number(parameters.get("exit_threshold", "0"))
     hold_ms = int(parameters.get("max_hold_ms", 3_600_000))
-    fee_bps = float(parameters.get("fee_bps_per_side", dict(task.get("execution") or {}).get("rate", 0.0) * 10_000))
-    slippage_bps = float(parameters.get("slippage_bps_per_side", dict(task.get("execution") or {}).get("slippage", 0.0)))
-    capital = float(dict(task.get("execution") or {}).get("capital") or 1_000_000)
-    balance = capital
+    execution = dict(task.get("execution") or {})
+    fee_bps_value = parameters.get("fee_bps_per_side")
+    if fee_bps_value is None:
+        fee_bps_value = _decimal_number(execution.get("rate")) * Decimal("10000")
+    fee_bps = _decimal_number(fee_bps_value)
+    slippage_bps = _decimal_number(
+        parameters.get("slippage_bps_per_side", execution.get("slippage", 0))
+    )
+    capital = _decimal_number(execution.get("capital") or 1_000_000)
+    quantity = _decimal_number(parameters.get("quantity") or 1)
+    cash = capital
     position: dict[str, Any] | None = None
+    pending: dict[str, Any] | None = None
     deals: list[dict[str, Any]] = []
+    fills: list[dict[str, Any]] = []
     equity: list[dict[str, Any]] = []
-    active_buy = active_sell = funding_pnl = 0.0
-    for row in factors:
-        direct_mid = _number(row.get("mid_price") or row.get("mid"))
-        bid = _number(row.get("bid_price1"))
-        ask = _number(row.get("ask_price1"))
-        mid = direct_mid or ((bid + ask) / 2 if bid > 0 and ask > 0 else 0.0)
+    position_events: list[dict[str, Any]] = []
+    position_history: list[dict[str, Any]] = []
+    active_buy = active_sell = total_funding_pnl = Decimal("0")
+    marks: dict[str, Decimal] = {}
+    last_event_time = period.get("start")
+    final_equity = capital
+    final_unrealized = Decimal("0")
+    period_end = _parse_datetime(period.get("end"))
+
+    def position_at(
+        *, symbol: str, settlement_time: datetime
+    ) -> dict[str, Any] | None:
+        if (
+            position is not None
+            and symbol == str(position["symbol"])
+            and position["entry_datetime"] <= settlement_time
+        ):
+            return position
+        for closed in reversed(position_history):
+            if (
+                symbol == str(closed["symbol"])
+                and closed["entry_datetime"] <= settlement_time
+                and settlement_time < closed["exit_datetime"]
+            ):
+                return closed
+        return None
+
+    def append_fill(
+        *,
+        action: str,
+        side: str,
+        position_effect: str,
+        signal_time: Any,
+        fill_time: Any,
+        price: Decimal,
+        fee: Decimal,
+        symbol: str,
+    ) -> dict[str, Any]:
+        fill_number = len(fills) + 1
+        item = {
+            "fill_id": f"{task_id}-fill-{fill_number}",
+            "order_id": f"{task_id}-order-{fill_number}",
+            "symbol": symbol,
+            "side": side,
+            "position_effect": position_effect,
+            "action": action,
+            "signal_time": signal_time,
+            "fill_time": fill_time,
+            "price": _decimal_float(price),
+            "quantity": _decimal_float(quantity),
+            "fee_amount": _decimal_float(fee),
+            "fee_bps": _decimal_float(fee_bps),
+            "slippage_bps": _decimal_float(slippage_bps),
+            "status": "filled",
+        }
+        fills.append(item)
+        return item
+
+    for row_index, row in enumerate(factors):
+        ready_time = _row_ready_time(row)
+        if ready_time > period_end:
+            continue
+        symbol = str(row.get("symbol") or (symbols[0] if symbols else ""))
+        direct_mid = _decimal_number(row.get("mid_price") or row.get("mid"))
+        bid = _decimal_number(row.get("bid_price1"))
+        ask = _decimal_number(row.get("ask_price1"))
+        mid = direct_mid or ((bid + ask) / Decimal("2") if bid > 0 and ask > 0 else Decimal("0"))
+        if mid <= 0 and row.get("_funding_event"):
+            mid = marks.get(symbol, Decimal("0"))
         if mid <= 0:
             continue
-        timestamp = _parse_datetime(row.get("event_time"))
+        timestamp = ready_time
         ts_ms = int(timestamp.timestamp() * 1000)
-        buy = _number(row.get("buy_qty")); sell = _number(row.get("sell_qty"))
-        active_buy += max(0.0, buy); active_sell += max(0.0, sell)
-        funding_rate = _number(row.get("funding_rate") or row.get("rate_decimal"))
+        event_time = _row_ready_time_text(row)
+        last_event_time = event_time
+        is_execution_tick = not bool(row.get("_funding_only"))
+        if is_execution_tick:
+            marks[symbol] = mid
+        buy = _decimal_number(row.get("buy_qty"))
+        sell = _decimal_number(row.get("sell_qty"))
+        active_buy += max(Decimal("0"), buy)
+        active_sell += max(Decimal("0"), sell)
+        funding_rate = (
+            _decimal_number(
+                row.get("funding_rate")
+                if row.get("funding_rate") is not None
+                else row.get("rate_decimal")
+            )
+            if row.get("_funding_event")
+            else Decimal("0")
+        )
+
+        # 资金费在 available_at 到达账本，但按 settlement_time 的历史仓位结算。
+        funding_position = None
+        if row.get("_funding_event"):
+            funding_position = position_at(
+                symbol=symbol,
+                settlement_time=_parse_datetime(
+                    row.get("_funding_event_time") or row.get("event_time")
+                ),
+            )
+        if funding_position is not None:
+            position_mark = _decimal_number(row.get("_funding_mark_price"))
+            if position_mark <= 0:
+                position_mark = marks.get(str(funding_position["symbol"]), mid)
+            funding_quantity = _decimal_number(funding_position.get("quantity"))
+            notional = abs(funding_quantity * position_mark)
+            funding_cashflow = (
+                -Decimal(funding_position["side"]) * notional * funding_rate
+            )
+            if funding_cashflow:
+                cash += funding_cashflow
+                total_funding_pnl += funding_cashflow
+                funding_position["funding_pnl"] += funding_cashflow
+                row["_funding_payment"] = _decimal_float(funding_cashflow)
+                deal_index = funding_position.get("deal_index")
+                if deal_index is not None:
+                    deal = deals[int(deal_index)]
+                    deal["funding_pnl"] = _decimal_float(
+                        funding_position["funding_pnl"]
+                    )
+                    deal["pnl_amount"] = _decimal_float(
+                        _decimal_number(deal.get("pnl_amount")) + funding_cashflow
+                    )
+
+        # Task v2 的 Lighter 引擎是 Tick 模式：本 Tick 只能生成信号，挂单必须
+        # 等到同品种的后续 Tick 才能成交，不能读取当前行后立即成交。
+        if (
+            pending is not None
+            and is_execution_tick
+            and row_index > int(pending["signal_index"])
+            and symbol == str(pending["symbol"])
+        ):
+            action = str(pending["action"])
+            order_side = Decimal("1") if action == "enter_long" else Decimal("-1")
+            if action == "exit":
+                if position is None:
+                    pending = None
+                else:
+                    order_side = -Decimal(position["side"])
+                    exit_price = mid * (
+                        Decimal("1") + order_side * slippage_bps / Decimal("10000")
+                    )
+                    exit_fee = abs(exit_price * quantity) * fee_bps / Decimal("10000")
+                    gross = Decimal(position["side"]) * (
+                        exit_price - position["entry_price"]
+                    ) * quantity
+                    cash += gross - exit_fee
+                    total_fees = position["entry_fee"] + exit_fee
+                    net = gross - total_fees + position["funding_pnl"]
+                    append_fill(
+                        action="exit_long" if position["side"] > 0 else "exit_short",
+                        side="sell" if position["side"] > 0 else "buy",
+                        position_effect="close",
+                        signal_time=pending["signal_time"],
+                        fill_time=event_time,
+                        price=exit_price,
+                        fee=exit_fee,
+                        symbol=symbol,
+                    )
+                    deals.append(
+                        {
+                            "symbol": position["symbol"],
+                            "side": "long" if position["side"] > 0 else "short",
+                            "entry_time": position["entry_time"],
+                            "exit_time": event_time,
+                            "entry_price": _decimal_float(position["entry_price"]),
+                            "exit_price": _decimal_float(exit_price),
+                            "quantity": _decimal_float(quantity),
+                            "gross_pnl": _decimal_float(gross),
+                            "fees": _decimal_float(total_fees),
+                            "pnl_amount": _decimal_float(net),
+                            "funding_pnl": _decimal_float(position["funding_pnl"]),
+                        }
+                    )
+                    position_events.append(
+                        {
+                            "event_time": event_time,
+                            "symbol": position["symbol"],
+                            "payload": {
+                                "symbol": position["symbol"],
+                                "side": "flat",
+                                "quantity": 0.0,
+                                "mark_price": _decimal_float(mid),
+                                "unrealized_pnl": 0.0,
+                                "funding_pnl": _decimal_float(position["funding_pnl"]),
+                            },
+                        }
+                    )
+                    position["exit_datetime"] = timestamp
+                    position["deal_index"] = len(deals) - 1
+                    position_history.append(position)
+                    position = None
+                    pending = None
+            else:
+                entry_price = mid * (
+                    Decimal("1") + order_side * slippage_bps / Decimal("10000")
+                )
+                entry_fee = abs(entry_price * quantity) * fee_bps / Decimal("10000")
+                cash -= entry_fee
+                position = {
+                    "symbol": symbol,
+                    "side": 1 if order_side > 0 else -1,
+                    "entry_price": entry_price,
+                    "entry_time": event_time,
+                    "entry_ts_ms": ts_ms,
+                    "entry_datetime": timestamp,
+                    "quantity": quantity,
+                    "entry_fee": entry_fee,
+                    "funding_pnl": Decimal("0"),
+                }
+                append_fill(
+                    action=action,
+                    side="buy" if order_side > 0 else "sell",
+                    position_effect="open",
+                    signal_time=pending["signal_time"],
+                    fill_time=event_time,
+                    price=entry_price,
+                    fee=entry_fee,
+                    symbol=symbol,
+                )
+                pending = None
+
+        signal = _signal_decimal(row)
+        if pending is None and is_execution_tick:
+            if position is None and abs(signal) >= threshold:
+                pending = {
+                    "action": "enter_long" if signal > 0 else "enter_short",
+                    "symbol": symbol,
+                    "signal_time": event_time,
+                    "signal_index": row_index,
+                }
+            elif position is not None and symbol == str(position["symbol"]):
+                if (
+                    ts_ms - int(position["entry_ts_ms"]) >= hold_ms
+                    or Decimal(position["side"]) * signal <= exit_threshold
+                ):
+                    pending = {
+                        "action": "exit",
+                        "symbol": symbol,
+                        "signal_time": event_time,
+                        "signal_index": row_index,
+                    }
+
+        unrealized = Decimal("0")
         if position is not None:
-            notional = abs(float(position["quantity"]) * mid)
-            funding_pnl += -float(position["side"]) * notional * funding_rate
-            signal = _signal(row)
-            if ts_ms - int(position["entry_ts_ms"]) >= hold_ms or position["side"] * signal <= exit_threshold:
-                exit_price = mid * (1 - position["side"] * slippage_bps / 10_000)
-                gross = position["side"] * (exit_price - position["entry_price"]) * position["quantity"]
-                fees = (abs(position["entry_price"]) + abs(exit_price)) * position["quantity"] * fee_bps / 10_000
-                net = gross - fees
-                balance += net
-                deals.append({"symbol": position["symbol"], "side": "long" if position["side"] > 0 else "short", "entry_time": position["entry_time"], "exit_time": row["event_time"], "pnl_amount": net, "funding_pnl": funding_pnl})
-                equity.append({"date": row["event_time"], "value": balance})
-                position = None; funding_pnl = 0.0
-        if position is None:
-            signal = _signal(row)
-            if abs(signal) >= threshold:
-                side = 1 if signal > 0 else -1
-                position = {"symbol": str(row.get("symbol") or symbols[0]), "side": side, "entry_price": mid * (1 + side * slippage_bps / 10_000), "entry_time": row["event_time"], "entry_ts_ms": ts_ms, "quantity": float(parameters.get("quantity") or 1.0)}
+            position_mark = marks.get(str(position["symbol"]), position["entry_price"])
+            unrealized = Decimal(position["side"]) * (
+                position_mark - position["entry_price"]
+            ) * quantity
+            position_events.append(
+                {
+                    "event_time": event_time,
+                    "symbol": position["symbol"],
+                    "payload": {
+                        "symbol": position["symbol"],
+                        "side": "long" if position["side"] > 0 else "short",
+                        "quantity": _decimal_float(Decimal(position["side"]) * quantity),
+                        "entry_price": _decimal_float(position["entry_price"]),
+                        "mark_price": _decimal_float(position_mark),
+                        "unrealized_pnl": _decimal_float(unrealized),
+                        "funding_pnl": _decimal_float(position["funding_pnl"]),
+                    },
+                }
+            )
+        final_unrealized = unrealized
+        final_equity = cash + unrealized
+        equity.append(
+            {
+                "date": event_time,
+                "value": _decimal_float(final_equity),
+                "cash": _decimal_float(cash),
+                "unrealized_pnl": _decimal_float(unrealized),
+                "funding_pnl": _decimal_float(total_funding_pnl),
+            }
+        )
     if not equity:
-        equity = [{"date": factors[0].get("event_time"), "value": capital}]
-    returns = [float(item["pnl_amount"]) / capital for item in deals]
+        equity = [{"date": last_event_time, "value": _decimal_float(capital)}]
+    returns = [_decimal_number(item["pnl_amount"]) / capital for item in deals]
+    final_positions = (
+        [position_events[-1]["payload"]]
+        if position is not None and position_events
+        else []
+    )
     from app.replay import build_replay_audit
 
     snapshot = dict((task.get("data") or {}).get("snapshot") or {})
@@ -270,11 +575,33 @@ def run_lighter_backtest(
                 ) else "factor",
                 "event_time": row.get("event_time"),
                 "available_at": row.get("available_at"),
-                "payload": row,
+                "payload": {
+                    key: value
+                    for key, value in row.items()
+                    if not key.startswith("_funding")
+                },
                 "symbol": row.get("symbol"),
                 "source_seq": index,
             }
         )
+        if row.get("_funding_event"):
+            replay_events.append(
+                {
+                    "event_type": "funding",
+                    "event_time": row.get("_funding_event_time")
+                    or row.get("event_time"),
+                    "available_at": row.get("_funding_available_at")
+                    or row.get("available_at"),
+                    "payload": {
+                        "rate": row.get("funding_rate"),
+                        "mark_price": row.get("_funding_mark_price"),
+                        "payment": row.get("_funding_payment", 0.0),
+                        "rate_direction": "positive_long_pays_short",
+                    },
+                    "symbol": row.get("symbol"),
+                    "source_seq": len(replay_events),
+                }
+            )
     exposed_footprint_trades = (
         footprint_trades if footprint_coverage["available"] else []
     )
@@ -293,12 +620,22 @@ def run_lighter_backtest(
                 "source_seq": index,
             }
         )
-    for index, item in enumerate(deals):
+    for index, item in enumerate(fills):
         replay_events.append(
             {
                 "event_type": "fill",
-                "event_time": item.get("exit_time") or item.get("entry_time"),
+                "event_time": item.get("fill_time"),
                 "payload": item,
+                "symbol": item.get("symbol"),
+                "source_seq": len(replay_events) + index,
+            }
+        )
+    for index, item in enumerate(position_events):
+        replay_events.append(
+            {
+                "event_type": "position",
+                "event_time": item.get("event_time"),
+                "payload": item.get("payload"),
                 "symbol": item.get("symbol"),
                 "source_seq": len(replay_events) + index,
             }
@@ -320,10 +657,38 @@ def run_lighter_backtest(
         "strategy": task.get("strategy") or {},
         "data_snapshot": dict((task.get("data") or {}).get("snapshot") or {}),
         "run": {"universe": task.get("universe") or {}, "period": period, "execution": task.get("execution") or {}, "parameters": parameters},
-        "metrics": {"total_return": balance / capital - 1.0, "final_equity": balance, "net_profit": balance - capital, "n_trades": len(deals), "win_rate": sum(value > 0 for value in returns) / len(returns) if returns else 0.0, "active_buy_qty": active_buy, "active_sell_qty": active_sell, "funding_pnl": sum(float(item.get("funding_pnl") or 0.0) for item in deals)},
+        "metrics": {
+            "total_return": _decimal_float(final_equity / capital - Decimal("1")),
+            "final_equity": _decimal_float(final_equity),
+            "final_cash": _decimal_float(cash),
+            "unrealized_pnl": _decimal_float(final_unrealized),
+            "net_profit": _decimal_float(final_equity - capital),
+            "n_trades": len(deals),
+            "n_fills": len(fills),
+            "win_rate": (
+                sum(value > 0 for value in returns) / len(returns) if returns else 0.0
+            ),
+            "active_buy_qty": _decimal_float(active_buy),
+            "active_sell_qty": _decimal_float(active_sell),
+            "funding_pnl": _decimal_float(total_funding_pnl),
+        },
         "curves": {"equity": equity},
         "deals": deals,
-        "diagnostics": {"matching_model": "lighter_factor_or_l2_rebuild", "book_depth": int(parameters.get("book_depth") or 10), "data_source_policy": "pxydata_snapshot_only", "snapshot_enforcement": "manifest_bound", "footprint_coverage": footprint_coverage, "warnings": ["Lighter 回测只生成研究结果，不提交真实订单。"]},
+        "fills": fills,
+        "positions": final_positions,
+        "diagnostics": {
+            "matching_model": "lighter_factor_or_l2_rebuild",
+            "execution_timing": "next_tick",
+            "book_depth": int(parameters.get("book_depth") or 10),
+            "data_source_policy": "pxydata_snapshot_only",
+            "snapshot_enforcement": "manifest_bound",
+            "funding_rate_unit": "decimal_notional_fraction_per_event",
+            "fee_unit": "basis_points_per_fill",
+            "slippage_unit": "basis_points_per_fill",
+            "pending_order": pending,
+            "footprint_coverage": footprint_coverage,
+            "warnings": ["Lighter 回测只生成研究结果，不提交真实订单。"],
+        },
         "artifacts": [],
         "replay_audit": build_replay_audit(
             run_id=task_id,
@@ -423,5 +788,30 @@ def _number(value: Any) -> float:
     return value if math.isfinite(value) else 0.0
 
 
+def _decimal_number(value: Any) -> Decimal:
+    """把外部数值稳定转换为 Decimal；缺失或非有限值按零处理。"""
+
+    try:
+        number = Decimal(str(value if value is not None else 0))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("0")
+    return number if number.is_finite() else Decimal("0")
+
+
+def _decimal_float(value: Decimal) -> float:
+    """结果契约保留 JSON number，账本计算过程保持 Decimal。"""
+
+    return float(value)
+
+
+def _signal_decimal(row: dict[str, Any]) -> Decimal:
+    return (
+        _decimal_number(row.get("trade_imbalance")) * Decimal("0.45")
+        + _decimal_number(row.get("depth_imbalance_5") or row.get("depth_imbalance"))
+        * Decimal("0.35")
+        + _decimal_number(row.get("ofi_normalized")) * Decimal("0.20")
+    )
+
+
 def _signal(row: dict[str, Any]) -> float:
-    return _number(row.get("trade_imbalance")) * 0.45 + _number(row.get("depth_imbalance_5") or row.get("depth_imbalance")) * 0.35 + _number(row.get("ofi_normalized")) * 0.20
+    return _decimal_float(_signal_decimal(row))

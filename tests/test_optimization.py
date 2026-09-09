@@ -4,7 +4,12 @@ from copy import deepcopy
 
 import pytest
 
-from app.optimization import OptimizationError, generate_folds, run_task_optimization
+from app.optimization import (
+    OptimizationError,
+    _task_with_period,
+    generate_folds,
+    run_task_optimization,
+)
 
 
 def _task(method: str = "optuna") -> dict:
@@ -45,7 +50,12 @@ def _evaluate(task: dict) -> dict:
             "n_trades": 1,
         },
         "curves": {"equity": [], "drawdown": []},
+        "orders": [{"order_id": f"order-{start}"}],
+        "fills": [{"fill_id": f"fill-{start}"}],
         "deals": [{"date": start, "pnl_amount": x}],
+        "positions": [{"symbol": "STALE-FIRST-FOLD"}],
+        "replay_audit": {"chain_sha256": start},
+        "reproducibility": {"result_sha256": start},
     }
 
 
@@ -68,6 +78,14 @@ def test_walk_forward_keeps_train_and_oos_dates_disjoint() -> None:
     assert all(item["train_end"] < item["test_start"] for item in folds)
     assert result["metrics"]["walk_forward_folds"] == len(folds)
     assert result["curves"]["equity"]
+    assert result["orders"] == []
+    assert result["fills"] == []
+    assert result["deals"] == []
+    assert result["positions"] == []
+    assert "replay_audit" not in result
+    assert "reproducibility" not in result
+    assert folds[0]["oos_execution"]["fills"]
+    assert result["diagnostics"]["walk_forward_result_scope"] == "aggregate_only"
 
 
 def test_generate_folds_rejects_short_range() -> None:
@@ -82,3 +100,25 @@ def test_generate_folds_rejects_short_range() -> None:
             test_days=10,
             step_days=10,
         )
+
+
+def test_walk_forward_period_preserves_original_timezone() -> None:
+    utc_task = _task()
+    utc_task["period"]["start"] = "2026-01-01T00:00:00Z"
+    utc_task["period"]["end"] = "2026-02-28T23:59:59Z"
+    utc_candidate = _task_with_period(
+        utc_task,
+        __import__("datetime").date(2026, 1, 2),
+        __import__("datetime").date(2026, 1, 3),
+    )
+    offset_candidate = _task_with_period(
+        _task(),
+        __import__("datetime").date(2026, 1, 2),
+        __import__("datetime").date(2026, 1, 3),
+    )
+
+    assert utc_candidate["period"] == {
+        "start": "2026-01-02T00:00:00Z",
+        "end": "2026-01-03T23:59:59Z",
+    }
+    assert offset_candidate["period"]["start"].endswith("+08:00")

@@ -49,6 +49,11 @@ from .lighter_microstructure import (
     LIGHTER_STRATEGY_ID,
     lighter_runtime_available,
 )
+from .universal_minute import (
+    UNIVERSAL_STRATEGY_HASH,
+    UNIVERSAL_STRATEGY_ID,
+    universal_minute_runtime_available,
+)
 from .llm_signal import LLMRealtimeSignalRequest, LLMSignalError, generate_realtime_signal
 from .custom_nodes import CustomDataNodeRunRequest, CustomDataNodeSpec, CustomNodeError, run_custom_data_node, validate_custom_data_node
 from .models import (
@@ -82,7 +87,12 @@ from .tqsdk_submission import TqSdkTaskSubmission
 A_SHARE_WARMUP_CALENDAR_DAYS = 120
 LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
 MANIFEST_ENGINE_TYPES = {
-    *DAA_ENGINE_TYPES, "a_share_emotion_etf", "microstructure", *ML_ENGINE_TYPES, *LIGHTER_ENGINE_TYPES
+    *DAA_ENGINE_TYPES,
+    "a_share_emotion_etf",
+    "microstructure",
+    *ML_ENGINE_TYPES,
+    *LIGHTER_ENGINE_TYPES,
+    "universal_1m",
 }
 ENGINE_REQUIRED_DATASETS: dict[str, list[str]] = {
     "vnpy_cta": [],
@@ -98,6 +108,7 @@ ENGINE_REQUIRED_DATASETS: dict[str, list[str]] = {
         "lighter_order_book_events",
         "lighter_funding_history",
     ],
+    "universal_1m": ["bars"],
     "mt5_native": [],
 }
 
@@ -157,7 +168,7 @@ def _data_requirement_payload(
         if body.engine_type in DAA_ENGINE_TYPES | {"a_share_emotion_etf", "ml_factor", "deep_learning"}
         else "lighter"
         if body.engine_type == "lighter_microstructure"
-        else "global"
+        else str(body.parameters.get("market") or "global")
     )
     pit_datasets = {
         "financials_pit",
@@ -165,6 +176,8 @@ def _data_requirement_payload(
         "factor_matrix_daily",
         "ml_features_daily",
         "market_emotion_daily",
+        "funding_rates",
+        "sentiment_events",
     }
     datasets = [
         {
@@ -875,6 +888,69 @@ def create_app(
                         ],
                     }],
                 },
+                {
+                    "id": "universal_1m",
+                    "available": universal_minute_runtime_available(),
+                    "intervals": ["1m"],
+                    "snapshot_enforcement": "manifest_bound",
+                    "replay_modes": ["bar"],
+                    "event_domains": [
+                        "market_bar",
+                        "sentiment",
+                        "funding",
+                        "signal",
+                        "order",
+                        "fill",
+                        "position",
+                        "account",
+                    ],
+                    "execution_stream": "complete_ordered_audited",
+                    "data_contracts": [
+                        "pxydata.bars.v1",
+                        "pxydata.funding_rates.v1",
+                        "pxydata.sentiment_events.v1",
+                    ],
+                    "task_authority": "PXYBACKTEST",
+                    "market_domains": [
+                        "cn_equity",
+                        "cn_futures",
+                        "fx_cfd",
+                        "crypto_perp",
+                    ],
+                    "accounting_scope": "linear_contract_single_base_currency",
+                    "adapter_required_for": [
+                        "inverse_contracts",
+                        "multi_currency_conversion",
+                        "options_expiry_and_greeks",
+                        "corporate_actions",
+                        "physical_delivery_and_roll",
+                    ],
+                    "strategies": [
+                        {
+                            "id": UNIVERSAL_STRATEGY_ID,
+                            "name": "通用 1 分钟情绪与价格信号",
+                            "version": "builtin-v1",
+                            "source_hash": UNIVERSAL_STRATEGY_HASH,
+                            "entrypoint": UNIVERSAL_STRATEGY_ID,
+                            "parameters": [
+                                {
+                                    "id": "signal_mode",
+                                    "choices": [
+                                        "sentiment",
+                                        "bar_return",
+                                        "sentiment_plus_return",
+                                    ],
+                                    "default": "sentiment",
+                                },
+                                {"id": "quantity", "default": 1},
+                                {"id": "entry_threshold", "default": 0.2},
+                                {"id": "exit_threshold", "default": 0.05},
+                                {"id": "contract_multiplier", "default": 1},
+                                {"id": "leverage", "default": 1},
+                            ],
+                        }
+                    ],
+                },
                 {"id": "mt5_native", "available": False},
             ],
         }
@@ -1091,6 +1167,10 @@ def create_app(
             or (body.engine_type == "microstructure" and microstructure_available)
             or (body.engine_type in ML_ENGINE_TYPES and learning_available)
             or (body.engine_type in LIGHTER_ENGINE_TYPES and lighter_available)
+            or (
+                body.engine_type == "universal_1m"
+                and universal_minute_runtime_available()
+            )
         )
         if not supported_engine:
             raise HTTPException(
@@ -1157,6 +1237,12 @@ def create_app(
             or body.strategy.source_hash.lower() != LIGHTER_STRATEGY_HASH
         ):
             raise HTTPException(status_code=409, detail="Lighter 策略版本不一致")
+        if body.engine_type == "universal_1m" and (
+            body.strategy.id != UNIVERSAL_STRATEGY_ID
+            or body.strategy.entrypoint != UNIVERSAL_STRATEGY_ID
+            or body.strategy.source_hash.lower() != UNIVERSAL_STRATEGY_HASH
+        ):
+            raise HTTPException(status_code=409, detail="通用1分钟策略版本不一致")
 
         try:
             start_date, end_date = _snapshot_date_range(body)

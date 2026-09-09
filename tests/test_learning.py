@@ -178,6 +178,46 @@ def _run_checkpoint_training(monkeypatch, **kwargs) -> dict:
     )
 
 
+def _fixed_learning_rows(
+    label_column: str,
+    *,
+    count: int = 12,
+    label_value: float = 0.01,
+    maturity_days: int = 1,
+) -> list[dict]:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return [
+        {
+            "event_time": (start + timedelta(days=index)).isoformat(),
+            "available_at": (start + timedelta(days=index)).isoformat(),
+            "decision_time": (start + timedelta(days=index)).isoformat(),
+            "label_available_at": (
+                start + timedelta(days=index + maturity_days)
+            ).isoformat(),
+            "symbol": "AAA",
+            "x": float(index),
+            label_column: label_value,
+        }
+        for index in range(count)
+    ]
+
+
+def _fixed_learning_task(label_column: str) -> dict:
+    task = _checkpoint_task()
+    task["period"]["end"] = "2026-01-31T23:59:59+00:00"
+    task["execution"]["rate"] = 0.0
+    task["parameters"].update(
+        {
+            "label_column": label_column,
+            "train_days": 4,
+            "test_days": 2,
+            "step_days": 2,
+            "prediction_threshold": -1,
+        }
+    )
+    return task
+
+
 def test_learning_checkpoint_round_trip_and_nested_tamper_rejection(
     monkeypatch,
 ) -> None:
@@ -432,6 +472,142 @@ def test_learning_checkpoint_rejects_changed_training_bindings(
         )
 
 
+def test_multi_period_forward_return_is_prediction_only_not_daily_equity(
+    monkeypatch,
+) -> None:
+    label_column = "forward_return_5d"
+    rows = _fixed_learning_rows(
+        label_column,
+        count=14,
+        label_value=0.10,
+        maturity_days=5,
+    )
+    monkeypatch.setattr(
+        "app.learning.load_manifest_feature_rows",
+        lambda **_: copy.deepcopy(rows),
+    )
+
+    result = run_learning_backtest(
+        task_id="five-day-label-test",
+        task=_fixed_learning_task(label_column),
+        manifest={"snapshot_manifest_version": 1},
+        data_root="unused",
+    )
+
+    assert result["diagnostics"]["label_horizon_days"] == 5
+    assert result["diagnostics"]["accounting_mode"] == (
+        "prediction_evaluation_only"
+    )
+    assert result["diagnostics"]["account_equity_available"] is False
+    assert result["metrics"]["prediction_count"] > 0
+    assert result["metrics"]["selected_target_mean"] == pytest.approx(0.10)
+    assert result["metrics"]["total_return"] is None
+    assert result["metrics"]["final_equity"] is None
+    assert result["metrics"]["n_days"] == 0
+    assert result["curves"] == {"equity": [], "drawdown": []}
+    factor_events = [
+        event
+        for event in result["_replay_events"]
+        if event["event_type"] == "factor"
+    ]
+    label_events = [
+        event
+        for event in result["_replay_events"]
+        if event["event_type"] == "label"
+    ]
+    assert all(label_column not in event["payload"] for event in factor_events)
+    assert label_events
+    assert all(
+        datetime.fromisoformat(event["event_time"])
+        > datetime.fromisoformat(event["payload"]["source_event_time"])
+        for event in label_events
+    )
+
+
+def test_forward_return_rejects_explicit_horizon_mismatch() -> None:
+    task = _fixed_learning_task("forward_return_5d")
+    task["parameters"]["label_horizon_days"] = 1
+
+    with pytest.raises(LearningBacktestError, match="期限不一致"):
+        run_learning_backtest(
+            task_id="label-horizon-mismatch-test",
+            task=task,
+            manifest={"snapshot_manifest_version": 1},
+            data_root="unused",
+        )
+
+
+def test_training_uses_label_maturity_not_feature_available_at(monkeypatch) -> None:
+    label_column = "forward_return_1d"
+    rows = _fixed_learning_rows(label_column, count=8)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    rows[2]["label_available_at"] = (start + timedelta(days=5)).isoformat()
+    rows[3]["label_available_at"] = (start + timedelta(days=6)).isoformat()
+    captured_training_days: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "app.learning.load_manifest_feature_rows",
+        lambda **_: copy.deepcopy(rows),
+    )
+    monkeypatch.setattr(
+        "app.learning.learning_runtime_capabilities",
+        lambda: {
+            "optional": {
+                "lightgbm": True,
+                "torch": False,
+                "qlib": False,
+                "rd_agent": False,
+            }
+        },
+    )
+
+    def fake_fit_model(_model_type, training_rows, *_args, **_kwargs):
+        captured_training_days.append(
+            [row["event_time"][:10] for row in training_rows]
+        )
+        return lambda _values: 0.01
+
+    monkeypatch.setattr("app.learning._fit_model", fake_fit_model)
+    task = _fixed_learning_task(label_column)
+    task["parameters"]["model_type"] = "lightgbm"
+    run_learning_backtest(
+        task_id="label-maturity-test",
+        task=task,
+        manifest={"snapshot_manifest_version": 1},
+        data_root="unused",
+    )
+
+    assert captured_training_days[0] == ["2026-01-01", "2026-01-02"]
+    assert rows[0]["available_at"] == rows[0]["event_time"]
+
+
+def test_single_day_label_is_not_used_as_account_return(
+    monkeypatch,
+) -> None:
+    rows = _fixed_learning_rows("label", count=10, label_value=0.01)
+    monkeypatch.setattr(
+        "app.learning.load_manifest_feature_rows",
+        lambda **_: copy.deepcopy(rows),
+    )
+
+    result = run_learning_backtest(
+        task_id="legacy-one-day-label-test",
+        task=_fixed_learning_task("label"),
+        manifest={"snapshot_manifest_version": 1},
+        data_root="unused",
+    )
+
+    assert result["diagnostics"]["accounting_mode"] == (
+        "prediction_evaluation_only"
+    )
+    assert result["diagnostics"]["account_equity_available"] is False
+    assert result["metrics"]["n_days"] == 0
+    assert result["metrics"]["total_return"] is None
+    assert result["metrics"]["final_equity"] is None
+    assert result["metrics"]["prediction_count"] > 0
+    assert result["curves"] == {"equity": [], "drawdown": []}
+
+
 def test_learning_derives_forward_return_from_factor_and_kline_snapshots(tmp_path) -> None:
     import pyarrow as pa
     from pyarrow import parquet
@@ -498,7 +674,13 @@ def test_learning_derives_forward_return_from_factor_and_kline_snapshots(tmp_pat
         manifest=manifest,
         data_root=tmp_path,
     )
-    assert result["metrics"]["n_days"] > 0
+    assert result["metrics"]["n_days"] == 0
+    assert result["metrics"]["total_return"] is None
+    assert result["metrics"]["prediction_count"] > 0
+    assert result["curves"] == {"equity": [], "drawdown": []}
+    assert result["diagnostics"]["accounting_mode"] == (
+        "prediction_evaluation_only"
+    )
     assert result["diagnostics"]["label_column"] == "forward_return_2d"
     assert result["replay_audit"]["event_count"] > result["metrics"]["n_days"]
     assert len(result["replay_audit"]["chain_sha256"]) == 64

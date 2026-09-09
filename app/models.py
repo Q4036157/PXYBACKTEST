@@ -13,6 +13,7 @@ SUPPORTED_PLATFORMS = {"LIGHTER", "OKX", "BINANCE", "BITMART", "MT4", "MT5"}
 DAA_ENGINE_TYPES = {"a_share_portfolio", "factor_matrix", "event_sentiment"}
 ML_ENGINE_TYPES = {"ml_factor", "deep_learning"}
 LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
+UNIVERSAL_ENGINE_TYPES = {"universal_1m"}
 
 
 def _extract_platform(vt_symbol: str) -> str:
@@ -85,6 +86,7 @@ EngineType = Literal[
     "ml_factor",
     "deep_learning",
     "lighter_microstructure",
+    "universal_1m",
     "mt5_native",
 ]
 
@@ -442,12 +444,15 @@ class SubmitBacktestRequestV2(BaseModel):
             self._validate_learning_contract()
         elif self.engine_type in LIGHTER_ENGINE_TYPES:
             self._validate_lighter_contract()
+        elif self.engine_type in UNIVERSAL_ENGINE_TYPES:
+            self._validate_universal_minute_contract()
         if self.optimization is not None and self.engine_type not in {
             "a_share_portfolio",
             "factor_matrix",
             "event_sentiment",
             "microstructure",
             "lighter_microstructure",
+            "universal_1m",
         }:
             raise ValueError(f"{self.engine_type} 尚不支持统一优化任务")
 
@@ -690,6 +695,92 @@ class SubmitBacktestRequestV2(BaseModel):
         if not 0 < threshold <= 1 or not 0 <= exit_threshold < threshold:
             raise ValueError("Lighter 盘口信号阈值无效")
 
+    def _validate_universal_minute_contract(self) -> None:
+        if self.period.interval != "1m" or self.execution.mode != "BAR":
+            raise ValueError("universal_1m 必须使用 1m 周期和 BAR 模式")
+        if (
+            self.execution.signal_time != "bar_close"
+            or self.execution.entry_fill != "next_bar_open"
+            or self.execution.exit_fill != "next_bar_open"
+            or self.execution.matching_policy != "bar_ohlc_conservative"
+        ):
+            raise ValueError("universal_1m 固定为分钟收盘信号、下一实际分钟开盘成交")
+        if self.strategy.id != self.strategy.entrypoint:
+            raise ValueError("universal_1m 要求 strategy.id 与 entrypoint 一致")
+        if re.fullmatch(r"[0-9a-fA-F]{64}", self.strategy.source_hash) is None:
+            raise ValueError("universal_1m 要求完整的 strategy.source_hash SHA256")
+        datasets = (
+            self.data.selection.datasets
+            if self.data.selection is not None
+            else [item.name for item in self.data.snapshot.datasets]  # type: ignore[union-attr]
+        )
+        if "bars" not in datasets:
+            raise ValueError("universal_1m 数据快照必须包含 bars")
+        if self.execution.funding_fee and "funding_rates" not in datasets:
+            raise ValueError("启用 funding_fee 时数据快照必须包含 funding_rates")
+        signal_mode = str(self.parameters.get("signal_mode") or "sentiment").lower()
+        if signal_mode not in {"sentiment", "bar_return", "sentiment_plus_return"}:
+            raise ValueError("universal_1m signal_mode 无效")
+        if signal_mode != "bar_return" and "sentiment_events" not in datasets:
+            raise ValueError("当前 signal_mode 要求数据快照包含 sentiment_events")
+        market = str(self.parameters.get("market") or "").lower()
+        asset_class = str(self.parameters.get("asset_class") or "").lower()
+        market_assets = {
+            "cn_equity": {"stock", "etf", "spot"},
+            "cn_futures": {"future", "futures"},
+            "fx_cfd": {"fx", "forex", "cfd"},
+            "crypto_perp": {"perpetual", "crypto_perpetual"},
+        }
+        if market not in market_assets:
+            raise ValueError("universal_1m parameters.market 无效")
+        if asset_class not in market_assets[market]:
+            raise ValueError("universal_1m 的 market 与 asset_class 不匹配")
+        base_currency = str(self.parameters.get("base_currency") or "").strip()
+        if not base_currency:
+            raise ValueError("universal_1m parameters.base_currency 不能为空")
+        entry_threshold = float(self.parameters.get("entry_threshold", 0.2))
+        exit_threshold = float(self.parameters.get("exit_threshold", 0.05))
+        if (
+            not math.isfinite(entry_threshold)
+            or not math.isfinite(exit_threshold)
+            or not 0 < entry_threshold
+            or not 0 <= exit_threshold < entry_threshold
+        ):
+            raise ValueError("universal_1m 信号阈值无效")
+        for name in ("quantity", "contract_multiplier", "leverage"):
+            value = self.parameters.get(name)
+            if value is not None:
+                number = float(value)
+                if not math.isfinite(number) or number <= 0:
+                    raise ValueError(f"universal_1m parameters.{name} 必须大于 0")
+        derivative_assets = {
+            "future",
+            "futures",
+            "fx",
+            "forex",
+            "cfd",
+            "perpetual",
+            "crypto_perpetual",
+        }
+        settlement = str(
+            self.parameters.get("settlement")
+            or ("derivative" if asset_class in derivative_assets else "spot")
+        ).lower()
+        if settlement not in {"spot", "derivative"}:
+            raise ValueError("universal_1m parameters.settlement 无效")
+        expected_settlement = (
+            "derivative" if asset_class in derivative_assets else "spot"
+        )
+        if settlement != expected_settlement:
+            raise ValueError("universal_1m 的 asset_class 与 settlement 不匹配")
+        leverage = float(
+            self.parameters.get("leverage") or self.execution.leverage or 1
+        )
+        if settlement == "spot" and leverage != 1:
+            raise ValueError("universal_1m 现货品种 leverage 必须为 1")
+        if settlement == "spot" and self.execution.funding_fee:
+            raise ValueError("universal_1m 现货品种不能启用 funding_fee")
+
     def with_snapshot(
         self,
         snapshot: DataSnapshotRefV2,
@@ -740,6 +831,14 @@ class SubmitBacktestRequestV2(BaseModel):
         if self.engine_type in LIGHTER_ENGINE_TYPES:
             if snapshot_manifest is None:
                 raise ValueError("lighter_microstructure 缺少内部快照清单")
+            return {
+                "speed": self.execution.speed,
+                "_task_contract": self.model_dump(mode="json"),
+                "_snapshot_manifest": snapshot_manifest,
+            }
+        if self.engine_type in UNIVERSAL_ENGINE_TYPES:
+            if snapshot_manifest is None:
+                raise ValueError("universal_1m 缺少内部快照清单")
             return {
                 "speed": self.execution.speed,
                 "_task_contract": self.model_dump(mode="json"),

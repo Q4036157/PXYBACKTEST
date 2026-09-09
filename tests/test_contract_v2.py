@@ -814,6 +814,7 @@ def test_capabilities_publish_versioned_recommended_defaults(tmp_path: Path) -> 
     assert profiles["a-share-daily-recommended"]["defaults"]["optimization"]["n_trials"] == 20
     assert profiles["a-share-daily-recommended"]["defaults"]["learning"]["max_epochs"] == 20
     assert profiles["tick-recommended"]["defaults"]["period"]["lookback_days"] == 6
+    assert profiles["universal-minute-recommended"]["defaults"]["period"]["interval"] == "1m"
     engines = {item["engine_id"]: item for item in payload["engines"]}
     assert engines["vnpy_cta"]["default_profile_ids"] == ["futures-minute-recommended"]
     assert engines["vnpy_cta"]["label"] == "CTA 可视化回放"
@@ -828,6 +829,22 @@ def test_capabilities_publish_versioned_recommended_defaults(tmp_path: Path) -> 
     }
     assert engines["ml_factor"]["frontend_ready"] is True
     assert engines["lighter_microstructure"]["frontend_ready"] is True
+    assert engines["universal_1m"]["frontend_ready"] is True
+    assert engines["universal_1m"]["task_authority"] == "PXYBACKTEST"
+    assert engines["universal_1m"]["market_domains"] == [
+        "cn_equity",
+        "cn_futures",
+        "fx_cfd",
+        "crypto_perp",
+    ]
+    assert engines["universal_1m"]["data_contracts"] == [
+        "pxydata.bars.v1",
+        "pxydata.funding_rates.v1",
+        "pxydata.sentiment_events.v1",
+    ]
+    assert engines["universal_1m"]["default_profile_ids"] == [
+        "universal-minute-recommended"
+    ]
     assert engines["mt5_native"]["frontend_ready"] is True
 
 

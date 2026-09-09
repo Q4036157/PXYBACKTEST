@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import queue
@@ -6,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from app import worker_process
+from app.kernel import stable_hash
 from app.worker_process import (
     _configure_backtest_worker_logging,
     _emit,
@@ -17,6 +19,7 @@ from app.worker_process import (
     run_a_share_worker,
     run_lighter_worker,
     run_microstructure_worker,
+    run_universal_minute_worker,
 )
 
 
@@ -140,6 +143,17 @@ def test_non_cta_replay_uses_event_cursor_and_removes_private_event_tape() -> No
     assert result["execution_snapshot"]["bar_history_count"] == 1
     assert result["execution_snapshot"]["account_curve_count"] == 1
     assert result["replay_audit"]["event_count"] == 2
+    assert result["run_card"]["task_authority"] == "PXYBACKTEST"
+    assert result["run_card"]["engine_type"] == "factor_matrix"
+    assert result["run_card"]["task_sha256"] == stable_hash(
+        request["_task_contract"]
+    )
+    payload = copy.deepcopy(result)
+    payload["reproducibility"].pop("result_sha256")
+    payload["run_card"].pop("result_sha256")
+    expected_result_sha256 = stable_hash(payload)
+    assert result["reproducibility"]["result_sha256"] == expected_result_sha256
+    assert result["run_card"]["result_sha256"] == expected_result_sha256
 
 
 def test_non_cta_cancel_saves_only_processed_execution_snapshot() -> None:
@@ -157,6 +171,8 @@ def test_non_cta_cancel_saves_only_processed_execution_snapshot() -> None:
     result = {
         "metrics": {"total_return": 0.99},
         "curves": {"equity": [{"date": "future", "value": 1_990_000}]},
+        "fills": [{"fill_id": "future-fill", "pnl_amount": 990_000}],
+        "deals": [{"trade_id": "future-deal", "pnl_amount": 990_000}],
         "_replay_events": [
             {
                 "event_type": "account",
@@ -192,6 +208,45 @@ def test_non_cta_cancel_saves_only_processed_execution_snapshot() -> None:
     assert result["curves"]["equity"] == [
         {"date": "2026-08-01", "value": 1_001_000}
     ]
+    assert result["fills"] == []
+    assert result["deals"] == []
+
+
+def test_partial_universal_result_does_not_count_open_fill_as_closed_deal() -> None:
+    result = {
+        "fills": [
+            {"fill_id": "open-1", "position_effect": "open"},
+            {"fill_id": "close-1", "position_effect": "close"},
+        ],
+        "deals": [
+            {
+                "trade_id": "deal-1",
+                "entry_fill_id": "open-1",
+                "exit_fill_id": "close-1",
+            }
+        ],
+    }
+    task = {"execution": {"capital": 1_000_000}}
+    snapshot = {
+        "fills": [{"fill_id": "open-1", "position_effect": "open"}],
+        "orders": [],
+        "positions": {},
+        "account_curve": [],
+        "bar_history": [],
+    }
+
+    worker_process._apply_partial_execution_result(
+        result,
+        task=task,
+        snapshot=snapshot,
+    )
+
+    assert result["fills"] == [
+        {"fill_id": "open-1", "position_effect": "open"}
+    ]
+    assert result["deals"] == []
+    assert result["metrics"]["n_fills"] == 1
+    assert result["metrics"]["n_trades"] == 0
 
 
 def test_emit_reliable_event_fails_closed_when_queue_is_full() -> None:
@@ -583,5 +638,64 @@ def test_lighter_worker_runs_the_common_optimizer(tmp_path: Path, monkeypatch: p
     run_lighter_worker("task-lighter", request, str(tmp_path), str(result_path), events, commands)
 
     assert json.loads(result_path.read_text(encoding="utf-8"))["optimization"]["method"] == "optuna"
+    assert len(calls) == 1
+    assert list(events.queue)[-1]["type"] == "completed"
+
+
+def test_universal_minute_worker_runs_common_optimizer_and_writes_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = {
+        "engine_type": "universal_1m",
+        "data": {"snapshot": {"snapshot_id": "snap-universal"}},
+        "execution": {"speed": 100, "execution_mode": "fast"},
+        "optimization": {"method": "optuna"},
+    }
+    request = {"_task_contract": task, "_snapshot_manifest": {"datasets": []}}
+    calls: list[dict] = []
+
+    def fake_backtest(*, task_id: str, task: dict, manifest: dict, data_root: str) -> dict:
+        calls.append(
+            {
+                "task_id": task_id,
+                "task": task,
+                "manifest": manifest,
+                "data_root": data_root,
+            }
+        )
+        return {
+            "engine_version": "pxybacktest.universal-1m.v1",
+            "metrics": {"n_fills": 1, "total_return": 0.01},
+            "diagnostics": {
+                "adapter": "pxybacktest.universal-1m.v1",
+                "strictly_reproducible": True,
+            },
+        }
+
+    def fake_optimizer(task: dict, evaluator, *, cancel_check=None) -> dict:
+        assert task["optimization"]["method"] == "optuna"
+        assert cancel_check is not None
+        return {**evaluator(task), "optimization": {"method": "optuna"}}
+
+    monkeypatch.setattr(
+        "app.universal_minute.run_universal_minute_backtest", fake_backtest
+    )
+    monkeypatch.setattr("app.optimization.run_task_optimization", fake_optimizer)
+    events: queue.Queue = queue.Queue()
+    result_path = tmp_path / "result.json"
+
+    run_universal_minute_worker(
+        "task-universal",
+        request,
+        str(tmp_path),
+        str(result_path),
+        events,
+        queue.Queue(),
+    )
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["optimization"]["method"] == "optuna"
+    assert result["run_card"]["task_authority"] == "PXYBACKTEST"
+    assert result["run_card"]["strictly_reproducible"] is True
     assert len(calls) == 1
     assert list(events.queue)[-1]["type"] == "completed"

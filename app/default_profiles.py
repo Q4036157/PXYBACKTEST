@@ -70,6 +70,20 @@ _ENGINE_METADATA: dict[str, dict[str, Any]] = {
         "frontend_ready": True,
         "result_panels": ["summary", "microstructure", "replay", "orders"],
     },
+    "universal_1m": {
+        "label": "通用市场 1 分钟",
+        "category": "multi_market",
+        "maturity": "experimental_adapter_core",
+        "frontend_ready": True,
+        "result_panels": [
+            "summary",
+            "replay",
+            "orders",
+            "positions",
+            "funding",
+            "run_card",
+        ],
+    },
     "mt5_native": {
         "label": "MT5 原生",
         "category": "external_platform",
@@ -127,6 +141,26 @@ _DEFAULT_PROFILES: tuple[dict[str, Any], ...] = (
         "defaults": {
             "period": {"lookback_days": 6, "interval": "tick"},
             "execution": {"speed": 50},
+            "optimization": {"n_trials": 20},
+        },
+    },
+    {
+        "profile_id": "universal-minute-recommended",
+        "profile_version": "1.0.0",
+        "market": "multi_market",
+        "timeframe": "minute",
+        "engine_ids": ["universal_1m"],
+        "effective_from": "2026-09-09T00:00:00+08:00",
+        "recommended": True,
+        "defaults": {
+            "period": {"lookback_days": 30, "interval": "1m"},
+            "execution": {
+                "signal_time": "bar_close",
+                "entry_fill": "next_bar_open",
+                "exit_fill": "next_bar_open",
+                "matching_policy": "bar_ohlc_conservative",
+                "speed": 50,
+            },
             "optimization": {"n_trials": 20},
         },
     },

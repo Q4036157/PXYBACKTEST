@@ -7,15 +7,15 @@ import multiprocessing
 import queue
 import shutil
 import time
-from dataclasses import dataclass
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from .config import Settings
 from .pxydata_client import DataRequirementManifestV1, SnapshotProviderError
 from .store import (
-    IdempotencyConflictError,
     TERMINAL_STATUSES,
+    IdempotencyConflictError,
     QueueLimitReachedError,
     TaskCreationReceipt,
     TaskStore,
@@ -789,7 +789,7 @@ class TaskManager:
             args=(
                 str(self.settings.pxylh_root),
                 str(self.settings.daa_root),
-                str(self.settings.pxydata_data_root),
+                str(self.settings.effective_pxydata_snapshot_root),
                 self.settings.render_interval_ms,
                 event_queue,
                 command_queue,

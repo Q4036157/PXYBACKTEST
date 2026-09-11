@@ -31,6 +31,11 @@ def pxylh_cta_worker_environment(
         value = str(source.get(source_name) or "").strip()
         if value:
             mapped[worker_name] = value
+    snapshot_root = str(
+        source.get("PXYBACKTEST_PXYDATA_SNAPSHOT_ROOT") or ""
+    ).strip()
+    if snapshot_root:
+        mapped["PXYDATA_DATA_DIR"] = snapshot_root
     return mapped
 
 
@@ -43,6 +48,7 @@ class Settings:
     daa_root: Path = Path(r"D:\x1\x2\DAA")
     daa_python_override: Path | None = None
     pxydata_data_root: Path = Path(r"E:\pxy-runtime\PXYDATA\data")
+    pxydata_snapshot_root: Path | None = None
     pxydata_base_url: str = "http://127.0.0.1:3020"
     pxydata_api_key: str = ""
     pxydata_service_secret: str = ""
@@ -89,8 +95,13 @@ class Settings:
             and (
                 self.daa_backend_root / "app" / "backtest" / "pxy_adapter.py"
             ).is_file()
-            and self.pxydata_data_root.is_dir()
+            and self.effective_pxydata_snapshot_root.is_dir()
         )
+
+    @property
+    def effective_pxydata_snapshot_root(self) -> Path:
+        """返回清单相对路径的只读解析根，兼容旧 DATA_ROOT 配置。"""
+        return self.pxydata_snapshot_root or self.pxydata_data_root
 
     def ensure_directories(self) -> None:
         for path in (self.runtime_root, self.data_dir, self.jobs_dir, self.results_dir):
@@ -139,6 +150,9 @@ class Settings:
             if pxydata_service_secret_path_raw
             else None
         )
+        snapshot_root_raw = os.getenv(
+            "PXYBACKTEST_PXYDATA_SNAPSHOT_ROOT", ""
+        ).strip()
         pxydata_service_secret = os.getenv(
             "PXYBACKTEST_PXYDATA_SERVICE_SECRET", ""
         ).strip() or _read_secret(pxydata_service_secret_path)
@@ -152,6 +166,7 @@ class Settings:
             daa_root=daa_root,
             daa_python_override=Path(daa_python_raw) if daa_python_raw else None,
             pxydata_data_root=pxydata_data_root,
+            pxydata_snapshot_root=(Path(snapshot_root_raw) if snapshot_root_raw else None),
             pxydata_base_url=os.getenv(
                 "PXYBACKTEST_PXYDATA_BASE_URL", "http://127.0.0.1:3020"
             )

@@ -47,6 +47,17 @@ def test_cta_worker_environment_maps_file_identity_without_secret_value() -> Non
     assert "also-must-not-cross" not in mapped.values()
 
 
+def test_cta_worker_environment_prefers_snapshot_root() -> None:
+    mapped = pxylh_cta_worker_environment(
+        {
+            "PXYBACKTEST_PXYDATA_DATA_ROOT": r"E:\pxy-runtime\PXYDATA\data",
+            "PXYBACKTEST_PXYDATA_SNAPSHOT_ROOT": r"E:\pxy-runtime\PXYDATA\readonly",
+        }
+    )
+
+    assert mapped["PXYDATA_DATA_DIR"] == r"E:\pxy-runtime\PXYDATA\readonly"
+
+
 def test_worker_applies_identity_mapping_before_pxylh_loader_import(
     monkeypatch,
 ) -> None:

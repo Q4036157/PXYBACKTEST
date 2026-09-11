@@ -12,8 +12,23 @@ from datetime import date, datetime, timedelta
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import HTMLResponse, Response
 
+from .a_share_emotion_etf import (
+    EMOTION_DATA_CONTRACT,
+    EMOTION_ETF_STRATEGY_HASH,
+    EMOTION_ETF_STRATEGY_ID,
+)
+from .a_share_emotion_etf import (
+    runtime_available as emotion_etf_runtime_available,
+)
 from .auth import TrustedIdentity, build_identity_dependency
 from .config import Settings
+from .custom_nodes import (
+    CustomDataNodeRunRequest,
+    CustomDataNodeSpec,
+    CustomNodeError,
+    run_custom_data_node,
+    validate_custom_data_node,
+)
 from .daa_client import (
     AI_CAPABLE_ENGINE_TYPES,
     DaaAdapterClient,
@@ -26,18 +41,6 @@ from .default_profiles import (
     engine_catalog_metadata,
     profile_ids_for_engine,
 )
-from .manager import QueueLimitError, TaskManager
-from .microstructure import (
-    MICROSTRUCTURE_STRATEGY_HASH,
-    MICROSTRUCTURE_STRATEGY_ID,
-    microstructure_runtime_available,
-)
-from .a_share_emotion_etf import (
-    EMOTION_DATA_CONTRACT,
-    EMOTION_ETF_STRATEGY_HASH,
-    EMOTION_ETF_STRATEGY_ID,
-    runtime_available as emotion_etf_runtime_available,
-)
 from .learning import (
     ML_ENGINE_TYPES,
     ML_STRATEGY_HASH,
@@ -49,13 +52,17 @@ from .lighter_microstructure import (
     LIGHTER_STRATEGY_ID,
     lighter_runtime_available,
 )
-from .universal_minute import (
-    UNIVERSAL_STRATEGY_HASH,
-    UNIVERSAL_STRATEGY_ID,
-    universal_minute_runtime_available,
+from .llm_signal import (
+    LLMRealtimeSignalRequest,
+    LLMSignalError,
+    generate_realtime_signal,
 )
-from .llm_signal import LLMRealtimeSignalRequest, LLMSignalError, generate_realtime_signal
-from .custom_nodes import CustomDataNodeRunRequest, CustomDataNodeSpec, CustomNodeError, run_custom_data_node, validate_custom_data_node
+from .manager import QueueLimitError, TaskManager
+from .microstructure import (
+    MICROSTRUCTURE_STRATEGY_HASH,
+    MICROSTRUCTURE_STRATEGY_ID,
+    microstructure_runtime_available,
+)
 from .models import (
     DAA_ENGINE_TYPES,
     DataSnapshotRefV2,
@@ -63,8 +70,6 @@ from .models import (
     SubmitBacktestRequest,
     SubmitBacktestRequestV2,
 )
-from .workflow import WorkflowSpec, validate_workflow
-from .version import __version__
 from .pxydata_client import (
     DataRequirementManifestV1,
     PxyDataSnapshotClient,
@@ -77,13 +82,20 @@ from .runner_registry import (
     runner_contract_capabilities,
 )
 from .store import (
-    IdempotencyConflictError,
     RESULT_RETENTION_SECONDS,
+    IdempotencyConflictError,
     TaskCreationReceipt,
     TaskNotFoundError,
 )
 from .strategy_package import StrategyPackage
 from .tqsdk_submission import TqSdkTaskSubmission
+from .universal_minute import (
+    UNIVERSAL_STRATEGY_HASH,
+    UNIVERSAL_STRATEGY_ID,
+    universal_minute_runtime_available,
+)
+from .version import __version__
+from .workflow import WorkflowSpec, validate_workflow
 
 A_SHARE_WARMUP_CALENDAR_DAYS = 120
 LIGHTER_ENGINE_TYPES = {"lighter_microstructure"}
@@ -498,16 +510,20 @@ def create_app(
     data_snapshots = snapshot_client or PxyDataSnapshotClient.from_settings(configured)
     daa_adapter = daa_client or DaaAdapterClient(configured)
     microstructure_available = (
-        configured.pxydata_data_root.is_dir() and microstructure_runtime_available()
+        configured.effective_pxydata_snapshot_root.is_dir()
+        and microstructure_runtime_available()
     )
     emotion_etf_available = (
-        configured.pxydata_data_root.is_dir() and emotion_etf_runtime_available()
+        configured.effective_pxydata_snapshot_root.is_dir()
+        and emotion_etf_runtime_available()
     )
     learning_available = (
-        configured.pxydata_data_root.is_dir() and learning_runtime_available()
+        configured.effective_pxydata_snapshot_root.is_dir()
+        and learning_runtime_available()
     )
     lighter_available = (
-        configured.pxydata_data_root.is_dir() and lighter_runtime_available()
+        configured.effective_pxydata_snapshot_root.is_dir()
+        and lighter_runtime_available()
     )
     runner_registry = build_runner_registry(
         RunnerProbeConfig.from_environment(pxylh_root=configured.pxylh_root)

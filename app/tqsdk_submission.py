@@ -50,7 +50,7 @@ class TqSdkTaskSubmission(BaseModel):
     start_date: date
     end_date: date
     execution_mode: Literal["visual", "fast"] = "visual"
-    speed: float = Field(default=50, ge=1, le=100)
+    speed: float = Field(default=3, ge=0.5, le=100)
 
     @model_validator(mode="after")
     def validate_native_submission(self) -> "TqSdkTaskSubmission":

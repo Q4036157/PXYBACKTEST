@@ -742,8 +742,8 @@ def create_app(
                         "parameters": [
                             {"id": "entry_threshold", "default": 30, "locked": True},
                             {"id": "exit_threshold", "default": 80, "locked": True},
-                            {"id": "lot_size", "default": 100, "locked": True},
-                            {"id": "min_commission", "default": 5.0},
+                            {"id": "lot_size", "label": "每手份额（份，固定 100）", "type": "int", "default": 100, "locked": True},
+                            {"id": "min_commission", "label": "每笔最低佣金（元）", "type": "number", "default": 5.0, "min": 0, "step": 0.5},
                         ],
                     }],
                 },

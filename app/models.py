@@ -41,7 +41,7 @@ class SubmitBacktestRequest(BaseModel):
     capital: float = Field(default=1_000_000, gt=0)
     rate: float = Field(default=0.0004, ge=0, le=1)
     slippage: float = Field(default=0, ge=0)
-    speed: float = Field(default=50, ge=1, le=100)
+    speed: float = Field(default=3, ge=0.5, le=100)
     mode: Literal["BAR", "TICK"] = "BAR"
     execution_mode: Literal["visual", "fast"] = "visual"
 
@@ -66,7 +66,7 @@ class SubmitBacktestRequest(BaseModel):
 
 
 class SetSpeedRequest(BaseModel):
-    speed: float = Field(ge=1, le=100)
+    speed: float = Field(ge=0.5, le=100)
 
 
 class TaskEvent(BaseModel):
@@ -250,7 +250,7 @@ class ExecutionModelV2(BaseModel):
     capital: float = Field(default=1_000_000, gt=0)
     rate: float = Field(default=0.0004, ge=0, le=1)
     slippage: float = Field(default=0, ge=0)
-    speed: float = Field(default=50, ge=1, le=100)
+    speed: float = Field(default=3, ge=0.5, le=100)
     mode: Literal["BAR", "TICK"] = "BAR"
     execution_mode: Literal["visual", "fast"] = "visual"
     leverage: float | None = Field(default=None, gt=0)

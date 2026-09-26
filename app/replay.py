@@ -1392,11 +1392,14 @@ class ResultReplayController:
             next_event = self.session.cursor.peek()
             if next_event is None:
                 break
-            remaining_delay = 0.0 if stepping else self._visual_delay(next_event)
-            while remaining_delay > 0:
+            waited = 0.0
+            while not stepping:
+                remaining_delay = self._visual_delay(next_event) - waited
+                if remaining_delay <= 0:
+                    break
                 interval = min(0.02, remaining_delay)
                 sleep(interval)
-                remaining_delay -= interval
+                waited += interval
                 self._read_commands(read_commands, on_state)
                 if self.session.clock.cancelled or self.session.clock.paused:
                     break

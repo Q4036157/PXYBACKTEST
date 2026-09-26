@@ -104,7 +104,7 @@ _DEFAULT_PROFILES: tuple[dict[str, Any], ...] = (
         "recommended": True,
         "defaults": {
             "period": {"lookback_days": 153, "interval": "1m"},
-            "execution": {"speed": 50},
+            "execution": {"speed": 3},
             "optimization": {"n_trials": 20},
         },
     },
@@ -125,7 +125,7 @@ _DEFAULT_PROFILES: tuple[dict[str, Any], ...] = (
         "recommended": True,
         "defaults": {
             "period": {"lookback_days": 365, "interval": "1d"},
-            "execution": {"speed": 50},
+            "execution": {"speed": 3},
             "optimization": {"n_trials": 20},
             "learning": {"max_epochs": 20},
         },
@@ -140,7 +140,7 @@ _DEFAULT_PROFILES: tuple[dict[str, Any], ...] = (
         "recommended": True,
         "defaults": {
             "period": {"lookback_days": 6, "interval": "tick"},
-            "execution": {"speed": 50},
+            "execution": {"speed": 3},
             "optimization": {"n_trials": 20},
         },
     },
@@ -159,7 +159,7 @@ _DEFAULT_PROFILES: tuple[dict[str, Any], ...] = (
                 "entry_fill": "next_bar_open",
                 "exit_fill": "next_bar_open",
                 "matching_policy": "bar_ohlc_conservative",
-                "speed": 50,
+                "speed": 3,
             },
             "optimization": {"n_trials": 20},
         },

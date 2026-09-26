@@ -1472,7 +1472,7 @@ def _replay_non_cta_result(
     task = dict(request.get("_task_contract") or {})
     execution = dict(task.get("execution") or {})
     snapshot_ref = dict((task.get("data") or {}).get("snapshot") or {})
-    speed = float(execution.get("speed") or request.get("speed") or 50)
+    speed = float(execution.get("speed") or request.get("speed") or 3)
     mode = str(execution.get("execution_mode") or "visual")
     pending = deferred_commands if deferred_commands is not None else []
     original_audit = result.get("replay_audit") or {}
@@ -1799,7 +1799,7 @@ def run_backtest_worker(
         以避免无界 UI 事件洪峰。
         """
         configured = max(16, int(render_interval_ms or 33))
-        requested = max(1.0, min(100.0, float(speed or 1.0)))
+        requested = max(0.5, min(100.0, float(speed or 1.0)))
         return max(8, min(configured, int(round(1000.0 / requested))))
 
     if str(getattr(task, "execution_mode", "visual")).lower() == "visual":
@@ -1890,7 +1890,7 @@ def run_backtest_worker(
                     requested_paused = False
                 elif action == "speed":
                     requested_speed = max(
-                        1.0, min(100.0, float(command.get("speed") or 1))
+                        0.5, min(100.0, float(command.get("speed") or 1))
                     )
                     task.speed = requested_speed
                     applied_speed = None

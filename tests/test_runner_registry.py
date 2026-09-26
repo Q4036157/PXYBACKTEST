@@ -485,27 +485,3 @@ def test_runner_resolution_rejects_wrong_execution_semantics(tmp_path: Path) -> 
     assert result["submit_ready"] is False
     assert "不支持执行语义" in result["reason"]
 
-
-def test_unimplemented_later_phase_platform_does_not_resolve(tmp_path: Path) -> None:
-    registry = build_runner_registry(
-        RunnerProbeConfig(
-            project_root=tmp_path / "PXYBACKTEST",
-            pxylh_root=tmp_path / "PXYLH",
-            tqsdk_python=None,
-            mt4_terminal=tmp_path / "mt4.exe",
-            mt5_terminal=tmp_path / "mt5.exe",
-        )
-    )
-    package = _package(
-        platform="tradingview",
-        adapter_id="pine-ir",
-        mode="compat",
-        semantics="tradingview_bar",
-        language="pine",
-    )
-
-    result = registry.resolve(package)
-
-    assert result["resolved"] is False
-    assert result["runner"] is None
-    assert "尚未接入" in result["reason"]

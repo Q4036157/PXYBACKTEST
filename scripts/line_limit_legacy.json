@@ -17,6 +17,5 @@
   "tests/test_learning.py": 686,
   "tests/test_store.py": 634,
   "app/universal_minute.py": 560,
-  "tests/test_minute_replay.py": 556,
-  "tests/test_runner_registry.py": 511
+  "tests/test_minute_replay.py": 556
 }

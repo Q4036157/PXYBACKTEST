@@ -1752,7 +1752,7 @@ def run_backtest_worker(
         capital=float(request.get("capital") or 1_000_000),
         rate=_parse_request_rate(request),
         slippage=float(request.get("slippage") or 0),
-        speed=float(request.get("speed") or 50),
+        speed=float(request.get("speed") or 3),
         mode=str(request.get("mode") or "BAR").upper(),
         execution_mode=str(request.get("execution_mode") or "visual").lower(),
     )

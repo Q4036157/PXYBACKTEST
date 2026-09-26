@@ -1388,7 +1388,6 @@ class ResultReplayController:
             if self.session.clock.paused and not stepping:
                 sleep(0.01)
                 continue
-
             next_event = self.session.cursor.peek()
             if next_event is None:
                 break
@@ -1407,7 +1406,6 @@ class ResultReplayController:
                 self.session.clock.paused and not stepping
             ):
                 continue
-
             event = self.session.step(handler, allow_paused=stepping)
             if event is None:
                 continue
@@ -1423,7 +1421,6 @@ class ResultReplayController:
                             "step_pending": self._step_budget,
                         }
                     )
-
         if self._last_projected_count != self.session.processed_events:
             self._project(on_snapshot, force=True)
         complete = self.session.cursor.exhausted and not self.session.clock.cancelled

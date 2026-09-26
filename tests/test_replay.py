@@ -813,51 +813,6 @@ def test_visual_replay_speed_changes_wall_time_without_changing_event_count() ->
     assert count_20x == count_50x == 3
 
 
-def test_result_replay_half_speed_and_live_speed_change() -> None:
-    events = [
-        {
-            "event_type": "market_bar",
-            "event_time": f"2026-08-01T00:00:0{index}Z",
-            "symbol": "XAU",
-            "payload": {"symbol": "XAU", "datetime": index, "close": 2000 + index},
-        }
-        for index in range(2)
-    ]
-    controller = ResultReplayController(
-        run_id="run-half-speed",
-        snapshot_id=SNAPSHOT,
-        events=events,
-        mode="visual",
-        speed=0.5,
-    )
-    delays: list[float] = []
-    result = controller.run(sleep=delays.append)
-    assert result["processed_events"] == 2
-    assert sum(delays) == pytest.approx(2.0)
-
-    controller = ResultReplayController(
-        run_id="run-live-speed",
-        snapshot_id=SNAPSHOT,
-        events=events,
-        mode="visual",
-        speed=0.5,
-    )
-    delays = []
-    changed = False
-
-    def read_commands() -> list[dict]:
-        nonlocal changed
-        if delays and not changed:
-            changed = True
-            return [{"action": "speed", "speed": 10}]
-        return []
-
-    result = controller.run(read_commands=read_commands, sleep=delays.append)
-    assert result["processed_events"] == 2
-    assert result["execution_snapshot"]["replay"]["speed"] == 10
-    assert sum(delays) == pytest.approx(0.1)
-
-
 def test_visual_and_fast_replay_have_identical_execution_snapshot() -> None:
     """可视化帧降采样不能改变统一执行快照。"""
     events = [

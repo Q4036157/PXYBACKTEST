@@ -19,6 +19,8 @@ if (!$python) { throw "No supported Python executable was found." }
 Push-Location $repoRoot
 try {
     $env:PYTHONPATH = "$repoRoot;$pxylhRoot;$(Join-Path $pxylhRoot 'backend')"
+    & $python scripts/check_line_limit.py
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & $python -m pytest -q
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & $python -m compileall -q app tests

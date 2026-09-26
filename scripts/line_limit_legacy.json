@@ -15,6 +15,5 @@
   "app/microstructure.py": 715,
   "tests/test_worker_process.py": 701,
   "tests/test_learning.py": 686,
-  "tests/test_store.py": 634,
-  "app/universal_minute.py": 560
+  "tests/test_store.py": 634
 }

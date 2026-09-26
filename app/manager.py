@@ -358,6 +358,13 @@ class TaskManager:
     ) -> dict[str, Any]:
         """先持久化可重试请求，再向 PXYDATA 幂等登记。"""
 
+        waiting = next(
+            (task for task in await asyncio.to_thread(self.store.waiting_tasks)
+             if task["task_id"] == task_id),
+            None,
+        )
+        if waiting is None:
+            return {}
         stub = {
             "contract_version": "pxydata.data-requirement.v1",
             "requirement_id": str(payload["requirement_id"]),
@@ -371,6 +378,7 @@ class TaskManager:
             "failure_reason": "",
             "snapshot": None,
             "registration_confirmed": False,
+            "wait_deadline_at": waiting["created_at"] + self.settings.data_wait_timeout_seconds,
             "request": {key: value for key, value in payload.items() if key != "requirement_id"},
         }
         persisted = await asyncio.to_thread(
@@ -442,6 +450,17 @@ class TaskManager:
         assert self._data_requirement_builder is not None
         assert self._data_ready_resolver is not None
         current = dict(task["state"].get("data_requirement") or {})
+        deadline = float(task["created_at"]) + self.settings.data_wait_timeout_seconds
+        if time.time() >= deadline:
+            await asyncio.to_thread(
+                self.store.append_waiting_event,
+                task["task_id"],
+                "failed",
+                {"error": "等待数据超时: 数据需求未在任务截止时间前就绪"},
+            )
+            return
+        if current and not current.get("wait_deadline_at"):
+            current["wait_deadline_at"] = deadline
         if float(current.get("next_poll_at") or 0) > time.time():
             return
         if not current:
@@ -489,6 +508,7 @@ class TaskManager:
                         "retry_count",
                         "status_poll_count",
                         "next_poll_at",
+                        "wait_deadline_at",
                     }
                 }
             )
@@ -581,6 +601,7 @@ class TaskManager:
         payload = {
             **manifest.model_dump(mode="json"),
             "registration_confirmed": True,
+            "wait_deadline_at": current.get("wait_deadline_at"),
             "request": request,
             "retry_count": 0,
             "status_poll_count": status_poll_count,

@@ -452,7 +452,7 @@ class TaskStore:
     def waiting_tasks(self) -> list[dict[str, Any]]:
         with self._lock, self._connection() as connection:
             rows = connection.execute(
-                "SELECT task_id, user_id, request_json, state_json FROM tasks WHERE status = 'waiting_for_data' ORDER BY created_at ASC"
+                "SELECT task_id, user_id, request_json, state_json, created_at FROM tasks WHERE status = 'waiting_for_data' ORDER BY created_at ASC"
             ).fetchall()
         return [
             {
@@ -460,6 +460,7 @@ class TaskStore:
                 "user_id": str(row["user_id"]),
                 "request": json.loads(row["request_json"]),
                 "state": json.loads(row["state_json"]),
+                "created_at": float(row["created_at"]),
             }
             for row in rows
         ]

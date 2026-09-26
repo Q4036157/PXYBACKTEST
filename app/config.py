@@ -58,6 +58,7 @@ class Settings:
     max_concurrent_tasks: int = 1
     max_queued_per_user: int = 3
     render_interval_ms: int = 50
+    data_wait_timeout_seconds: int = 86400
 
     @property
     def data_dir(self) -> Path:
@@ -188,5 +189,8 @@ class Settings:
             ),
             render_interval_ms=max(
                 33, int(os.getenv("PXYBACKTEST_RENDER_INTERVAL_MS", "50"))
+            ),
+            data_wait_timeout_seconds=max(
+                60, int(os.getenv("PXYBACKTEST_DATA_WAIT_TIMEOUT_SECONDS", "86400"))
             ),
         )

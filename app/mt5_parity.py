@@ -287,7 +287,7 @@ def normalize_pxy_deals(items: Iterable[Mapping[str, Any]]) -> tuple[NormalizedD
                 price=_decimal(_first(item, ("price", "fill_price"), 0)),
                 commission=_decimal(_first(item, ("commission", "fee"), 0)),
                 swap=_decimal(_first(item, ("swap", "funding"), 0)),
-                profit=_decimal(_first(item, ("profit", "pnl", "realized_pnl"), 0)),
+                profit=_decimal(_first(item, ("mt5_booked_profit", "profit", "pnl", "realized_pnl"), 0)),
                 balance=(
                     _decimal(_first(item, ("balance",)))
                     if _first(item, ("balance",), None) is not None

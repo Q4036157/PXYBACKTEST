@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .mt5_ohlc_options import Mt5OhlcOptions
 from .snapshot_verifier import validate_snapshot_manifest
 
 SUPPORTED_PLATFORMS = {"LIGHTER", "OKX", "BINANCE", "BITMART", "MT4", "MT5"}
@@ -29,7 +30,7 @@ def _extract_platform(vt_symbol: str) -> str:
     return ""
 
 
-class SubmitBacktestRequest(BaseModel):
+class SubmitBacktestRequest(Mt5OhlcOptions):
     model_config = ConfigDict(extra="forbid")
 
     strategy_class: str = Field(min_length=1, max_length=200)
@@ -44,10 +45,7 @@ class SubmitBacktestRequest(BaseModel):
     speed: float = Field(default=3, ge=0.5, le=100)
     mode: Literal["BAR", "TICK"] = "BAR"
     execution_mode: Literal["visual", "fast"] = "visual"
-
-    @field_validator(
-        "strategy_class", "vt_symbol", "interval", "start_time", "end_time"
-    )
+    @field_validator("strategy_class", "vt_symbol", "interval", "start_time", "end_time")
     @classmethod
     def strip_required_text(cls, value: str) -> str:
         stripped = value.strip()
@@ -238,7 +236,7 @@ class TaskDataV2(BaseModel):
             raise ValueError("data must contain exactly one of selection or snapshot")
 
 
-class ExecutionModelV2(BaseModel):
+class ExecutionModelV2(Mt5OhlcOptions):
     """影响回测结果的唯一显式执行口径。
 
     rate/slippage 保留给 v1/vn.py 兼容层；v2 结果同时记录标准化的 bps
@@ -430,6 +428,7 @@ class SubmitBacktestRequestV2(BaseModel):
 
     def validate_contract(self) -> None:
         self.data.validate_choice()
+        self.execution.validate_replay(self.engine_type, self.execution.mode, self.period.interval)
         if self.engine_type == "vnpy_cta" and len(self.universe.symbols) != 1:
             raise ValueError("vnpy_cta currently requires exactly one symbol")
         if self.engine_type == "a_share_portfolio":
@@ -878,6 +877,7 @@ class SubmitBacktestRequestV2(BaseModel):
                 "speed": self.execution.speed,
                 "mode": self.execution.mode,
                 "execution_mode": self.execution.execution_mode,
+                **self.execution.mt5_worker_fields(),
             }
         ).model_dump()
         legacy["_task_contract"] = self.model_dump(mode="json")

@@ -89,6 +89,15 @@ def test_compare_deals_accepts_pxy_aliases_and_money_rounding(tmp_path: Path) ->
     assert result.mismatch_count == 0
 
 
+def test_normalize_deals_prefers_mt5_booked_profit() -> None:
+    deals = normalize_pxy_deals([{
+        "time": "2026-04-01 00:00:00", "symbol": "LABUSDT_BN",
+        "direction": "short", "offset": "close", "volume": 0.01,
+        "price": 1.0, "pnl": -0.0649, "mt5_booked_profit": -0.06,
+    }])
+    assert deals[0].profit == Decimal("-0.06")
+
+
 def test_compare_deals_reports_first_semantic_divergence(tmp_path: Path) -> None:
     report = parse_mt5_report(_write_report(tmp_path / "report.html"))
     wrong = replace(report.deals[1], side="buy", price=Decimal("4426.060"))

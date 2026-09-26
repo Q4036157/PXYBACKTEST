@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from app.kernel import stable_hash as _kernel_stable_hash
+from app.mt5_ohlc_options import mt5_task_options
 
 A_SHARE_ADAPTER_CONTRACT = "pxybacktest.engine-adapter.a-share.v1"
 DAA_ENGINE_TYPES = {"a_share_portfolio", "factor_matrix", "event_sentiment"}
@@ -1712,7 +1713,6 @@ def run_backtest_worker(
         return
     if str(backend_root) not in sys.path:
         sys.path.insert(0, str(backend_root))
-
     try:
         from services.backtest_service.engine_runner import run_backtest_sync
         from services.backtest_service.kline_loader import ensure_backtest_kline_data
@@ -1739,7 +1739,6 @@ def run_backtest_worker(
             terminal=True,
         )
         return
-
     task = BacktestTask(
         task_id=task_id,
         user_id="workstation",
@@ -1755,6 +1754,7 @@ def run_backtest_worker(
         speed=float(request.get("speed") or 3),
         mode=str(request.get("mode") or "BAR").upper(),
         execution_mode=str(request.get("execution_mode") or "visual").lower(),
+        **mt5_task_options(request),
     )
     # PXYLH 任务内部统一使用北京时间 naive，但 MT5 Tester 的 FromDate /
     # ToDate 必须保留请求原始时区。将明确带偏移的值传给 MT5 快照加载器，

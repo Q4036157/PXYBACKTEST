@@ -345,3 +345,12 @@ def test_submit_model_rejects_unsupported_platform() -> None:
                 "end_time": "2026-08-02 00:00:00",
             }
         )
+
+
+def test_mt5_ohlc_model_rejects_bar_execution():
+    with pytest.raises(ValidationError, match="TICK"):
+        SubmitBacktestRequest.model_validate({
+            "strategy_class": "Pt5Strategy", "vt_symbol": "LABUSDT_SWAP_BINANCE.GLOBAL",
+            "interval": "1m", "start_time": "2026-04-01T00:00:00+08:00",
+            "end_time": "2026-04-02T00:00:00+08:00", "tick_model": "mt5_ohlc_1m",
+        })

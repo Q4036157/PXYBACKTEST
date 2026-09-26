@@ -19,6 +19,6 @@ Reproduce with `python -m scripts.benchmark_mt5_tick_loader` and the data root, 
 
 ## Parity gate
 
-The older `123骑士` Oracle recorded in `docs/mt5-parity-contract.md` refers to MQ5 SHA256 `799D17...`, EX5 SHA256 `63FF6A...` and report SHA256 `C2A652...`. None of those matching EA files was found among the current D:/x1/x2 MQL5 sources/binaries; the surviving `123骑士-200/123骑士.mq5` has a different SHA256. Do not silently substitute it or mark the old vector accepted.
+The older `123骑士` Oracle recorded in `docs/mt5-parity-contract.md` refers to MQ5 SHA256 `799D17...`, EX5 SHA256 `63FF6A...` and report SHA256 `C2A652...`. The matching EX5 is absent from the current working tree but recoverable from MT5 Git commit `31c4dde` (blob `372c60bc...`); the matching MQ5 and original report have not been located. The surviving `123骑士-200/123骑士.mq5` has a different SHA256 and is only a candidate for a new vector. Do not silently substitute it, delete the recoverable historical EX5, or mark either vector accepted.
 
 Before a full benchmark or C++ rollout, pin the exact EA/EX5, inputs, terminal build, account specification and MT5 report; execute the same strategy against the bound PXYDATA snapshot; then pass ordered-deal, account-path and visual-event checks. Only profile the full matched run after these identities and three dimensions pass.

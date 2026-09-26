@@ -484,4 +484,3 @@ def test_runner_resolution_rejects_wrong_execution_semantics(tmp_path: Path) -> 
     assert result["resolved"] is False
     assert result["submit_ready"] is False
     assert "不支持执行语义" in result["reason"]
-
